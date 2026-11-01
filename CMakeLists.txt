@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.19)
-project(nixscp VERSION 1.0.0 LANGUAGES CXX)
+project(nixscp VERSION 1.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -119,6 +119,9 @@ set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Dragan Plavšić <hello@codewizdev.com>")
 set(CPACK_DEBIAN_PACKAGE_SECTION net)
 set(CPACK_DEBIAN_PACKAGE_PRIORITY optional)
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+# Runtime plugins shlibdeps cannot see: SVG icon themes (Adwaita, Breeze)
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "qt6-svg-plugins")
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "qt6-wayland, xdg-utils, openssh-client")
 set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/codewizdevs/nixscp")
 # Fedora / openSUSE
 set(CPACK_RPM_PACKAGE_NAME nixscp)
@@ -126,6 +129,8 @@ set(CPACK_RPM_PACKAGE_LICENSE "GPL-3.0-only")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/Internet")
 set(CPACK_RPM_PACKAGE_URL "https://github.com/codewizdevs/nixscp")
 set(CPACK_RPM_PACKAGE_AUTOREQ ON)
+set(CPACK_RPM_PACKAGE_REQUIRES "qt6-qtsvg")
+set(CPACK_RPM_PACKAGE_SUGGESTS "qt6-qtwayland, xdg-utils, openssh-clients")
 set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
   /usr/share/applications /usr/share/metainfo /usr/share/icons /usr/share/icons/hicolor
   /usr/share/icons/hicolor/scalable /usr/share/icons/hicolor/scalable/apps)

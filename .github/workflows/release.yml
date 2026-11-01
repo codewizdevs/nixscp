@@ -49,13 +49,15 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends build-essential cmake pkgconf \
-            qt6-base-dev libssh-dev libssl-dev dpkg-dev file git ca-certificates
+            qt6-base-dev libssh-dev libssl-dev dpkg-dev file git ca-certificates \
+            qt6-svg-plugins xdg-utils fonts-dejavu-core openssh-client
 
       - name: Install build dependencies (Fedora)
         if: matrix.family == 'fedora'
         run: |
           dnf install -y gcc-c++ cmake pkgconf qt6-qtbase-devel libssh-devel \
-            openssl-devel rpm-build file git
+            openssl-devel rpm-build file git qt6-qtsvg xdg-utils \
+            dejavu-sans-fonts openssh-clients
 
       - uses: actions/checkout@v4
 

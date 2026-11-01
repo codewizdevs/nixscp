@@ -710,6 +710,10 @@ void ProgressDialog::UpdateControls()
   bool HideOnceDone = (Data.Op == FileOperationProgress::Calculate);
   d->CycleOnceDoneItem->setVisible(!HideOnceDone);
   d->SpeedItem->setVisible(Transfer);
+  // Wider fonts or longer translations must not push items (the speed
+  // combo) into the toolbar's overflow menu: the dialog grows instead
+  d->Toolbar->setMinimumWidth(0);
+  d->Toolbar->setMinimumWidth(d->Toolbar->sizeHint().width());
 
   QString AnimationName =
     (Data.Op == FileOperationProgress::Delete) ? QStringLiteral("Delete") :

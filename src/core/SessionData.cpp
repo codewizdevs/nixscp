@@ -1590,14 +1590,49 @@ int StoredSessionList::ImportFromWinSCPIni(const QString & FileName, QString * E
 int StoredSessionList::CompareLogicalText(const QString & A, const QString & B)
 {
   // CompareLogicalText with NaturalOrderNumericalSorting (StrCmpLogicalW)
+  // Digit runs are compared by value here: QCollator's numeric mode does
+  // nothing in the C/POSIX locale (and without ICU)
   static thread_local QCollator Collator = []()
   {
     QCollator C;
-    C.setNumericMode(true);
     C.setCaseSensitivity(Qt::CaseInsensitive);
     return C;
   }();
-  int Result = Collator.compare(A, B);
+  auto IsDigit = [](QChar C) { return (C >= QLatin1Char('0')) && (C <= QLatin1Char('9')); };
+  int Result = 0;
+  qsizetype IA = 0, IB = 0;
+  while ((Result == 0) && (IA < A.size()) && (IB < B.size()))
+  {
+    bool DigitA = IsDigit(A[IA]);
+    qsizetype EA = IA, EB = IB;
+    while ((EA < A.size()) && (IsDigit(A[EA]) == DigitA)) EA++;
+    while ((EB < B.size()) && (IsDigit(B[EB]) == IsDigit(B[IB]))) EB++;
+    if (DigitA && IsDigit(B[IB]))
+    {
+      QStringView NA = QStringView(A).sliced(IA, EA - IA), NB = QStringView(B).sliced(IB, EB - IB);
+      while ((NA.size() > 1) && (NA[0] == QLatin1Char('0'))) NA = NA.sliced(1);
+      while ((NB.size() > 1) && (NB[0] == QLatin1Char('0'))) NB = NB.sliced(1);
+      Result = (NA.size() != NB.size()) ? ((NA.size() < NB.size()) ? -1 : 1) : NA.compare(NB);
+    }
+    else if (DigitA != IsDigit(B[IB]))
+    {
+      Result = Collator.compare(QStringView(A).sliced(IA), QStringView(B).sliced(IB));
+      if (Result == 0)
+      {
+        Result = DigitA ? -1 : 1;
+      }
+    }
+    else
+    {
+      Result = Collator.compare(QStringView(A).sliced(IA, EA - IA), QStringView(B).sliced(IB, EB - IB));
+    }
+    IA = EA;
+    IB = EB;
+  }
+  if (Result == 0)
+  {
+    Result = (A.size() - IA > 0) ? 1 : ((B.size() - IB > 0) ? -1 : 0);
+  }
   if (Result == 0)
   {
     // For deterministic results

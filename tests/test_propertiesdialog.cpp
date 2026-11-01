@@ -17,6 +17,7 @@
 #include "gui/PropertiesDialog.h"
 #include "gui/RemoteTransferDialog.h"
 
+#include <QLocale>
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
@@ -862,6 +863,8 @@ int main(int argc, char ** argv)
     qputenv("QT_QPA_PLATFORM", "offscreen");
   }
   QApplication App(argc, argv);
+  // Expected texts use English digit grouping ("2,048"), whatever the host locale
+  QLocale::setDefault(QLocale(QLocale::English, QLocale::UnitedStates));
   QStandardPaths::setTestModeEnabled(true);
   QTemporaryDir Scratch;
   qputenv("XDG_CONFIG_HOME", Scratch.path().toUtf8());
