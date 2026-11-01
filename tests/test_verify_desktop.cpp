@@ -693,6 +693,16 @@ static void TestSleepInhibitor()
     std::printf("  SKIP: no systemd-logind\n");
     return;
   }
+  {
+    // Containers may have the logind directories but no system bus
+    QProcess Probe;
+    Probe.start(Inhibit, {QStringLiteral("--list"), QStringLiteral("--no-pager")});
+    if (!Probe.waitForFinished(10000) || (Probe.exitStatus() != QProcess::NormalExit) || (Probe.exitCode() != 0))
+    {
+      std::printf("  SKIP: systemd-logind not reachable\n");
+      return;
+    }
+  }
   auto Listed = [&Inhibit]()
   {
     QProcess P;
