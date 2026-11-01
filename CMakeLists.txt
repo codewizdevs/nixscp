@@ -1,0 +1,143 @@
+cmake_minimum_required(VERSION 3.19)
+project(nixscp VERSION 1.0.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo)
+endif()
+
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network)
+find_package(PkgConfig REQUIRED)
+# libssh 0.11+: pipelined SFTP uses the sftp_aio API
+pkg_check_modules(LIBSSH REQUIRED IMPORTED_TARGET libssh>=0.11)
+pkg_check_modules(LIBCRYPTO REQUIRED IMPORTED_TARGET libcrypto>=3.2)
+
+# Sources are globbed so parallel work can add files without touching this file
+file(GLOB CORE_SOURCES CONFIGURE_DEPENDS src/core/*.cpp src/core/*.h)
+file(GLOB GUI_SOURCES CONFIGURE_DEPENDS src/gui/*.cpp src/gui/*.h)
+file(GLOB CLI_SOURCES CONFIGURE_DEPENDS src/cli/*.cpp src/cli/*.h)
+file(GLOB RESOURCE_FILES CONFIGURE_DEPENDS resources/*.qrc)
+# WinSCP's icon set (resources/icons.qrc, resources/animations.qrc) is NOT under the
+# GPL: its license (winscp-master/license.txt part B) forbids reuse in or with
+# another software. It is therefore opt-in for private builds; by default NixSCP
+# uses the desktop icon theme (src/gui/Icons.cpp falls back automatically).
+option(NIXSCP_WINSCP_ICONS "Embed WinSCP's icon set (not redistributable, see resources/icons/README)" OFF)
+if(NOT NIXSCP_WINSCP_ICONS)
+  list(FILTER RESOURCE_FILES EXCLUDE REGEX "/(icons|animations)\\.qrc$")
+endif()
+
+# Core: protocols, sessions, configuration (QtCore + QtNetwork only, no GUI)
+add_library(nixscpcore STATIC ${CORE_SOURCES})
+target_include_directories(nixscpcore PUBLIC src)
+target_link_libraries(nixscpcore PUBLIC Qt6::Core Qt6::Network PkgConfig::LIBSSH PkgConfig::LIBCRYPTO)
+target_compile_options(nixscpcore PRIVATE -Wall -Wextra)
+
+# GUI sources, compiled once: linked into the application and the GUI tests
+add_library(nixscpgui OBJECT ${GUI_SOURCES} ${RESOURCE_FILES})
+target_link_libraries(nixscpgui PUBLIC nixscpcore Qt6::Widgets)
+target_compile_definitions(nixscpgui PRIVATE PROJECT_VERSION="${PROJECT_VERSION}")
+target_compile_options(nixscpgui PRIVATE -Wall -Wextra)
+
+# GUI application (winscp.exe)
+add_executable(nixscp src/main.cpp)
+target_link_libraries(nixscp PRIVATE nixscpgui)
+target_compile_definitions(nixscp PRIVATE PROJECT_VERSION="${PROJECT_VERSION}")
+target_compile_options(nixscp PRIVATE -Wall -Wextra)
+install(TARGETS nixscp RUNTIME DESTINATION bin)
+
+# Console scripting client (winscp.com)
+if(CLI_SOURCES)
+  add_executable(nixscp-cli ${CLI_SOURCES})
+  target_link_libraries(nixscp-cli PRIVATE nixscpcore)
+  target_compile_definitions(nixscp-cli PRIVATE PROJECT_VERSION="${PROJECT_VERSION}")
+  target_compile_options(nixscp-cli PRIVATE -Wall -Wextra)
+  install(TARGETS nixscp-cli RUNTIME DESTINATION bin)
+endif()
+
+install(FILES data/nixscp.desktop DESTINATION share/applications)
+
+# Tests: every tests/test_<name>.cpp becomes target test_<name>, linked with the core.
+# Tests needing a server (test sshd etc.) skip themselves (exit 0) unless
+# their environment variables are set. Tests that mention NIXSCP_GUI_TESTS are
+# GUI tests: built with that define and the GUI objects, run offscreen.
+enable_testing()
+file(GLOB TEST_SOURCES CONFIGURE_DEPENDS tests/test_*.cpp)
+foreach(TEST_SOURCE ${TEST_SOURCES})
+  get_filename_component(TEST_NAME ${TEST_SOURCE} NAME_WE)
+  string(REPLACE "test_" "" TEST_SHORT ${TEST_NAME})
+  file(STRINGS ${TEST_SOURCE} GUI_TEST_MARKER REGEX "NIXSCP_GUI_TESTS" LIMIT_COUNT 1)
+  if(GUI_TEST_MARKER)
+    add_executable(${TEST_NAME} ${TEST_SOURCE})
+    target_link_libraries(${TEST_NAME} PRIVATE nixscpgui)
+    target_compile_definitions(${TEST_NAME} PRIVATE NIXSCP_GUI_TESTS)
+    add_test(NAME ${TEST_SHORT} COMMAND ${TEST_NAME})
+    set_tests_properties(${TEST_SHORT} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+  else()
+    add_executable(${TEST_NAME} ${TEST_SOURCE})
+    target_link_libraries(${TEST_NAME} PRIVATE nixscpcore)
+    add_test(NAME ${TEST_SHORT} COMMAND ${TEST_NAME})
+  endif()
+endforeach()
+
+# Desktop integration: AppStream metainfo and application icon.
+# The icon is optional (extracted from the WinSCP sources by a separate step),
+# so it is installed only when present at configure time.
+include(GNUInstallDirs)
+install(FILES data/nixscp.metainfo.xml DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/metainfo)
+# NixSCP application icon (original artwork): every hicolor size + scalable SVG
+foreach(ICON_SIZE 16 22 24 32 48 64 128 256 512)
+  install(FILES resources/appicon/nixscp-${ICON_SIZE}.png
+    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/${ICON_SIZE}x${ICON_SIZE}/apps RENAME nixscp.png)
+endforeach()
+install(FILES data/nixscp.svg DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/scalable/apps)
+
+# Packaging (cpack -G DEB); see packaging/README.md
+set(CPACK_PACKAGE_NAME nixscp)
+set(CPACK_PACKAGE_VENDOR "CodeWiz")
+set(CPACK_PACKAGE_CONTACT "Dragan Plavšić <hello@codewizdev.com>")
+set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/codewizdevs/nixscp")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "WinSCP for Linux: SFTP, SCP, FTP/FTPS, WebDAV and S3 client")
+set(CPACK_PACKAGE_DESCRIPTION "NixSCP is a native Linux port of WinSCP with the WinSCP Commander\ninterface for SFTP, SCP, FTP/FTPS, WebDAV and Amazon S3 transfers, a Site\nManager compatible with WinSCP.ini and the nixscp-cli scripting client.")
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_PACKAGING_INSTALL_PREFIX /usr)
+set(CPACK_STRIP_FILES ON)
+set(CPACK_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS
+  OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+# DEB by default; RPM with -DCPACK_GENERATOR=RPM (release builds run on the target distro)
+if(NOT CPACK_GENERATOR)
+  set(CPACK_GENERATOR DEB)
+endif()
+# Optional distro tag in package file names, e.g. -DNIXSCP_PACKAGE_SUFFIX=ubuntu26.04
+set(NIXSCP_PACKAGE_SUFFIX "" CACHE STRING "Suffix appended to package file names")
+# Debian / Ubuntu
+set(CPACK_DEBIAN_PACKAGE_NAME nixscp)
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Dragan Plavšić <hello@codewizdev.com>")
+set(CPACK_DEBIAN_PACKAGE_SECTION net)
+set(CPACK_DEBIAN_PACKAGE_PRIORITY optional)
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/codewizdevs/nixscp")
+# Fedora / openSUSE
+set(CPACK_RPM_PACKAGE_NAME nixscp)
+set(CPACK_RPM_PACKAGE_LICENSE "GPL-3.0-only")
+set(CPACK_RPM_PACKAGE_GROUP "Applications/Internet")
+set(CPACK_RPM_PACKAGE_URL "https://github.com/codewizdevs/nixscp")
+set(CPACK_RPM_PACKAGE_AUTOREQ ON)
+set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
+  /usr/share/applications /usr/share/metainfo /usr/share/icons /usr/share/icons/hicolor
+  /usr/share/icons/hicolor/scalable /usr/share/icons/hicolor/scalable/apps)
+foreach(ICON_SIZE 16 22 24 32 48 64 128 256 512)
+  list(APPEND CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
+    /usr/share/icons/hicolor/${ICON_SIZE}x${ICON_SIZE} /usr/share/icons/hicolor/${ICON_SIZE}x${ICON_SIZE}/apps)
+endforeach()
+if(NIXSCP_PACKAGE_SUFFIX)
+  set(CPACK_DEBIAN_FILE_NAME "nixscp_${PROJECT_VERSION}_${NIXSCP_PACKAGE_SUFFIX}_amd64.deb")
+  set(CPACK_RPM_FILE_NAME "nixscp-${PROJECT_VERSION}.${NIXSCP_PACKAGE_SUFFIX}.x86_64.rpm")
+else()
+  set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+  set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
+endif()
+include(CPack)

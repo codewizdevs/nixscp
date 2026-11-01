@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- NixSCP application icon, simplified variant for 16-32 px (original artwork). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f7fd8"/>
+      <stop offset="1" stop-color="#1c4f9c"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="30" height="30" rx="6" fill="url(#tile)"/>
+  <rect x="5" y="5" width="9.5" height="15" rx="1.5" fill="#ffffff"/>
+  <rect x="17.5" y="5" width="9.5" height="15" rx="1.5" fill="#ffffff"/>
+  <rect x="7" y="7.5" width="5.5" height="1.6" fill="#2f7fd8"/>
+  <rect x="19.5" y="7.5" width="5.5" height="1.6" fill="#1c4f9c"/>
+  <path d="M 3.5 24 L 9 19.5 L 9 22.2 L 23 22.2 L 23 19.5 L 28.5 24 L 23 28.5 L 23 25.8 L 9 25.8 L 9 28.5 Z"
+        fill="#ff8a1f" stroke="#ffffff" stroke-width="1" stroke-linejoin="round"/>
+</svg>

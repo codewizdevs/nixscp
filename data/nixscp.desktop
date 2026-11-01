@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=NixSCP
+GenericName=SFTP, SCP and FTP Client
+Comment=SFTP/SCP/FTP client with WinSCP interface
+Exec=nixscp /unsafe %u
+Icon=nixscp
+Terminal=false
+Categories=Network;FileTransfer;Qt;
+Keywords=NixSCP;WinSCP;SCP;SFTP;FTP;FTPS;FTPES;WebDAV;S3;SSH;file transfer;file manager;commander;remote;server;upload;download;sync;synchronize;putty;
+MimeType=x-scheme-handler/sftp;x-scheme-handler/scp;x-scheme-handler/ftp;x-scheme-handler/ftps;x-scheme-handler/ftpes;x-scheme-handler/dav;x-scheme-handler/davs;x-scheme-handler/s3;
+StartupWMClass=nixscp
+Actions=NewSession;
+
+[Desktop Action NewSession]
+Name=New Session
+Exec=nixscp

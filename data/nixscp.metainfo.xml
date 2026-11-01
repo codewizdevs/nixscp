@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- NixSCP - native Linux port of WinSCP -->
+<component type="desktop-application">
+  <id>com.codewizdev.NixSCP</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <developer id="com.codewizdev">
+    <name>Dragan Plavšić (CodeWiz)</name>
+  </developer>
+  <url type="homepage">https://codewizdev.com/</url>
+  <update_contact>hello@codewizdev.com</update_contact>
+  <name>NixSCP</name>
+  <summary>SFTP, SCP and FTP client with the WinSCP interface</summary>
+  <description>
+    <p>
+      NixSCP is a native Linux port of WinSCP. It provides the familiar
+      WinSCP Commander interface for copying files between a local and a
+      remote computer over SFTP, SCP, FTP and FTPS.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Two-panel Commander interface with a transfer queue</li>
+      <li>Site Manager compatible with the WinSCP.ini configuration format</li>
+      <li>Directory synchronization and file search</li>
+      <li>Integrated text editor</li>
+      <li>Console scripting client (nixscp-cli) compatible with WinSCP scripts</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">nixscp.desktop</launchable>
+  <provides>
+    <binary>nixscp</binary>
+    <binary>nixscp-cli</binary>
+  </provides>
+  <categories>
+    <category>Network</category>
+    <category>FileTransfer</category>
+  </categories>
+  <keywords>
+    <keyword>NixSCP</keyword>
+    <keyword>WinSCP</keyword>
+    <keyword>SCP</keyword>
+    <keyword>SFTP</keyword>
+    <keyword>FTP</keyword>
+    <keyword>FTPS</keyword>
+    <keyword>WebDAV</keyword>
+    <keyword>S3</keyword>
+    <keyword>SSH</keyword>
+    <keyword>file transfer</keyword>
+    <keyword>file manager</keyword>
+    <keyword>commander</keyword>
+    <keyword>synchronize</keyword>
+  </keywords>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-31"/>
+  </releases>
+</component>

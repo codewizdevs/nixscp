@@ -1,0 +1,552 @@
+[
+ {
+  "lang": "AF",
+  "name": "Afrikaans",
+  "english": "Afrikaans",
+  "locale": "af",
+  "lcid": 1078,
+  "completeness": 0,
+  "rtl": false,
+  "authors": "2004,2019,"
+ },
+ {
+  "lang": "AR",
+  "name": "العربية",
+  "english": "Arabic",
+  "locale": "ar",
+  "lcid": 1025,
+  "completeness": 69,
+  "rtl": true,
+  "authors": "2005,2026,Ramzi alsllami,Suhaila"
+ },
+ {
+  "lang": "BE",
+  "name": "беларуская",
+  "english": "Belarusian",
+  "locale": "be",
+  "lcid": 1059,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2010,2026,Pavel Miniutka,Marcis G."
+ },
+ {
+  "lang": "BG",
+  "name": "български",
+  "english": "Bulgarian",
+  "locale": "bg",
+  "lcid": 1026,
+  "completeness": 31,
+  "rtl": false,
+  "authors": "2004,2026,ССТАНЕВ,Plamen Penev"
+ },
+ {
+  "lang": "BN",
+  "name": "বাংলা",
+  "english": "Bangla",
+  "locale": "bn",
+  "lcid": 1093,
+  "completeness": 4,
+  "rtl": false,
+  "authors": "2016,2019,Sazzad Hossain Sharkar"
+ },
+ {
+  "lang": "CA",
+  "name": "català",
+  "english": "Catalan",
+  "locale": "ca",
+  "lcid": 1027,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,Joan Monguillot,Oriol Capsada,Víctor Mitjans"
+ },
+ {
+  "lang": "CH",
+  "name": "中文(繁體)",
+  "english": "Chinese (Traditional)",
+  "locale": "zh-Hant",
+  "lcid": 1028,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2005,2026,Mark Lin,Walter Cheuk,Hong-Yi Chen"
+ },
+ {
+  "lang": "CHS",
+  "name": "中文(简体)",
+  "english": "Chinese (Simplified)",
+  "locale": "zh-Hans",
+  "lcid": 2052,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2005,2026,Digital Sonic"
+ },
+ {
+  "lang": "CS",
+  "name": "čeština",
+  "english": "Czech",
+  "locale": "cs",
+  "lcid": 1029,
+  "completeness": 100,
+  "rtl": false,
+  "authors": "2003,2026,Martin Přikryl"
+ },
+ {
+  "lang": "DA",
+  "name": "dansk",
+  "english": "Danish",
+  "locale": "da",
+  "lcid": 1030,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2004,2026,Rene Skaarup,Kristoff Carsten,Torben Stallknecht,Thomas Pryds Lauritsen,Thomas Poulsen"
+ },
+ {
+  "lang": "DE",
+  "name": "Deutsch",
+  "english": "German",
+  "locale": "de",
+  "lcid": 1031,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,Marko Meister,Mick Weiss"
+ },
+ {
+  "lang": "EL",
+  "name": "Ελληνικά",
+  "english": "Greek",
+  "locale": "el",
+  "lcid": 1032,
+  "completeness": 26,
+  "rtl": false,
+  "authors": "2004,2022,Chrysostomos Rousopoulos,Dimitris Botsis,Michail K. Karos"
+ },
+ {
+  "lang": "ES",
+  "name": "español",
+  "english": "Spanish",
+  "locale": "es",
+  "lcid": 3082,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,David Martin,Fredy Rojas,Pablo Grande,Juan Razeto"
+ },
+ {
+  "lang": "ET",
+  "name": "eesti",
+  "english": "Estonian",
+  "locale": "et",
+  "lcid": 1061,
+  "completeness": 63,
+  "rtl": false,
+  "authors": "2005,2026,Kristjan Randma"
+ },
+ {
+  "lang": "FA",
+  "name": "فارسی",
+  "english": "Persian",
+  "locale": "fa",
+  "lcid": 1065,
+  "completeness": 94,
+  "rtl": true,
+  "authors": "2008,2024,Liber,Amir Ghasemi"
+ },
+ {
+  "lang": "FI",
+  "name": "suomi",
+  "english": "Finnish",
+  "locale": "fi",
+  "lcid": 1035,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,Sami Kuusisto,Tero Pelander,Jarmo Järvenpää"
+ },
+ {
+  "lang": "FP",
+  "name": "Filipino",
+  "english": "Filipino",
+  "locale": "fil",
+  "lcid": 1124,
+  "completeness": 18,
+  "rtl": false,
+  "authors": "2010,2019,Rafael Mendoza,Tyler Castaldo"
+ },
+ {
+  "lang": "FR",
+  "name": "français",
+  "english": "French",
+  "locale": "fr",
+  "lcid": 1036,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,Nicolas Frissung,Eric Winter,Julien Terral,Raphael Raimbault"
+ },
+ {
+  "lang": "GL",
+  "name": "galego",
+  "english": "Galician",
+  "locale": "gl",
+  "lcid": 1110,
+  "completeness": 3,
+  "rtl": false,
+  "authors": "2008,2019,Antón Méixome"
+ },
+ {
+  "lang": "HE",
+  "name": "עברית",
+  "english": "Hebrew",
+  "locale": "he",
+  "lcid": 1037,
+  "completeness": 14,
+  "rtl": true,
+  "authors": "2003,2026,Refael Ackermann"
+ },
+ {
+  "lang": "HI",
+  "name": "हिन्दी",
+  "english": "Hindi",
+  "locale": "hi",
+  "lcid": 1081,
+  "completeness": 0,
+  "rtl": false,
+  "authors": "2016,2019,"
+ },
+ {
+  "lang": "HR",
+  "name": "hrvatski",
+  "english": "Croatian",
+  "locale": "hr",
+  "lcid": 1050,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2007,2026,Mario Galevski,Ivan Rožić,Renato Pavicic"
+ },
+ {
+  "lang": "HU",
+  "name": "magyar",
+  "english": "Hungarian",
+  "locale": "hu",
+  "lcid": 1038,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,Dániel Kiss-Kálmán,Csaba Tóth,Kácsor István,Csizmadia Gábor"
+ },
+ {
+  "lang": "HY",
+  "name": "հայերեն",
+  "english": "Armenian",
+  "locale": "hy",
+  "lcid": 1067,
+  "completeness": 0,
+  "rtl": false,
+  "authors": "2012,2019,Eduard Babayan"
+ },
+ {
+  "lang": "IN",
+  "name": "Indonesia",
+  "english": "Indonesian",
+  "locale": "id",
+  "lcid": 1057,
+  "completeness": 54,
+  "rtl": false,
+  "authors": "2003,2026,Radhitya Wawan Yunarko,Iwan Setya Putra,Budi Rahardjo"
+ },
+ {
+  "lang": "IS",
+  "name": "íslenska",
+  "english": "Icelandic",
+  "locale": "is",
+  "lcid": 1039,
+  "completeness": 82,
+  "rtl": false,
+  "authors": "2015,2022,Stefán Örvar Sigmundsson"
+ },
+ {
+  "lang": "IT",
+  "name": "italiano",
+  "english": "Italian",
+  "locale": "it",
+  "lcid": 1040,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,bovirus,Claudio Galdiolo,Vincenzo Reale,Toni Giorgino"
+ },
+ {
+  "lang": "JP",
+  "name": "日本語",
+  "english": "Japanese",
+  "locale": "ja",
+  "lcid": 1041,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,Kobachi,Nobushige Sanada,Hiroki Kobayashi,Shinichi Ozaki"
+ },
+ {
+  "lang": "KA",
+  "name": "ქართული",
+  "english": "Georgian",
+  "locale": "ka",
+  "lcid": 1079,
+  "completeness": 81,
+  "rtl": false,
+  "authors": "2025,2026,Temuri Doghonadze"
+ },
+ {
+  "lang": "KO",
+  "name": "한국어",
+  "english": "Korean",
+  "locale": "ko",
+  "lcid": 1042,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2004,2026,Jinsup Park,Keunsik Hong"
+ },
+ {
+  "lang": "LT",
+  "name": "lietuvių",
+  "english": "Lithuanian",
+  "locale": "lt",
+  "lcid": 1063,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,Donatas,Gedas Lukošius,Tomas Vilda,Linas Jankauskas"
+ },
+ {
+  "lang": "LV",
+  "name": "latviešu",
+  "english": "Latvian",
+  "locale": "lv",
+  "lcid": 1062,
+  "completeness": 6,
+  "rtl": false,
+  "authors": "2004,2019,Henrijs Kons,Vairis Caune"
+ },
+ {
+  "lang": "MK",
+  "name": "македонски",
+  "english": "Macedonian",
+  "locale": "mk",
+  "lcid": 1071,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2017,2026,Mario Galevski"
+ },
+ {
+  "lang": "MS",
+  "name": "Melayu",
+  "english": "Malay",
+  "locale": "ms",
+  "lcid": 1086,
+  "completeness": 23,
+  "rtl": false,
+  "authors": "2003,2019,Lim Ghee Lam"
+ },
+ {
+  "lang": "MYA",
+  "name": "မြန်မာ",
+  "english": "Burmese",
+  "locale": "my",
+  "lcid": 1109,
+  "completeness": 7,
+  "rtl": false,
+  "authors": "2018,2019,Winston Lei"
+ },
+ {
+  "lang": "NL",
+  "name": "Nederlands",
+  "english": "Dutch",
+  "locale": "nl",
+  "lcid": 1043,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,Nathan van Dael,Emma Vriezen,Pieter Verhaeghe,Russell Ian Trafford,Stephan Eizinga,Dennis van Zoerlandt"
+ },
+ {
+  "lang": "NO",
+  "name": "norsk bokmål",
+  "english": "Norwegian Bokmål",
+  "locale": "nb",
+  "lcid": 1044,
+  "completeness": 97,
+  "rtl": false,
+  "authors": "2003,2026,Stein-Aksel Basma,Denis Braekhus,Odd Egil Hansen"
+ },
+ {
+  "lang": "PA",
+  "name": "ਪੰਜਾਬੀ",
+  "english": "Punjabi",
+  "locale": "pa",
+  "lcid": 1094,
+  "completeness": 17,
+  "rtl": false,
+  "authors": "2025,2025,Jagjeet Singh"
+ },
+ {
+  "lang": "PL",
+  "name": "polski",
+  "english": "Polish",
+  "locale": "pl",
+  "lcid": 1045,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,Marek Adamski,Michał Trzebiatowski,Hubert Trzewik,Wojciech Fornal,Andrzej Maslowski,Marek Lipinski"
+ },
+ {
+  "lang": "PT",
+  "name": "português (Brasil)",
+  "english": "Portuguese (Brazil)",
+  "locale": "pt-BR",
+  "lcid": 1046,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,Marcello Mco,Eduardo Mozart,Claudionor Buzzo Raymundo,Jefferson Sousa,Marcelo Pessoa,Daniel Costa,Rafael Camacho,André Arruda dos Santos Silva"
+ },
+ {
+  "lang": "PTG",
+  "name": "português (Portugal)",
+  "english": "Portuguese (Portugal)",
+  "locale": "pt-PT",
+  "lcid": 2070,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,Hugo Simões,Sérgio Clemente Alves,enVide neFelibata,Joaquim Fonseca,Francisco Azenha,Marcelo Rodrigues"
+ },
+ {
+  "lang": "RO",
+  "name": "română",
+  "english": "Romanian",
+  "locale": "ro",
+  "lcid": 1048,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2004,2026,Catalin Podoleanu,Radu Basca"
+ },
+ {
+  "lang": "RU",
+  "name": "русский",
+  "english": "Russian",
+  "locale": "ru",
+  "lcid": 1049,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,Vitaliy Zhukov,Alexey Vesnin,Maksim Sidorov,Dmitriy Yermolayev,Stas Ukolov,Alexander Nureyev"
+ },
+ {
+  "lang": "SK",
+  "name": "slovenčina",
+  "english": "Slovak",
+  "locale": "sk",
+  "lcid": 1051,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2005,2026,Marián Hikaník,Patrik Lenart"
+ },
+ {
+  "lang": "SL",
+  "name": "slovenščina",
+  "english": "Slovenian",
+  "locale": "sl",
+  "lcid": 1060,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2006,2026,Žiga Vodnjov Frelih,Aleksander Hegler,Renato Lukac"
+ },
+ {
+  "lang": "SQ",
+  "name": "shqip",
+  "english": "Albanian",
+  "locale": "sq",
+  "lcid": 1052,
+  "completeness": 0,
+  "rtl": false,
+  "authors": "2005,2019,"
+ },
+ {
+  "lang": "SRL",
+  "name": "srpski (latinica)",
+  "english": "Serbian (Latin)",
+  "locale": "sr-Latn",
+  "lcid": 2074,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2006,2026,Mario Galevski,Neobee.net"
+ },
+ {
+  "lang": "SV",
+  "name": "svenska",
+  "english": "Swedish",
+  "locale": "sv",
+  "lcid": 1053,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2003,2026,Andreas Pettersson,René Fichter"
+ },
+ {
+  "lang": "TA",
+  "name": "தமிழ்",
+  "english": "Tamil",
+  "locale": "ta",
+  "lcid": 1097,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2024,2026,Tamil Time Team"
+ },
+ {
+  "lang": "TH",
+  "name": "ไทย",
+  "english": "Thai",
+  "locale": "th",
+  "lcid": 1054,
+  "completeness": 9,
+  "rtl": false,
+  "authors": "2004,2026,Thanapon Namjittrong"
+ },
+ {
+  "lang": "TR",
+  "name": "Türkçe",
+  "english": "Turkish",
+  "locale": "tr",
+  "lcid": 1055,
+  "completeness": 99,
+  "rtl": false,
+  "authors": "2004,2026,Kaya Zeren,Fatih Savas,Kerem Emik,Süleyman Şentürk"
+ },
+ {
+  "lang": "UK",
+  "name": "українська",
+  "english": "Ukrainian",
+  "locale": "uk",
+  "lcid": 1058,
+  "completeness": 88,
+  "rtl": false,
+  "authors": "2006,2026,lexxai,Ivanka Skakun,Martyniv Alex,Oleg Butuzov"
+ },
+ {
+  "lang": "VI",
+  "name": "Tiếng Việt",
+  "english": "Vietnamese",
+  "locale": "vi",
+  "lcid": 1066,
+  "completeness": 77,
+  "rtl": false,
+  "authors": "2004,2025,Phạm Văn Khánh,Lê Huy Mạnh Tân,Trần Ngọc Quân"
+ },
+ {
+  "lang": "XXE",
+  "name": "esperanto",
+  "english": "Esperanto",
+  "locale": "eo",
+  "lcid": 4294967109,
+  "completeness": 2,
+  "rtl": false,
+  "authors": "2004,2019,Trio"
+ },
+ {
+  "lang": "XXK",
+  "name": "Taqbaylit",
+  "english": "Kabyle",
+  "locale": "kab",
+  "lcid": 4294967115,
+  "completeness": 74,
+  "rtl": false,
+  "authors": "2016,2019,Mohammed Belkacem,Yacine Bouklif"
+ }
+]

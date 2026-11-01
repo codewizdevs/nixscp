@@ -1,0 +1,16 @@
+<!DOCTYPE RCC>
+<!-- NixSCP's own application icon (original artwork, same license as NixSCP);
+     always embedded, independent of the opt-in WinSCP icon set -->
+<RCC version="1.0">
+  <qresource prefix="/appicon">
+    <file alias="nixscp-16.png">appicon/nixscp-16.png</file>
+    <file alias="nixscp-22.png">appicon/nixscp-22.png</file>
+    <file alias="nixscp-24.png">appicon/nixscp-24.png</file>
+    <file alias="nixscp-32.png">appicon/nixscp-32.png</file>
+    <file alias="nixscp-48.png">appicon/nixscp-48.png</file>
+    <file alias="nixscp-64.png">appicon/nixscp-64.png</file>
+    <file alias="nixscp-128.png">appicon/nixscp-128.png</file>
+    <file alias="nixscp-256.png">appicon/nixscp-256.png</file>
+    <file alias="nixscp-512.png">appicon/nixscp-512.png</file>
+  </qresource>
+</RCC>

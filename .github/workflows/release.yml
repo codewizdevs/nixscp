@@ -1,0 +1,107 @@
+# Builds NixSCP packages (.deb / .rpm) inside each target distribution's own
+# container, so libraries and package dependencies match that distribution,
+# and attaches them to the GitHub release of the pushed version tag.
+# Packages use the desktop icon theme (NIXSCP_WINSCP_ICONS=OFF).
+name: Release packages
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 26.04 (.deb)
+            image: ubuntu:26.04
+            family: debian
+            generator: DEB
+            suffix: ubuntu26.04
+          - name: Debian 13 (.deb)
+            image: debian:trixie
+            family: debian
+            generator: DEB
+            suffix: debian13
+          - name: Fedora 42 (.rpm)
+            image: fedora:42
+            family: fedora
+            generator: RPM
+            suffix: fc42
+          - name: Fedora 43 (.rpm)
+            image: fedora:43
+            family: fedora
+            generator: RPM
+            suffix: fc43
+    steps:
+      - name: Install build dependencies (Debian/Ubuntu)
+        if: matrix.family == 'debian'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential cmake pkgconf \
+            qt6-base-dev libssh-dev libssl-dev dpkg-dev file git ca-certificates
+
+      - name: Install build dependencies (Fedora)
+        if: matrix.family == 'fedora'
+        run: |
+          dnf install -y gcc-c++ cmake pkgconf qt6-qtbase-devel libssh-devel \
+            openssl-devel rpm-build file git
+
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DNIXSCP_WINSCP_ICONS=OFF \
+            -DNIXSCP_PACKAGE_SUFFIX=${{ matrix.suffix }} \
+            -DCPACK_GENERATOR=${{ matrix.generator }}
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test (offline suites; server suites skip themselves)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --test-dir build --output-on-failure --timeout 600
+
+      - name: Package
+        run: |
+          cd build
+          cpack -G ${{ matrix.generator }}
+          ls -l *.deb *.rpm 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nixscp-${{ matrix.suffix }}
+          path: |
+            build/*.deb
+            build/*.rpm
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: NixSCP ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            packages/*.deb
+            packages/*.rpm

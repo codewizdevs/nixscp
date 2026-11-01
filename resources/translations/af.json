@@ -1,0 +1,23 @@
+{
+"lang":"AF",
+"name":"Afrikaans",
+"english":"Afrikaans",
+"locale":"af",
+"lcid":1078,
+"completeness":0,
+"rtl":false,
+"authors":"2004,2019,",
+"strings":{
+"&Help":"Hulp",
+"&License...":"Lesensies",
+"About application":"Aangaande programmatuur",
+"Display license":"Vertoon lisensie",
+"Help":"Hulp",
+"License agreements of all following programs (libraries) are part of application license agreement.":"Lisensie aanvaarding van alle programme (Biblioteke) is deel van die programmatuur lisensie aanvardings.",
+"License...":"Lesensies",
+"OK":"Goed",
+"Portions copyright:":"Kopiereg Deel:",
+"To send comments and report bugs use support forum at:":"Om kommentaar en programmatuur foute aan te meld gebruik die hulp forum by:"
+},
+"contexts":{}
+}

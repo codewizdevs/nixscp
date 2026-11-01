@@ -1,0 +1,6 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/license">
+    <file alias="license.txt">license/license.txt</file>
+  </qresource>
+</RCC>

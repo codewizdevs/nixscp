@@ -1,0 +1,15 @@
+# build output
+build/
+build-*/
+*.user
+CMakeLists.txt.user
+
+# never commit personal configuration, logs or credentials
+*.ini
+*.reg
+*.log
+*.pem
+*.key
+*.crt
+.env
+.env.*
