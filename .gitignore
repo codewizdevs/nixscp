@@ -13,3 +13,5 @@ CMakeLists.txt.user
 *.crt
 .env
 .env.*
+__pycache__/
+*.pyc
