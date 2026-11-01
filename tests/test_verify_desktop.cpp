@@ -740,6 +740,14 @@ static bool ValidateDesktopFile(const QString & Validator, const QString & FileN
 static void TestDesktopEntries(const QString & Scratch)
 {
   std::printf("- desktop entries\n");
+  // shared-mime-info sniffs SVG by "<svg" in the first 256 bytes: GNOME
+  // Shell (gdk-pixbuf) cannot load the app icon otherwise (blank dock icon)
+  for (const QString & Icon : {QStringLiteral("nixscp.svg"), QStringLiteral("nixscp-small.svg")})
+  {
+    QByteArray Svg = ReadFile(SourceDir() + QStringLiteral("/data/") + Icon);
+    qsizetype Tag = Svg.indexOf("<svg");
+    CHECK_MSG((Tag >= 0) && (Tag < 200), Icon);
+  }
   QString Validator = QStandardPaths::findExecutable(QStringLiteral("desktop-file-validate"));
   if (Validator.isEmpty())
   {
