@@ -1,6 +1,7 @@
 // Port of the inter-instance part of WinSCP source/windows/WinMain.cpp and
 // forms/CustomScpExplorer.cpp (WMCopyData); see SingleInstance.h
 #include "gui/SingleInstance.h"
+#include "core/Platform.h"
 
 #include <QCryptographicHash>
 #include <QDataStream>
@@ -43,7 +44,7 @@ QString SingleInstance::DefaultServerName(const QString & IniFileName)
     Path = Canonical.isEmpty() ? Info.absoluteFilePath() : Canonical;
   }
   QByteArray Hash = QCryptographicHash::hash(Path.toUtf8(), QCryptographicHash::Sha256).toHex().left(16);
-  QString Name = QStringLiteral("nixscp-%1-%2").arg(static_cast<qulonglong>(getuid())).arg(QString::fromLatin1(Hash));
+  QString Name = QStringLiteral("nixscp-%1-%2").arg(Platform::UserKey(), QString::fromLatin1(Hash));
   // Qt creates the runtime directory (0700) when $XDG_RUNTIME_DIR is not set
   QString Dir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
   QString Result = Dir.isEmpty() ? Name : QDir(Dir).filePath(Name);

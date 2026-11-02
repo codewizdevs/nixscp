@@ -4,6 +4,7 @@
 #include "gui/EditorManager.h"
 #include "gui/HelpSystem.h"
 
+#include "core/CopyParam.h"
 #include "core/FileMasks.h"
 #include "core/Queue.h"
 #include "core/IniStorage.h"
@@ -45,12 +46,19 @@
 #include <cerrno>
 #include <csignal>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
+#ifdef Q_OS_WIN
+#include <QWinEventNotifier>
+#else
+#include <sys/syscall.h>
 #ifndef SYS_pidfd_open
 #define SYS_pidfd_open 434
 #endif
+#endif
+
+#include "core/LocalFileSystem.h"
+#include "core/Platform.h"
 
 static const QString TemporaryFolderPrefix = QStringLiteral("nixscp-");
 static const int KeepUpToDateChangeDelay = 500;   // TGUIConfiguration::KeepUpToDateChangeDelay (ms)
@@ -75,8 +83,13 @@ struct EditorManager::EditedFile
   bool NewFile = false;          // ExecuteNewRemoteFile: not on the server yet
   QPointer<EditorWindow> Editor; // internal editor
   qint64 Pid = 0;                // tracked external editor process (SDI)
-  int PidFd = -1;
+#ifdef Q_OS_WIN
+  HANDLE PidHandle = nullptr;    // signalled when the process exits
+  QWinEventNotifier * PidNotifier = nullptr;
+#else
+  int PidFd = -1;                // pidfd: readable when the process exits
   QSocketNotifier * PidNotifier = nullptr;
+#endif
   QTimer * PidPoll = nullptr;
   QElapsedTimer Opened;
   // local file state last uploaded/downloaded (mtime in ns, size)
@@ -124,6 +137,8 @@ static QString ValidLocalName(const QString & Name)
   QString Result = Name;
   Result.replace(QLatin1Char('/'), QLatin1Char('_'));
   Result.remove(QChar(0));
+  // Windows: no ":", "?", ... nor reserved names (no change on Linux)
+  Result = CopyParam::ValidLocalFileName(Result);
   if (Result.isEmpty() || (Result == QStringLiteral(".")) || (Result == QStringLiteral("..")))
   {
     Result = QStringLiteral("_") + Result;
@@ -133,7 +148,24 @@ static QString ValidLocalName(const QString & Name)
 
 static bool IsProcessAlive(qint64 Pid)
 {
+#ifdef Q_OS_WIN
+  if (Pid <= 0)
+  {
+    return false;
+  }
+  HANDLE Process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(Pid));
+  if (Process == nullptr)
+  {
+    // access denied: it exists (of another user)
+    return GetLastError() == ERROR_ACCESS_DENIED;
+  }
+  DWORD Code = 0;
+  bool Alive = GetExitCodeProcess(Process, &Code) && (Code == STILL_ACTIVE);
+  CloseHandle(Process);
+  return Alive;
+#else
   return (Pid > 0) && ((::kill(static_cast<pid_t>(Pid), 0) == 0) || (errno == EPERM));
+#endif
 }
 
 //---------------------------------------------------------------------------
@@ -1040,7 +1072,12 @@ void EditorManager::CustomExecuteFile(EditedFile * File, ExecuteFileBy By, const
   }
   else
   {
+#ifdef Q_OS_WIN
+    // Opens the file with its associated program (and exits at once)
+    Command = QStringLiteral("explorer.exe !.!");
+#else
     Command = QStringLiteral("xdg-open !.!");
+#endif
     Track = (EditorConfigInteger(QStringLiteral("SDIShellEditor"), 0) != 0);
   }
   QStringList Args = EditorCommandArguments(Command, File->FileName);
@@ -1048,7 +1085,8 @@ void EditorManager::CustomExecuteFile(EditedFile * File, ExecuteFileBy By, const
   // cannot be tracked (OPEN_FILE_NO_PROCESS2)
   static const QStringList Launchers = {
     QStringLiteral("xdg-open"), QStringLiteral("gio"), QStringLiteral("kde-open"), QStringLiteral("kde-open5"),
-    QStringLiteral("kioclient"), QStringLiteral("kioclient5"), QStringLiteral("exo-open"), QStringLiteral("gnome-open") };
+    QStringLiteral("kioclient"), QStringLiteral("kioclient5"), QStringLiteral("exo-open"), QStringLiteral("gnome-open"),
+    QStringLiteral("explorer.exe"), QStringLiteral("explorer"), QStringLiteral("cmd.exe"), QStringLiteral("cmd") };
   if (!Args.isEmpty() && Launchers.contains(QFileInfo(Args.first()).fileName()) && (By == efExternalEditor))
   {
     Track = false;
@@ -1105,6 +1143,22 @@ bool EditorManager::StartExternal(const QString & Command, const QString & FileN
 void EditorManager::TrackProcess(EditedFile * File)
 {
   quint64 Id = File->Id;
+#ifdef Q_OS_WIN
+  HANDLE Process = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(File->Pid));
+  if (Process != nullptr)
+  {
+    // the process handle is signalled when it exits
+    File->PidHandle = Process;
+    File->PidNotifier = new QWinEventNotifier(Process, this);
+    connect(File->PidNotifier, &QWinEventNotifier::activated, this, [this, Id]()
+    {
+      if (EditedFile * F = FindFile(Id))
+      {
+        ProcessFinished(F);
+      }
+    });
+  }
+#else
   int Fd = static_cast<int>(::syscall(SYS_pidfd_open, static_cast<pid_t>(File->Pid), 0));
   if (Fd >= 0)
   {
@@ -1119,6 +1173,7 @@ void EditorManager::TrackProcess(EditedFile * File)
       }
     });
   }
+#endif
   else if (!IsProcessAlive(File->Pid))
   {
     QTimer::singleShot(0, this, [this, Id]()
@@ -1151,13 +1206,13 @@ void EditorManager::TrackProcess(EditedFile * File)
 //---------------------------------------------------------------------------
 bool EditorManager::FileStamp(const QString & FileName, qint64 & Time, qint64 & Size)
 {
-  struct stat St;
-  if (::stat(QFile::encodeName(FileName).constData(), &St) != 0)
+  LocalFs::Stat St;
+  if (!LocalFs::StatFollow(FileName, St))
   {
     return false;
   }
-  Time = static_cast<qint64>(St.st_mtim.tv_sec) * 1000000000LL + St.st_mtim.tv_nsec;
-  Size = static_cast<qint64>(St.st_size);
+  Time = St.ModifiedSec * 1000000000LL + St.ModifiedNsec;
+  Size = St.Size;
   return true;
 }
 
@@ -1725,11 +1780,19 @@ void EditorManager::CloseProcess(EditedFile * File)
 {
   delete File->PidNotifier;
   File->PidNotifier = nullptr;
+#ifdef Q_OS_WIN
+  if (File->PidHandle != nullptr)
+  {
+    CloseHandle(File->PidHandle);
+    File->PidHandle = nullptr;
+  }
+#else
   if (File->PidFd >= 0)
   {
     ::close(File->PidFd);
     File->PidFd = -1;
   }
+#endif
   delete File->PidPoll;
   File->PidPoll = nullptr;
   File->Pid = 0;
@@ -2066,14 +2129,13 @@ QStringList EditorManager::FindTemporaryFolders()
 {
   // TWinConfiguration::DoFindTemporaryFolders
   QStringList Result;
-  uint Uid = ::getuid();
   for (const QString & Base : TemporaryBaseDirectories())
   {
     const QFileInfoList Entries = QDir(Base).entryInfoList({TemporaryFolderPrefix + QStringLiteral("*")},
       QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot | QDir::NoSymLinks);
     for (const QFileInfo & Entry : Entries)
     {
-      if (Entry.ownerId() != Uid)
+      if (!Platform::OwnedByCurrentUser(Entry.ownerId()))
       {
         continue;
       }

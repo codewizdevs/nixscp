@@ -45,7 +45,9 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 
+#ifndef Q_OS_WIN
 #include <langinfo.h>
+#endif
 
 // Open editors, for Save All and the application exit (TEditorForm instances)
 static QList<EditorWindow *> EditorInstances;
@@ -662,8 +664,13 @@ struct EditorWindow::Private : public QObject
 
   static QString SystemCodeset()
   {
+#ifdef Q_OS_WIN
+    // The ANSI code page of Windows ("CP1252"...), as WinSCP's CP_ACP
+    return QStringLiteral("CP%1").arg(GetACP());
+#else
     const char * Codeset = nl_langinfo(CODESET);
     return (Codeset != nullptr) && (*Codeset != '\0') ? QString::fromLatin1(Codeset) : QStringLiteral("ANSI_X3.4-1968");
+#endif
   }
 
   bool LoadFile()
@@ -1364,7 +1371,7 @@ EditorWindow::EditorWindow(const QString & LocalFileName, const QString & Displa
   });
   // FormHelp: F1 and Help > Help open the editor's page
   HelpSystem::InstallFormHelp(this, QStringLiteral("ui_editor"));
-  connect(d->HelpAction, &QAction::triggered, d, [this]() { HelpSystem::ShowHelp(QStringLiteral("ui_editor")); });
+  connect(d->HelpAction, &QAction::triggered, d, []() { HelpSystem::ShowHelp(QStringLiteral("ui_editor")); });
   connect(d->DefaultColorAction, &QAction::triggered, d, [this]() { SetBackgroundColor(QColor()); });
   connect(d->CustomColorAction, &QAction::triggered, d, [this]()
   {

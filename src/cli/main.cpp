@@ -901,11 +901,10 @@ int main(int argc, char * argv[])
 
   Console & C = Console::Instance();
   Options Params;
-  QStringList Args;
-  for (int I = 1; I < argc; I++)
+  // Unicode on Windows too (argv there is in the ANSI code page)
+  const QStringList Args = QCoreApplication::arguments().mid(1);
+  for (const QString & Arg : Args)
   {
-    QString Arg = QString::fromLocal8Bit(argv[I]);
-    Args.append(Arg);
     Params.Add(Arg);
   }
 

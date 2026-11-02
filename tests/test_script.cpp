@@ -24,9 +24,13 @@
 #include <QRegularExpression>
 #include <QTemporaryDir>
 
+#include "core/Platform.h"
+
 #include <sys/stat.h>
+
+#ifndef _WIN32
 #include <signal.h>
-#include <fcntl.h>
+#endif
 #include <cstdio>
 
 static int Failures = 0;
@@ -445,10 +449,7 @@ static void WriteFile(const QString & FileName, const QByteArray & Data, qint64 
   F.close();
   if (MTime > 0)
   {
-    struct timespec Times[2];
-    Times[0].tv_sec = Times[1].tv_sec = static_cast<time_t>(MTime);
-    Times[0].tv_nsec = Times[1].tv_nsec = 0;
-    utimensat(AT_FDCWD, QFile::encodeName(FileName).constData(), Times, 0);
+    Platform::SetFileTimes(FileName, MTime);
   }
 }
 
@@ -764,7 +765,8 @@ static void TestServer(const QString & Host, int Port, const QString & User, con
   CHECK_MSG((R.ExitCode == 1) && R.Output.contains(QStringLiteral("Unknown option 'sideways'.")), R.Output);
   CHECK(QFileInfo::exists(SyncLocal + QStringLiteral("/fromremote.txt")));
 
-  // keepuptodate: runs until Ctrl+C
+  // keepuptodate: runs until Ctrl+C (needs SIGINT delivery to the child)
+#ifndef _WIN32
   {
     QProcess P;
     P.setProgram(CliPath);
@@ -802,6 +804,7 @@ static void TestServer(const QString & Host, int Port, const QString & User, con
     CHECK(QFileInfo::exists(SyncRemote + QStringLiteral("/live.txt")));
     CHECK(!QFileInfo::exists(SyncRemote + QStringLiteral("/one.txt")));
   }
+#endif
 
   // rmdir, log file
   QString LogFile = ScratchDir + QStringLiteral("/session.log");

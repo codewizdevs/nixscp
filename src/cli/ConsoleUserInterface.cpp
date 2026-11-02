@@ -6,10 +6,12 @@
 #include <QElapsedTimer>
 #include <QMutexLocker>
 
-#include <poll.h>
 #include <signal.h>
-#include <termios.h>
 #include <unistd.h>
+#ifndef Q_OS_WIN
+#include <poll.h>
+#include <termios.h>
+#endif
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
@@ -25,14 +27,64 @@ static void InterruptHandler(int)
   }
 }
 
+// Text of the console: UTF-8 on Windows (SetUpWindowsConsole), the locale's encoding elsewhere
+static QByteArray ToConsole(const QString & Str)
+{
+#ifdef Q_OS_WIN
+  return Str.toUtf8();
+#else
+  return Str.toLocal8Bit();
+#endif
+}
+
+static QString FromConsole(const QByteArray & Data)
+{
+#ifdef Q_OS_WIN
+  return QString::fromUtf8(Data);
+#else
+  return QString::fromLocal8Bit(Data);
+#endif
+}
+
 Console & Console::Instance()
 {
   static Console Instance;
   return Instance;
 }
 
+#ifdef Q_OS_WIN
+static BOOL WINAPI ConsoleCtrlHandler(DWORD Event)
+{
+  if ((Event == CTRL_C_EVENT) || (Event == CTRL_BREAK_EVENT))
+  {
+    InterruptHandler(SIGINT);
+    return TRUE;
+  }
+  return FALSE;
+}
+
+// UTF-8 in and out, and the escape sequences (window title) of Windows 10+
+static void SetUpWindowsConsole()
+{
+  SetConsoleOutputCP(CP_UTF8);
+  SetConsoleCP(CP_UTF8);
+  for (DWORD Std : {STD_OUTPUT_HANDLE, STD_ERROR_HANDLE})
+  {
+    HANDLE Handle = GetStdHandle(Std);
+    DWORD Mode = 0;
+    if ((Handle != INVALID_HANDLE_VALUE) && GetConsoleMode(Handle, &Mode))
+    {
+      SetConsoleMode(Handle, Mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+  }
+}
+#endif
+
 Console::Console()
 {
+#ifdef Q_OS_WIN
+  SetUpWindowsConsole();
+#endif
   FOutputTty = (isatty(STDOUT_FILENO) != 0);
   FInputTty = (isatty(STDIN_FILENO) != 0);
   FStdErrTty = (isatty(STDERR_FILENO) != 0);
@@ -85,11 +137,15 @@ void Console::RestoreTitle()
 
 void Console::InstallSignalHandler()
 {
+#ifdef Q_OS_WIN
+  SetConsoleCtrlHandler(&ConsoleCtrlHandler, TRUE);
+#else
   struct sigaction Action = {};
   Action.sa_handler = InterruptHandler;
   sigemptyset(&Action.sa_mask);
   Action.sa_flags = 0;
   sigaction(SIGINT, &Action, nullptr);
+#endif
 }
 
 bool Console::PendingAbort() const
@@ -104,7 +160,7 @@ void Console::ClearPendingAbort()
 
 void Console::Write(const QString & Str)
 {
-  QByteArray Bytes = Str.toLocal8Bit();
+  QByteArray Bytes = ToConsole(Str);
   FILE * Stream = FUseStdErr ? stderr : stdout;
   fwrite(Bytes.constData(), 1, static_cast<size_t>(Bytes.size()), Stream);
   fflush(Stream);
@@ -161,6 +217,80 @@ void Console::FinishProgress()
 namespace
 {
 // Switches the terminal to no-echo (and optionally non-canonical) mode for its lifetime
+#ifdef Q_OS_WIN
+class TerminalMode
+{
+public:
+  TerminalMode(bool Active, bool Echo, bool Canonical) :
+    FInput(GetStdHandle(STD_INPUT_HANDLE)), FActive(Active && GetConsoleMode(FInput, &FPrev))
+  {
+    if (FActive)
+    {
+      DWORD Mode = FPrev;
+      if (!Echo)
+      {
+        Mode &= ~ENABLE_ECHO_INPUT;
+      }
+      if (!Canonical)
+      {
+        Mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+      }
+      SetConsoleMode(FInput, Mode);
+    }
+  }
+  ~TerminalMode()
+  {
+    if (FActive)
+    {
+      SetConsoleMode(FInput, FPrev);
+    }
+  }
+private:
+  HANDLE FInput;
+  DWORD FPrev = 0;
+  bool FActive;
+};
+
+// Whether a byte can be read from stdin without blocking for long
+static bool InputAvailable(HANDLE Input, DWORD TimeoutMs)
+{
+  DWORD Mode = 0;
+  if (GetConsoleMode(Input, &Mode))
+  {
+    // Console: key presses (other events, as focus or mouse, are dropped)
+    if (WaitForSingleObject(Input, TimeoutMs) != WAIT_OBJECT_0)
+    {
+      return false;
+    }
+    INPUT_RECORD Record;
+    DWORD Count = 0;
+    while (PeekConsoleInputW(Input, &Record, 1, &Count) && (Count == 1))
+    {
+      if ((Record.EventType == KEY_EVENT) && Record.Event.KeyEvent.bKeyDown)
+      {
+        return true;
+      }
+      ReadConsoleInputW(Input, &Record, 1, &Count);
+    }
+    return false;
+  }
+  if (GetFileType(Input) == FILE_TYPE_PIPE)
+  {
+    DWORD Available = 0;
+    if (!PeekNamedPipe(Input, nullptr, 0, nullptr, &Available, nullptr))
+    {
+      return true;   // closed: ReadFile reports EOF
+    }
+    if (Available == 0)
+    {
+      Sleep(TimeoutMs);
+      return false;
+    }
+    return true;
+  }
+  return true;   // a file: never blocks
+}
+#else
 class TerminalMode
 {
 public:
@@ -193,6 +323,7 @@ private:
   struct termios FPrev = {};
   bool FActive;
 };
+#endif
 
 // Waits for one byte on stdin; 1 = read, 0 = EOF/error, -1 = timeout, -2 = interrupted
 int ReadByte(char & C, QElapsedTimer & Timer, unsigned int TimeoutMs)
@@ -207,6 +338,28 @@ int ReadByte(char & C, QElapsedTimer & Timer, unsigned int TimeoutMs)
     {
       return -1;
     }
+#ifdef Q_OS_WIN
+    HANDLE Input = GetStdHandle(STD_INPUT_HANDLE);
+    if (!InputAvailable(Input, 100))
+    {
+      continue;
+    }
+    DWORD Read = 0;
+    if (!ReadFile(Input, &C, 1, &Read, nullptr))
+    {
+      // Ctrl+C aborts a pending console read
+      if ((GetLastError() == ERROR_OPERATION_ABORTED) && !Console::Instance().PendingAbort())
+      {
+        continue;
+      }
+      return Console::Instance().PendingAbort() ? -2 : 0;
+    }
+    if ((Read == 1) && (C == '\r'))
+    {
+      continue;   // CR LF line ends
+    }
+    return (Read == 1) ? 1 : 0;
+#else
     struct pollfd Fd = {STDIN_FILENO, POLLIN, 0};
     int Rc = poll(&Fd, 1, 100);
     if (Rc < 0)
@@ -231,6 +384,7 @@ int ReadByte(char & C, QElapsedTimer & Timer, unsigned int TimeoutMs)
       return 0;
     }
     return (Read == 1) ? 1 : 0;
+#endif
   }
 }
 }
@@ -283,7 +437,7 @@ bool Console::Input(QString & Str, bool Echo, unsigned int TimeoutMs)
   {
     Line.chop(1);
   }
-  Str = QString::fromLocal8Bit(Line);
+  Str = FromConsole(Line);
   return Result;
 }
 
@@ -572,7 +726,7 @@ int Console::Choice(const QString & Accels, int Cancel, int Break, int Timeouted
         }
         Line += C;
       }
-      QString Answer = QString::fromLocal8Bit(Line).trimmed();
+      QString Answer = FromConsole(Line).trimmed();
       if (!Answer.isEmpty())
       {
         int Index = static_cast<int>(Accels.indexOf(Answer[0].toUpper()));

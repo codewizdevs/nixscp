@@ -181,7 +181,7 @@ public:
   void Upload(const QString & LocalPath, const QString & RemotePath, int Mode, const TransferParams & Params, FileOperationProgress & Progress) override;
 
   // Server side copy of a file (TS3FileSystem::CopyFile)
-  void CopyFile(const QString & From, const QString & To);
+  void CopyFile(const QString & From, const QString & To) override;
   // Clears the bucket region/endpoint caches (TS3FileSystem::ClearCaches)
   void ClearCaches();
 

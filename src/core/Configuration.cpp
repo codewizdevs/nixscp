@@ -3,6 +3,7 @@
 // storage handling of core/HierarchicalStorage.cpp (TIniFileStorage::Flush:
 // re-read and merge before writing, so several instances can share the file)
 #include "core/Configuration.h"
+#include "core/CloudSettings.h"
 #include "core/FileMasks.h"
 #include "core/Security.h"
 #include "core/SessionLog.h"
@@ -216,9 +217,22 @@ Configuration::Configuration()
   FIniFileName = !FCustomIniFileName.isEmpty() ? ExpandPath(FCustomIniFileName) : AutomaticIniFileName();
 }
 
+// ~/.config/nixscp on Linux; %APPDATA%\NixSCP (roaming, as WinSCP.ini) on Windows
+static QString ConfigurationDirectory()
+{
+#ifdef Q_OS_WIN
+  QString AppData = qEnvironmentVariable("APPDATA");
+  if (!AppData.isEmpty())
+  {
+    return QDir::fromNativeSeparators(AppData) + QStringLiteral("/NixSCP");
+  }
+#endif
+  return QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + QStringLiteral("/nixscp");
+}
+
 QString Configuration::OverrideFileName()
 {
-  return QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + QStringLiteral("/nixscp/override.ini");
+  return ConfigurationDirectory() + QStringLiteral("/override.ini");
 }
 
 QString Configuration::PortableIniFileName()
@@ -252,7 +266,7 @@ QString Configuration::AutomaticIniFileName()
   {
     return Portable;
   }
-  return QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + QStringLiteral("/nixscp/nixscp.ini");
+  return ConfigurationDirectory() + QStringLiteral("/nixscp.ini");
 }
 
 void Configuration::SetIniFileName(const QString & FileName)
@@ -1037,6 +1051,7 @@ bool Configuration::Save()
     FBaseline = FIni;
   }
   EmitChangedIfNeeded(false);
+  emit Saved();
   return true;
 }
 
@@ -1186,11 +1201,16 @@ QString Configuration::DefaultIniFileExportPath() const
   return Dir + QLatin1Char('/') + Name;
 }
 
+IniFile Configuration::ExportData()
+{
+  SaveTo(FIni);
+  return UserConfiguration(FNulStorage ? FDiskData : ReadFileData(FIniFileName), FBaseline, FIni);
+}
+
 bool Configuration::Export(const QString & FileName, QString * Error)
 {
   // TConfiguration::Export: complete configuration to a new file
-  SaveTo(FIni);
-  IniFile Out = UserConfiguration(FNulStorage ? FDiskData : ReadFileData(FIniFileName), FBaseline, FIni);
+  IniFile Out = ExportData();
   QFile::remove(FileName);
   if (!Out.Save(FileName))
   {
@@ -1215,7 +1235,15 @@ bool Configuration::Import(const QString & FileName, QString * Error)
     }
     return false;
   }
+  return ImportData(In, Error);
+}
+
+bool Configuration::ImportData(IniFile In, QString * Error)
+{
   In.EraseSection(QString());
+  // A cloud sync key in a backup is taken by CloudSync::ImportKey; it never
+  // becomes part of the configuration file
+  In.EraseSectionTree(CloudSettings::KeySection);
   if (FNulStorage)
   {
     LoadFromDisk(In.SaveToData(), QList<IniFile::Change>(), true);

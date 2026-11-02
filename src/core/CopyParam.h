@@ -119,6 +119,12 @@ struct CopyParam
   // TCopyParamType::ChangeFileName: FirstLevel (files selected for the
   // transfer, not their contents) also applies FileMask (MaskFileName)
   QString ChangeFileName(const QString & FileName, bool FirstLevel) const;
+  // Windows (TCopyParamType::ValidLocalFileName with the default token
+  // replacement): characters a Windows file name cannot have become %XX, a
+  // trailing space/dot is encoded and reserved names (CON, ...) get "%00";
+  // RestoreChars reverses it for uploads. Both return the name as is on Linux.
+  static QString ValidLocalFileName(const QString & FileName);
+  static QString RestoreChars(const QString & FileName);
   // Rights for newly uploaded file/directory (TCopyParamType::RemoteFileRights)
   unsigned int RemoteFileRights(bool Directory) const;
 

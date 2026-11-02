@@ -1,5 +1,6 @@
 // Port of WinSCP source/core/Script.cpp (TScript, TManagementScript)
 #include "cli/Script.h"
+#include "core/Platform.h"
 #include "cli/ConsoleUserInterface.h"
 #include "cli/ScriptHelp.h"
 #include "core/FtpFileSystem.h"
@@ -110,10 +111,7 @@ QString ModificationStr(const QDateTime & DateTime)
 
 void SetLocalModificationTime(const QString & Path, const QDateTime & Time)
 {
-  struct timespec Times[2];
-  Times[0].tv_sec = Times[1].tv_sec = static_cast<time_t>(Time.toSecsSinceEpoch());
-  Times[0].tv_nsec = Times[1].tv_nsec = 0;
-  utimensat(AT_FDCWD, QFile::encodeName(Path).constData(), Times, 0);
+  Platform::SetFileTimes(Path, Time.toSecsSinceEpoch());
 }
 
 bool IsRealFile(const QString & FileName)
@@ -1563,7 +1561,7 @@ void Script::Download(const std::vector<RemoteItem> & Files, const QString & Tar
       QString NewName = MaskFileName(Param.ChangeFileName(Name), FileMask);
       if (NewName != Name)
       {
-        DownloadDirectoryAs(Item, QDir(TargetDir).filePath(NewName), Param, Move);
+        DownloadDirectoryAs(Item, QDir(TargetDir).filePath(CopyParam::ValidLocalFileName(NewName)), Param, Move);
         continue;
       }
     }
@@ -1572,7 +1570,7 @@ void Script::Download(const std::vector<RemoteItem> & Files, const QString & Tar
     if (Resume && !Item.File.IsDirectory)
     {
       // -resume: continue an existing smaller target via the core's resumable transfer
-      QString Target = QDir(TargetDir).filePath(MaskFileName(Param.ChangeFileName(Name), FileMask));
+      QString Target = QDir(TargetDir).filePath(CopyParam::ValidLocalFileName(MaskFileName(Param.ChangeFileName(Name), FileMask)));
       QFileInfo Existing(Target);
       if (Existing.exists() && !Existing.isDir() && (Existing.size() < Item.File.Size) && !QFileInfo::exists(Target + PartialExt))
       {
@@ -1596,7 +1594,7 @@ void Script::Download(const std::vector<RemoteItem> & Files, const QString & Tar
     {
       // WinSCP's console fails creating the file (the core's "Create?"
       // query is the GUI Copy dialog's)
-      QString FirstTarget = QDir(TargetDir).filePath(MaskFileName(Param.ChangeFileName(UnixPath::ExtractFileName(Plain.first())), FileMask));
+      QString FirstTarget = QDir(TargetDir).filePath(CopyParam::ValidLocalFileName(MaskFileName(Param.ChangeFileName(UnixPath::ExtractFileName(Plain.first())), FileMask)));
       throw ExtException(QStringLiteral("Can't create file '%1'.").arg(FirstTarget), QStringLiteral("No such file or directory"));
     }
     OperationResult Result = Wait(S, [&](Terminal::Callback Done) { S.Term->CopyToLocal(Plain, TargetDir, Param, Move, Done); }, true);
@@ -1605,7 +1603,7 @@ void Script::Download(const std::vector<RemoteItem> & Files, const QString & Tar
       for (const QString & Path : Plain)
       {
         XmlRecord(QStringLiteral("download"), {{QStringLiteral("filename"), Path},
-          {QStringLiteral("destination"), QDir(TargetDir).filePath(Param.ChangeFileName(UnixExtractFileName(Path), true))}},
+          {QStringLiteral("destination"), QDir(TargetDir).filePath(CopyParam::ValidLocalFileName(Param.ChangeFileName(UnixExtractFileName(Path), true)))}},
           Result.Ok, Result.Ok ? QStringList() : QStringList{Result.Message});
       }
     }
@@ -1635,7 +1633,7 @@ void Script::Upload(const std::vector<LocalItem> & Files, const QString & Target
       QString NewName = MaskFileName(Param.ChangeFileName(Name), FileMask);
       if (NewName != Name)
       {
-        UploadDirectoryAs(Item, UnixPath::Combine(TargetDir, NewName), Param, Move);
+        UploadDirectoryAs(Item, UnixPath::Combine(TargetDir, CopyParam::RestoreChars(NewName)), Param, Move);
         continue;
       }
     }
@@ -1643,7 +1641,7 @@ void Script::Upload(const std::vector<LocalItem> & Files, const QString & Target
     // core to the first level (TCopyParamType::ChangeFileName)
     if (Resume && Item.Exists && !Item.Directory)
     {
-      ResumeTargets.append(UnixPath::Combine(TargetDir, MaskFileName(Param.ChangeFileName(Name), FileMask)));
+      ResumeTargets.append(UnixPath::Combine(TargetDir, CopyParam::RestoreChars(MaskFileName(Param.ChangeFileName(Name), FileMask))));
       ResumeTargets.append(QString::number(Item.Size));
     }
     Plain.append(Item.Path);
@@ -1682,7 +1680,7 @@ void Script::Upload(const std::vector<LocalItem> & Files, const QString & Target
       for (const QString & Path : Plain)
       {
         XmlRecord(QStringLiteral("upload"), {{QStringLiteral("filename"), Path},
-          {QStringLiteral("destination"), UnixPath::Combine(TargetDir, Param.ChangeFileName(QFileInfo(Path).fileName(), true))}},
+          {QStringLiteral("destination"), UnixPath::Combine(TargetDir, CopyParam::RestoreChars(Param.ChangeFileName(QFileInfo(Path).fileName(), true)))}},
           Result.Ok, Result.Ok ? QStringList() : QStringList{Result.Message});
       }
     }

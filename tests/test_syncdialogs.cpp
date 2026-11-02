@@ -21,6 +21,7 @@ int main()
 
 #include "core/Configuration.h"
 #include "core/IniStorage.h"
+#include "core/Platform.h"
 #include "gui/GuiUserInterface.h"
 #include "gui/EditMaskDialog.h"
 #include "gui/SynchronizeDialogs.h"
@@ -171,8 +172,7 @@ static void WriteFile(const QString & FileName, const QByteArray & Data, qint64 
   CHECK(F.open(QIODevice::WriteOnly | QIODevice::Truncate));
   F.write(Data);
   F.close();
-  struct timespec Times[2] = {{static_cast<time_t>(MTime), 0}, {static_cast<time_t>(MTime), 0}};
-  utimensat(AT_FDCWD, QFile::encodeName(FileName).constData(), Times, 0);
+  Platform::SetFileTimes(FileName, MTime);
 }
 
 static QByteArray ReadAll(const QString & FileName)

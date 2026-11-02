@@ -22,6 +22,7 @@
 //   NIXSCP_TEST_EVIL_SERVERS                    directory with evil_ftp.py and evil_dav.py
 //                                               (started by this test on free ports)
 //   NIXSCP_TEST_FTPS_PORT, NIXSCP_TEST_DAVS_URL  TLS servers with a self-signed certificate
+#include "core/Platform.h"
 #include "core/Configuration.h"
 #include "core/CopyParam.h"
 #include "core/CustomCommands.h"
@@ -98,6 +99,16 @@ static QString RunShell(const QString & Command, const QString & Dir, int * Exit
   return QString::fromUtf8(P.readAllStandardOutput());
 }
 
+// The shell of local custom commands (cmd.exe on Windows)
+static void RunLocalShell(const QString & Command, const QString & Dir)
+{
+  QProcess P;
+  P.setWorkingDirectory(Dir);
+  Platform::SetShellCommand(P, Command);
+  P.start();
+  P.waitForFinished(10000);
+}
+
 // Payloads that execute "touch <Mark>" when a shell evaluates them unquoted
 // or in the wrong quotes
 static QStringList InjectionPayloads(const QString & Mark)
@@ -111,6 +122,23 @@ static QStringList InjectionPayloads(const QString & Mark)
     QStringLiteral("x|touch %1").arg(Mark),
     QStringLiteral("x\ntouch %1\n").arg(Mark),
   };
+}
+
+// Payloads for the local shell that runs local custom commands
+static QStringList LocalInjectionPayloads(const QString & Mark)
+{
+#ifdef _WIN32
+  // cmd.exe; only characters a downloaded Windows file name can have
+  return {
+    QStringLiteral("x&mkdir %1").arg(Mark),
+    QStringLiteral("x && mkdir %1").arg(Mark),
+    QStringLiteral("x)&mkdir %1&(y").arg(Mark),
+    QStringLiteral("x^&mkdir %1").arg(Mark),
+    QStringLiteral("x'&mkdir %1&'y").arg(Mark),
+  };
+#else
+  return InjectionPayloads(Mark);
+#endif
 }
 
 // ---------------------------------------------------------------- stored passwords
@@ -245,7 +273,7 @@ static void TestLocalCustomCommands(const QString & Dir)
   };
   for (const QString & Template : Templates)
   {
-    for (const QString & Payload : InjectionPayloads(Mark))
+    for (const QString & Payload : LocalInjectionPayloads(Mark))
     {
       QString Cmd;
       QString FileName = Dir + QLatin1Char('/') + Payload;
@@ -259,7 +287,7 @@ static void TestLocalCustomCommands(const QString & Dir)
         Cmd = LocalCustomCommand(Data, QStringLiteral("/remote"), Dir, FileName, QString(), QString()).Complete(Template, true);
       }
       QFile::remove(QDir(Dir).filePath(Mark));
-      RunShell(Cmd, Dir);
+      RunLocalShell(Cmd, Dir);
       bool Injected = QFileInfo::exists(QDir(Dir).filePath(Mark));
       CHECK_VULN(!Injected, QStringLiteral("local command [%1] with remote file name [%2] executed: %3")
         .arg(Template, QString(Payload).replace(QLatin1Char('\n'), QStringLiteral("\\n")), Cmd));
@@ -1069,11 +1097,18 @@ int main(int argc, char ** argv)
   QTemporaryDir Work;
   CHECK(Work.isValid());
   TestPasswords();
+#ifndef _WIN32
   TestIniPermissions(Work.path());
+#endif
   TestLocalCustomCommands(Work.path());
+#ifdef _WIN32
+  // Escaping for the remote (Unix) shell, checked with a local /bin/sh: Linux
+  std::printf("[remote shell escaping, OpenSSH command line, Unix permissions] SKIPPED (Linux only)\n");
+#else
   TestRemoteCustomCommands(Work.path());
   TestScpShellQuoting(Work.path());
   TestTerminalCommand(Work.path());
+#endif
   TestEditorCommand();
 
   QString KeyFile = qEnvironmentVariable("NIXSCP_TEST_SSH_KEY");

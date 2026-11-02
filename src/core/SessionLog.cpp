@@ -1,6 +1,7 @@
 // Port of WinSCP source/core/SessionInfo.cpp (TSessionLog) and
 // GetExpandedLogFileName (core/SessionData.cpp)
 #include "core/SessionLog.h"
+#include "core/Platform.h"
 #include "core/ActionsLog.h"
 #include "core/Configuration.h"
 #include "core/FileSystem.h"
@@ -27,8 +28,9 @@
 
 #include <atomic>
 #include <optional>
-#include <pwd.h>
+#ifndef Q_OS_WIN
 #include <unistd.h>
+#endif
 
 //---------------------------------------------------------------------------
 // The file shared by all logs with the same expanded name
@@ -218,6 +220,7 @@ QString TimeZoneLogString()
   return Result;
 }
 
+#ifndef Q_OS_WIN
 QString ProcessName(qint64 Pid, qint64 * ParentPid)
 {
   QFile Stat(QStringLiteral("/proc/%1/stat").arg(Pid));
@@ -240,10 +243,15 @@ QString ProcessName(qint64 Pid, qint64 * ParentPid)
   }
   return Name;
 }
+#endif
 
 // GetAncestorProcessNames (core/Common.cpp), from /proc
 QString AncestorProcessNames()
 {
+#ifdef Q_OS_WIN
+  // Only for the session log header; /proc does not exist on Windows
+  return QStringLiteral("unknown");
+#else
   QStringList Names;
   qint64 Pid = getppid();
   for (int Depth = 0; (Depth < 20) && (Pid > 1); Depth++)
@@ -258,6 +266,7 @@ QString AncestorProcessNames()
     Pid = Parent;
   }
   return Names.isEmpty() ? QStringLiteral("unknown") : Names.join(QStringLiteral(", "));
+#endif
 }
 
 // GetOSInfo
@@ -280,12 +289,7 @@ QString DesktopInfo()
 
 QString LocalAccount()
 {
-  struct passwd * Pw = getpwuid(getuid());
-  if (Pw != nullptr)
-  {
-    return QString::fromLocal8Bit(Pw->pw_name);
-  }
-  QString User = qEnvironmentVariable("USER");
+  QString User = Platform::CurrentUserName();
   return User.isEmpty() ? QStringLiteral("<Failed to retrieve username>") : User;
 }
 

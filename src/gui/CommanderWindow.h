@@ -78,6 +78,8 @@ public:
   void NewLocalTab(const QString & LocalDirectory = QString(), const QString & OtherLocalDirectory = QString());
 
   CommanderActions * Actions() const { return FA; }
+  // The connected tabs with their current directories (workspace / cloud session)
+  QList<SessionData> WorkspaceTabs() const;
   EditorManager * Editors() const { return FEditorManager; }
 
 public slots:
@@ -266,7 +268,6 @@ private:
   void ShowPanelPopup(FilePanel * Panel, const QPoint & GlobalPos);
   QMenu * CreateEditPopupSubmenu(QMenu * Parent, bool Bold);
   // Workspaces / custom commands
-  QList<SessionData> WorkspaceTabs() const;
   void SaveWorkspace();
   CustomCommandContext CustomCommandsContext() const;
   void RebuildCustomCommands();

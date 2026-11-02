@@ -1,6 +1,7 @@
 // Port of WinSCP source/core/ScpFileSystem.cpp (TSCPFileSystem) and
 // TRemoteFile::SetListingStr from source/core/RemoteFiles.cpp
 #include "core/ScpFileSystem.h"
+#include "core/Platform.h"
 #include "core/CopyParam.h"
 #include "core/SessionLog.h"
 #include "core/SftpFileSystem.h"
@@ -129,16 +130,14 @@ QString JoinMessages(const ExtException & E)
 
 ScpFileSystem::ScpFileSystem(const SessionData & Data, UserInterface * UI) :
   FData(Data),
-  FUI(UI),
   FOwnShell(std::make_unique<SecureShell>(Data, UI)),
   FShell(FOwnShell.get()),
   FLsFullTime(Data.SCPLsFullTime)
 {
 }
 
-ScpFileSystem::ScpFileSystem(const SessionData & Data, UserInterface * UI, SecureShell * ExistingShell) :
+ScpFileSystem::ScpFileSystem(const SessionData & Data, UserInterface * /*UI*/, SecureShell * ExistingShell) :
   FData(Data),
-  FUI(UI),
   FShell(ExistingShell),
   FLsFullTime(Data.SCPLsFullTime)
 {
@@ -1538,12 +1537,7 @@ QString TimeRecord(const QString & Path)
 
 void SetLocalTimes(const QString & Path, qint64 MTime, qint64 ATime)
 {
-  struct timespec Times[2];
-  Times[0].tv_sec = static_cast<time_t>(ATime);
-  Times[0].tv_nsec = 0;
-  Times[1].tv_sec = static_cast<time_t>(MTime);
-  Times[1].tv_nsec = 0;
-  utimensat(AT_FDCWD, QFile::encodeName(Path).constData(), Times, 0);
+  Platform::SetFileTimes(Path, static_cast<qint64>(MTime), static_cast<qint64>(ATime));
 }
 
 bool ValidScpFileName(const QString & Name)

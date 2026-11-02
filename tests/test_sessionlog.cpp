@@ -230,8 +230,10 @@ static void TestSensitive(const QString & Dir)
   CHECK(!Text.contains(QStringLiteral("again")));
   CHECK(Text.contains(QStringLiteral("Time zone: Current: GMT")));
   CHECK(Text.contains(SessionLog::Separator()));
-  // the log file is private
+  // the log file is private (Unix modes; Windows: the folder ACL)
+#ifndef _WIN32
   CHECK_EQ(int(QFileInfo(Masked).permissions() & (QFileDevice::ReadGroup | QFileDevice::ReadOther)), 0);
+#endif
 
   QString Plain = Dir + QStringLiteral("/sensitive.log");
   {

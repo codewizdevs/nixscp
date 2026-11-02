@@ -237,7 +237,9 @@ static void TestPutty(const QString & Home)
   CHECK(SiteImport::ImportHostKeys(Keys, List.SelectedSessions(), KnownHosts) == 1);
   QByteArray Contents = ReadFile(KnownHosts);
   CHECK(Contents == "[putty.example.com]:2022 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEUb8T3zysHIqc8BOLUePVMwgRW6RcqtxRsYFQuS3A9W\n");
+#ifndef _WIN32
   CHECK((QFile::permissions(KnownHosts) & (QFileDevice::ReadGroup | QFileDevice::ReadOther)) == 0);
+#endif
   // not added twice
   CHECK(SiteImport::ImportHostKeys(Keys, List.SelectedSessions(), KnownHosts) == 0);
 }
@@ -345,6 +347,10 @@ static void TestIni(const QString & Home)
     CHECK(D.Password == QStringLiteral("pw"));
     CHECK(D.Timeout == 40);
     CHECK(List.Selected.first());
+#ifdef _WIN32
+    // native paths: nothing to remap
+    CHECK(!SiteImport::HasWindowsPaths(D));
+#else
     CHECK(SiteImport::HasWindowsPaths(D));
     // Windows paths: the profile maps to the home folder
     QDir().mkpath(Home + QStringLiteral("/Documents"));
@@ -353,6 +359,7 @@ static void TestIni(const QString & Home)
     CHECK(D.LocalDirectory == Home + QStringLiteral("/Documents"));
     CHECK(D.PublicKeyFile == Home + QStringLiteral("/.ssh/id_ini"));
     CHECK(!SiteImport::HasWindowsPaths(D));
+#endif
   }
   QMap<QString, QString> Keys = SiteImport::LoadIniHostKeys(Ini);
   CHECK(Keys.size() == 1);
@@ -438,7 +445,11 @@ static void TestSessionData()
         QStringLiteral("value/value/value"));
   CHECK(SessionData::ExpandEnvironmentVariables(QStringLiteral("$NIXSCP_UNDEFINED_VAR 100%")) == QStringLiteral("$NIXSCP_UNDEFINED_VAR 100%"));
   CHECK(SessionData::ExpandEnvironmentVariables(QStringLiteral("~/x")) == QDir::homePath() + QStringLiteral("/x"));
+#ifdef _WIN32
+  CHECK(SessionData::ExpandEnvironmentVariables(QStringLiteral("%USERPROFILE%")) == qEnvironmentVariable("USERPROFILE"));
+#else
   CHECK(SessionData::ExpandEnvironmentVariables(QStringLiteral("%USERPROFILE%")) == QDir::homePath());
+#endif
   SessionData E;
   E.HostName = QStringLiteral("${NIXSCP_TEST_VAR}.example.com");
   E.PublicKeyFile = QStringLiteral("~/.ssh/id");
@@ -560,6 +571,8 @@ int main()
   QTemporaryDir Dir;
   QString Home = Dir.path();
   qputenv("HOME", Home.toLocal8Bit());
+  // (Windows: the home folder of QDir::homePath())
+  qputenv("USERPROFILE", Home.toLocal8Bit());
   qputenv("XDG_CONFIG_HOME", (Home + QStringLiteral("/.config")).toLocal8Bit());
   qunsetenv("PUTTYDIR");
   TestOpenssh(Home);

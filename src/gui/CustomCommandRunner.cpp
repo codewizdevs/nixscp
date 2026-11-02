@@ -10,6 +10,7 @@
 #include "gui/EditMaskDialog.h"
 
 #include "core/Configuration.h"
+#include "core/Platform.h"
 #include "core/SecureShell.h"
 #include "core/Terminal.h"
 
@@ -917,7 +918,10 @@ void Runner::RunLocal(const QStringList & Commands, bool Wait, std::function<voi
     // ExecuteShellChecked: started, not waited for
     for (const QString & Command : Commands)
     {
-      if (!QProcess::startDetached(QStringLiteral("/bin/sh"), {QStringLiteral("-c"), Command}, WorkingDirectory()))
+      QProcess Detached;
+      Platform::SetShellCommand(Detached, Command);
+      Detached.setWorkingDirectory(WorkingDirectory());
+      if (!Detached.startDetached())
       {
         // EXECUTE_APP_ERROR
         Error(QStringLiteral("Cannot execute '%1'.").arg(Command));
@@ -983,7 +987,8 @@ void Runner::RunNext()
       Fail();
     }
   });
-  Process->start(QStringLiteral("/bin/sh"), {QStringLiteral("-c"), Command});
+  Platform::SetShellCommand(*Process, Command);
+  Process->start();
   Process->closeWriteChannel();
 }
 

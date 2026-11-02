@@ -259,6 +259,10 @@ public:
   // and reloads it (no restart needed, Changed and StoredSessionsChanged are emitted).
   bool Export(const QString & FileName, QString * Error = nullptr);
   bool Import(const QString & FileName, QString * Error = nullptr);
+  // The same in memory (NixSCP Pro cloud sync): the complete user configuration,
+  // and replacing it (the root policies section of Data is ignored)
+  IniFile ExportData();
+  bool ImportData(IniFile Data, QString * Error = nullptr);
   // Machine-wide files (for tests; default: nixscp/nixscp.ini in $XDG_CONFIG_DIRS)
   QStringList SystemIniFileNames() const;
   void SetSystemIniFileNames(const QStringList & FileNames);
@@ -307,6 +311,8 @@ signals:
   // The site list was re-read (another instance saved, Import, MoveStorage);
   // previously obtained SessionData pointers are not part of the list anymore
   void StoredSessionsChanged();
+  // Changes (preferences or sites) were written to the file
+  void Saved();
 
 private:
   Configuration();

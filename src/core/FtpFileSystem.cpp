@@ -37,9 +37,7 @@
 #include <openssl/proverr.h>
 #include <openssl/x509.h>
 
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "core/Sockets.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -858,17 +856,17 @@ namespace
 void CloseUploadConnection(QSslSocket * Socket, int TimeoutMs, FileOperationProgress * Progress)
 {
   qintptr Fd = Socket->socketDescriptor();
-  int Dup = (Fd >= 0) ? dup(static_cast<int>(Fd)) : -1;
+  Net::Socket Dup = (Fd >= 0) ? Net::Duplicate(static_cast<Net::Socket>(Fd)) : Net::Invalid;
   Socket->disconnectFromHost();
   if (Socket->state() != QAbstractSocket::UnconnectedState)
   {
     Socket->waitForDisconnected(TimeoutMs);
   }
-  if (Dup < 0)
+  if (Dup == Net::Invalid)
   {
     return;
   }
-  shutdown(Dup, SHUT_WR);
+  shutdown(Dup, Net::ShutWrite);
   QElapsedTimer Timer;
   Timer.start();
   char Buffer[4096];
@@ -878,8 +876,10 @@ void CloseUploadConnection(QSslSocket * Socket, int TimeoutMs, FileOperationProg
     {
       break;
     }
-    pollfd P{Dup, POLLIN, 0};
-    int Ready = poll(&P, 1, 100);
+    Net::PollFd P{};
+    P.fd = Dup;
+    P.events = POLLIN;
+    int Ready = Net::Poll(&P, 1, 100);
     if (Ready < 0)
     {
       break;
@@ -888,13 +888,13 @@ void CloseUploadConnection(QSslSocket * Socket, int TimeoutMs, FileOperationProg
     {
       continue;
     }
-    ssize_t Read = recv(Dup, Buffer, sizeof(Buffer), 0);
+    qint64 Read = Net::Receive(Dup, Buffer, sizeof(Buffer), 0);
     if (Read <= 0)
     {
       break;
     }
   }
-  close(Dup);
+  Net::Close(Dup);
 }
 }
 

@@ -2,6 +2,8 @@
 // source/forms/EditorPreferences.cpp + EditorPreferences.dfm, the master password
 // dialog of windows/UserInterface.cpp, locale handling of windows/GUIConfiguration.cpp
 #include "gui/PreferencesDialog.h"
+#include "gui/GuiCommandLine.h"
+#include "gui/CloudSyncUi.h"
 #include "gui/HelpSystem.h"
 #include "gui/CustomCommandsPage.h"
 #include "gui/CopyParamsDialog.h"
@@ -518,7 +520,7 @@ void PreferencesDialog::ExportConfiguration(QWidget * Parent)
     return;
   }
   QString Error;
-  if (!C.Export(FileName, &Error))
+  if (!CloudSyncUi::ExportConfiguration(Parent, FileName, &Error))
   {
     QMessageBox::critical(Parent, QStringLiteral("Error"), Error);
   }
@@ -543,7 +545,7 @@ bool PreferencesDialog::ImportConfiguration(QWidget * Parent)
     return false;
   }
   QString Error;
-  if (!C.Import(FileName, &Error))
+  if (!CloudSyncUi::ImportConfiguration(Parent, FileName, &Error))
   {
     QMessageBox::critical(Parent, QStringLiteral("Error"), Error);
     return false;
@@ -1513,7 +1515,7 @@ PreferencesDialog::PreferencesDialog(QWidget * Parent) :
     // HintLabel(LogFileNameHintText, LOG_FILE_HINT3): "patterns" link with a hint
     const QString LogFileHint = QStringLiteral(
       "!Y year\n!M month\n!D day\n!T time\n!P process ID\n!@ hostname\n!S session name\nExample: ~/logs/!S!T.log");
-    auto NewHintLabel = [this, &LogFileHint](const QString & Caption)
+    auto NewHintLabel = [&LogFileHint](const QString & Caption)
     {
       auto * Label = new QLabel(QStringLiteral("<a href=\"patterns\">%1</a>").arg(Translator::Tr(Caption)));
       Label->setToolTip(Translator::Tr(LogFileHint));
@@ -2552,6 +2554,7 @@ bool PreferencesDialog::EditEditor(int Index)
   return true;
 }
 
+#ifndef Q_OS_WIN
 // Quoting of an Exec key argument (Desktop Entry Specification, "The Exec key")
 static QString UrlHandlerExecQuote(const QString & Arg)
 {
@@ -2637,6 +2640,7 @@ static bool RemoveUrlHandlerAssociations(const QString & FileName)
   File.write(Result.join(QLatin1Char('\n')).toUtf8());
   return true;
 }
+#endif
 
 void PreferencesDialog::RegisterAsUrlHandler(bool Register)
 {
@@ -2659,8 +2663,13 @@ void PreferencesDialog::RegisterAsUrlHandler(bool Register)
     QMessageBox::Yes | QMessageBox::No, this);
   Box.setObjectName(QStringLiteral("RegisterUrlConfirmation"));
   Box.setInformativeText(Register ?
+#ifdef Q_OS_WIN
+    QStringLiteral("NixSCP will become the default application for %1 addresses of your user account.")
+      .arg(UrlSchemes.join(QStringLiteral(", "))) :
+#else
     QStringLiteral("NixSCP will become the default application for %1 addresses of your user account (%2).")
       .arg(UrlSchemes.join(QStringLiteral(", ")), FileName) :
+#endif
     QStringLiteral("The association of %1 addresses with NixSCP will be removed.").arg(UrlSchemes.join(QStringLiteral(", "))));
   if (Box.exec() != QMessageBox::Yes)
   {
@@ -2669,6 +2678,17 @@ void PreferencesDialog::RegisterAsUrlHandler(bool Register)
 
   QString Error;
   QApplication::setOverrideCursor(Qt::WaitCursor);   // TInstantOperationVisualizer
+#ifdef Q_OS_WIN
+  // HKCU\Software\Classes, as WinSCP
+  if (Register)
+  {
+    GuiCommandLine::RegisterForDefaultProtocols(&Error);
+  }
+  else
+  {
+    GuiCommandLine::UnregisterForProtocols(&Error);
+  }
+#else
   if (Register)
   {
     // AppImage: the image, not its temporary mount point
@@ -2719,6 +2739,7 @@ void PreferencesDialog::RegisterAsUrlHandler(bool Register)
     }
     QProcess::execute(QStringLiteral("update-desktop-database"), {Dir});
   }
+#endif
   QApplication::restoreOverrideCursor();
   if (!Error.isEmpty())
   {
@@ -2729,6 +2750,21 @@ void PreferencesDialog::RegisterAsUrlHandler(bool Register)
 void PreferencesDialog::CreateDesktopIcon()
 {
   QString Dir = QStandardPaths::writableLocation(QStandardPaths::DesktopLocation);
+#ifdef Q_OS_WIN
+  // a shell link (QFile::link creates .lnk files on Windows)
+  QString Link = Dir + QStringLiteral("/NixSCP.lnk");
+  if (QMessageBox::question(this, windowTitle(),
+        QStringLiteral("Create a desktop icon \"%1\"?").arg(QDir::toNativeSeparators(Link))) != QMessageBox::Yes)
+  {
+    return;
+  }
+  QFile::remove(Link);
+  if (!QFile::link(QCoreApplication::applicationFilePath(), Link))
+  {
+    QMessageBox::warning(this, windowTitle(), QStringLiteral("Cannot create file \"%1\".").arg(QDir::toNativeSeparators(Link)));
+  }
+  return;
+#endif
   QString FileName = Dir + QStringLiteral("/nixscp.desktop");
   if (QMessageBox::question(this, windowTitle(),
         QStringLiteral("Create a desktop icon \"%1\"?").arg(FileName)) != QMessageBox::Yes)

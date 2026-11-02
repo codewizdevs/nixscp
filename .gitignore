@@ -1,6 +1,9 @@
 # build output
 build/
 build-*/
+builds/
+bin/
+win-sdk/
 *.user
 CMakeLists.txt.user
 

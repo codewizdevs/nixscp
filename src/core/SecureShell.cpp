@@ -21,14 +21,12 @@
 #include <libssh/callbacks.h>
 #include <libssh/sftp.h>
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
+#include "core/Sockets.h"
+
 #include <fcntl.h>
-#include <poll.h>
+#ifndef Q_OS_WIN
+#include <sys/un.h>
+#endif
 #include <cerrno>
 #include <cstring>
 #include <list>
@@ -793,7 +791,12 @@ addrinfo * ResolveHost(const QString & Host, int Port, int Family)
   int Rc = getaddrinfo(HostUtf.constData(), PortStr.constData(), &Hints, &Addresses);
   if (Rc != 0)
   {
-    ConnectionError(Host, QStringLiteral("Host does not exist.\n%1").arg(QString::fromLocal8Bit(gai_strerror(Rc))));
+#ifdef Q_OS_WIN
+    QString Reason = QString::fromWCharArray(gai_strerrorW(Rc));
+#else
+    QString Reason = QString::fromLocal8Bit(gai_strerror(Rc));
+#endif
+    ConnectionError(Host, QStringLiteral("Host does not exist.\n%1").arg(Reason));
   }
   return Addresses;
 }
@@ -805,17 +808,18 @@ int AddressFamilyToAF(TAddressFamily Family)
 
 // Opens a TCP connection with the session timeout, honouring the address
 // family and source address; returns the blocking socket
-int ConnectTcp(const QString & Host, int Port, TAddressFamily Family, const QString & SourceAddress, int TimeoutSec)
+Net::Socket ConnectTcp(const QString & Host, int Port, TAddressFamily Family, const QString & SourceAddress, int TimeoutSec)
 {
+  Net::Startup();
   addrinfo * Addresses = ResolveHost(Host, Port, AddressFamilyToAF(Family));
-  int Socket = -1;
+  Net::Socket Socket = Net::Invalid;
   int LastError = 0;
-  for (addrinfo * A = Addresses; (A != nullptr) && (Socket < 0); A = A->ai_next)
+  for (addrinfo * A = Addresses; (A != nullptr) && (Socket == Net::Invalid); A = A->ai_next)
   {
-    int S = socket(A->ai_family, A->ai_socktype | SOCK_CLOEXEC, A->ai_protocol);
-    if (S < 0)
+    Net::Socket S = Net::Open(A->ai_family, A->ai_socktype, A->ai_protocol);
+    if (S == Net::Invalid)
     {
-      LastError = errno;
+      LastError = Net::LastError();
       continue;
     }
     if (!SourceAddress.isEmpty())
@@ -827,51 +831,44 @@ int ConnectTcp(const QString & Host, int Port, TAddressFamily Family, const QStr
       addrinfo * Bind = nullptr;
       QByteArray SourceUtf = SourceAddress.toUtf8();
       if ((getaddrinfo(SourceUtf.constData(), nullptr, &BindHints, &Bind) != 0) || (Bind == nullptr) ||
-          (::bind(S, Bind->ai_addr, Bind->ai_addrlen) != 0))
+          (::bind(S, Bind->ai_addr, static_cast<int>(Bind->ai_addrlen)) != 0))
       {
-        LastError = errno;
+        LastError = Net::LastError();
         if (Bind != nullptr)
         {
           freeaddrinfo(Bind);
         }
-        ::close(S);
+        Net::Close(S);
         continue;
       }
       freeaddrinfo(Bind);
     }
     // Connect with the session timeout
-    int Flags = fcntl(S, F_GETFL, 0);
-    fcntl(S, F_SETFL, Flags | O_NONBLOCK);
-    int C = ::connect(S, A->ai_addr, A->ai_addrlen);
-    if ((C < 0) && (errno == EINPROGRESS))
+    Net::SetBlocking(S, false);
+    int C = ::connect(S, A->ai_addr, static_cast<int>(A->ai_addrlen));
+    int Error = (C != 0) ? Net::LastError() : 0;
+    if ((C != 0) && Net::WouldBlock(Error))
     {
-      pollfd P{S, POLLOUT, 0};
-      C = (poll(&P, 1, std::max(TimeoutSec, 1) * 1000) == 1) ? 0 : -1;
-      int SoError = (C == 0) ? 0 : ETIMEDOUT;
-      socklen_t Len = sizeof(SoError);
-      if (C == 0)
-      {
-        getsockopt(S, SOL_SOCKET, SO_ERROR, &SoError, &Len);
-      }
-      if (SoError != 0)
-      {
-        C = -1;
-        errno = SoError;
-      }
+      Net::PollFd P{};
+      P.fd = S;
+      P.events = POLLOUT;
+      bool Ready = (Net::Poll(&P, 1, std::max(TimeoutSec, 1) * 1000) == 1);
+      Error = Ready ? Net::GetError(S) : Net::TimedOut;
+      C = (Error == 0) ? 0 : -1;
     }
-    if (C < 0)
+    if (C != 0)
     {
-      LastError = errno;
-      ::close(S);
+      LastError = Error;
+      Net::Close(S);
       continue;
     }
-    fcntl(S, F_SETFL, Flags);
+    Net::SetBlocking(S, true);
     Socket = S;
   }
   freeaddrinfo(Addresses);
-  if (Socket < 0)
+  if (Socket == Net::Invalid)
   {
-    ConnectionError(Host, QString::fromLocal8Bit(strerror(LastError)));
+    ConnectionError(Host, Net::ErrorText(LastError));
   }
   return Socket;
 }
@@ -880,7 +877,7 @@ int ConnectTcp(const QString & Host, int Port, TAddressFamily Family, const QStr
 class ProxyIo
 {
 public:
-  ProxyIo(int Socket, int TimeoutSec) :
+  ProxyIo(Net::Socket Socket, int TimeoutSec) :
     FSocket(Socket), FTimeoutMs(std::max(TimeoutSec, 1) * 1000)
   {
   }
@@ -891,14 +888,15 @@ public:
     while (Done < Data.size())
     {
       Wait(POLLOUT);
-      ssize_t N = ::send(FSocket, Data.constData() + Done, static_cast<size_t>(Data.size() - Done), MSG_NOSIGNAL);
+      qint64 N = Net::Send(FSocket, Data.constData() + Done, Data.size() - Done, Net::NoSignal);
       if (N < 0)
       {
-        if ((errno == EINTR) || (errno == EAGAIN))
+        int Error = Net::LastError();
+        if (Net::Interrupted(Error) || Net::WouldBlock(Error))
         {
           continue;
         }
-        ProxyError(QString::fromLocal8Bit(strerror(errno)));
+        ProxyError(Net::ErrorText(Error));
       }
       Done += N;
     }
@@ -911,18 +909,19 @@ public:
     {
       Wait(POLLIN);
       char Buffer[1024];
-      ssize_t N = ::recv(FSocket, Buffer, static_cast<size_t>(std::min<qsizetype>(sizeof(Buffer), Len - Result.size())), 0);
+      qint64 N = Net::Receive(FSocket, Buffer, std::min<qsizetype>(sizeof(Buffer), Len - Result.size()), 0);
       if (N == 0)
       {
         ProxyError(QStringLiteral("Proxy server closed the connection unexpectedly."));
       }
       if (N < 0)
       {
-        if ((errno == EINTR) || (errno == EAGAIN))
+        int Error = Net::LastError();
+        if (Net::Interrupted(Error) || Net::WouldBlock(Error))
         {
           continue;
         }
-        ProxyError(QString::fromLocal8Bit(strerror(errno)));
+        ProxyError(Net::ErrorText(Error));
       }
       Result.append(Buffer, N);
     }
@@ -934,12 +933,12 @@ public:
   {
     Wait(POLLIN);
     QByteArray Result(Max, Qt::Uninitialized);
-    ssize_t N;
+    qint64 N;
     do
     {
-      N = ::recv(FSocket, Result.data(), static_cast<size_t>(Max), MSG_PEEK);
+      N = Net::Receive(FSocket, Result.data(), Max, MSG_PEEK);
     }
-    while ((N < 0) && (errno == EINTR));
+    while ((N < 0) && Net::Interrupted(Net::LastError()));
     if (N <= 0)
     {
       ProxyError(QStringLiteral("Proxy server closed the connection unexpectedly."));
@@ -965,27 +964,29 @@ public:
 
   void Wait(short Events)
   {
-    pollfd P{FSocket, Events, 0};
+    Net::PollFd P{};
+    P.fd = FSocket;
+    P.events = Events;
     int Rc;
     do
     {
-      Rc = poll(&P, 1, FTimeoutMs);
+      Rc = Net::Poll(&P, 1, FTimeoutMs);
     }
-    while ((Rc < 0) && (errno == EINTR));
+    while ((Rc < 0) && Net::Interrupted(Net::LastError()));
     if (Rc == 0)
     {
       ProxyError(QStringLiteral("Timeout while waiting for the proxy server."));
     }
     if (Rc < 0)
     {
-      ProxyError(QString::fromLocal8Bit(strerror(errno)));
+      ProxyError(Net::ErrorText(Net::LastError()));
     }
   }
 
   int TimeoutMs() const { return FTimeoutMs; }
 
 private:
-  int FSocket;
+  Net::Socket FSocket;
   int FTimeoutMs;
 };
 
@@ -1400,7 +1401,7 @@ struct SecureShell::AgentForwarding
   struct Forward
   {
     ssh_channel Channel = nullptr;
-    int Socket = -1;
+    Net::Socket Socket = Net::Invalid;
     QByteArray Buffer;
     bool Closed = false;
     ssh_channel_callbacks_struct Callbacks{};
@@ -1439,10 +1440,10 @@ struct SecureShell::AgentForwarding
 
   static void Release(Forward & F)
   {
-    if (F.Socket >= 0)
+    if (F.Socket != Net::Invalid)
     {
-      ::close(F.Socket);
-      F.Socket = -1;
+      Net::Close(F.Socket);
+      F.Socket = Net::Invalid;
     }
     if (F.Channel != nullptr)
     {
@@ -1473,14 +1474,20 @@ struct SecureShell::AgentForwarding
   static ssh_channel OpenRequest(ssh_session Session, void * UserData)
   {
     AgentForwarding * Self = static_cast<AgentForwarding *>(UserData);
+#ifdef Q_OS_WIN
+    // The Windows agents (Pageant, OpenSSH's named pipe) are not supported yet
+    Q_UNUSED(Session);
+    Q_UNUSED(Self);
+    return nullptr;
+#else
     QByteArray Path = AgentSocketPath();
     sockaddr_un Address{};
     if (Path.isEmpty() || (static_cast<size_t>(Path.size()) >= sizeof(Address.sun_path)))
     {
       return nullptr;
     }
-    int Socket = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (Socket < 0)
+    Net::Socket Socket = Net::Open(AF_UNIX, SOCK_STREAM, 0);
+    if (Socket == Net::Invalid)
     {
       return nullptr;
     }
@@ -1488,13 +1495,13 @@ struct SecureShell::AgentForwarding
     memcpy(Address.sun_path, Path.constData(), static_cast<size_t>(Path.size()));
     if (::connect(Socket, reinterpret_cast<const sockaddr *>(&Address), sizeof(Address)) != 0)
     {
-      ::close(Socket);
+      Net::Close(Socket);
       return nullptr;
     }
     ssh_channel Channel = ssh_channel_new(Session);
     if (Channel == nullptr)
     {
-      ::close(Socket);
+      Net::Close(Socket);
       return nullptr;
     }
     auto F = std::make_unique<Forward>();
@@ -1509,10 +1516,11 @@ struct SecureShell::AgentForwarding
     Self->Forwards.push_back(std::move(F));
     Self->Opened++;
     return Channel;
+#endif
   }
 
   // One agent request -> response over the agent socket
-  static QByteArray Relay(int Socket, const QByteArray & Request)
+  static QByteArray Relay(Net::Socket Socket, const QByteArray & Request)
   {
     try
     {
@@ -1751,12 +1759,12 @@ bool SecureShell::PromptProxyCredentials()
   return true;
 }
 
-int SecureShell::OpenProxySocket()
+Net::Socket SecureShell::OpenProxySocket()
 {
   bool AtProxy = DnsAtProxy(FData);
   for (int Attempt = 0;; Attempt++)
   {
-    int Socket = ConnectTcp(FData.ProxyHost, FData.ProxyPort, FData.AddressFamily, FData.SourceAddress, FData.Timeout);
+    Net::Socket Socket = ConnectTcp(FData.ProxyHost, FData.ProxyPort, FData.AddressFamily, FData.SourceAddress, FData.Timeout);
     try
     {
       ProxyIo Io(Socket, FData.Timeout);
@@ -1774,8 +1782,8 @@ int SecureShell::OpenProxySocket()
           if (!NegotiateHttp(Io, FData, AtProxy, Status))
           {
             // 407: ask for the credentials once, when none are configured
-            ::close(Socket);
-            Socket = -1;
+            Net::Close(Socket);
+            Socket = Net::Invalid;
             bool CanPrompt = (Attempt == 0) && FData.ProxyUsername.isEmpty();
             if (CanPrompt && !PromptProxyCredentials())
             {
@@ -1808,9 +1816,9 @@ int SecureShell::OpenProxySocket()
     }
     catch (...)
     {
-      if (Socket >= 0)
+      if (Socket != Net::Invalid)
       {
-        ::close(Socket);
+        Net::Close(Socket);
       }
       throw;
     }
@@ -1942,7 +1950,7 @@ void SecureShell::ApplyOptions()
   // Own socket: SOCKS/HTTP/Telnet proxy negotiated here, the address family
   // (libssh has no option for it) or a logical host name (the host key is
   // then looked up under that name, while the real host is connected)
-  int Socket = Proxied ? OpenProxySocket() :
+  Net::Socket Socket = Proxied ? OpenProxySocket() :
     ConnectTcp(FData.HostName, FData.PortNumber, FData.AddressFamily, FData.SourceAddress, FData.Timeout);
   socket_t Fd = Socket;
   ssh_options_set(FSession, SSH_OPTIONS_FD, &Fd);

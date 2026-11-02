@@ -6,6 +6,9 @@
 #include "core/CustomCommands.h"
 #include "core/Configuration.h"
 #include "core/IniStorage.h"
+#include "core/Platform.h"
+
+#include <QRegularExpression>
 #include "core/SessionData.h"
 
 #include <QProcess>
@@ -635,7 +638,8 @@ QString InteractiveCustomCommand::ExecuteLocalCommand(const QString & Command)
   // ExecuteProcessAndReadOutput(Command, Value, ExitCode, false) + TrimRight
   QProcess Process;
   Process.setProcessChannelMode(QProcess::SeparateChannels);
-  Process.start(QStringLiteral("/bin/sh"), {QStringLiteral("-c"), Command});
+  Platform::SetShellCommand(Process, Command);
+  Process.start();
   if (!Process.waitForStarted())
   {
     throw ExtException(QStringLiteral("Cannot execute '%1'.").arg(Command));
@@ -961,13 +965,23 @@ bool LocalCustomCommand::PatternReplacement(int Index, const QString & Pattern, 
 // chosen by the server must not be able to inject shell syntax.
 static QString ShellSingleQuoteLocal(const QString & Value)
 {
-  QString Result = Value;
-  Result.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
-  return QLatin1Char('\'') + Result + QLatin1Char('\'');
+  return Platform::ShellQuote(Value);
 }
 
 void LocalCustomCommand::DelimitReplacement(QString & Replacement, QChar Quote)
 {
+#ifdef Q_OS_WIN
+  // cmd.exe: WinSCP does not delimit. Downloaded names cannot contain '"',
+  // '|', '<' or '>' (ValidLocalFileName), but "&", "^", "(", ")" and "%" are
+  // valid in Windows names and syntax for cmd.exe: unquoted, such a name
+  // (chosen by the server) is put in double quotes. Inside quotes it is inert.
+  static const QRegularExpression CmdSyntax(QStringLiteral("[\\s&^()%;,=!]"));
+  if (FShellQuoting && (Quote != QLatin1Char('"')) && Replacement.contains(CmdSyntax))
+  {
+    Replacement = QLatin1Char('"') + Replacement + QLatin1Char('"');
+  }
+  return;
+#endif
   if (!FShellQuoting || Replacement.isEmpty())
   {
     return;
@@ -1025,7 +1039,7 @@ QString MakeLocalFileList(const QStringList & FileNames)
   QStringList Args;
   for (const QString & FileName : FileNames)
   {
-    // AddQuotes; single quotes, as the list is run by /bin/sh
+    // AddQuotes; single quotes when the list is run by /bin/sh
     Args.append(ShellSingleQuoteLocal(FileName));
   }
   return Args.join(QLatin1Char(' '));

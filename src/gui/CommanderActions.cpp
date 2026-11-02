@@ -1,5 +1,6 @@
 // Port of WinSCP source/forms/NonVisual.{cpp,dfm}: the action list
 // (captions, 'Short|Long' hints, Commander shortcuts) and the menu builders
+#include "gui/CloudSyncUi.h"
 #include "gui/CommanderActions.h"
 #include "gui/Icons.h"
 
@@ -750,7 +751,7 @@ void CommanderWindow::ConnectActions()
     On("NewFileAction", [this, P]() { EditNew(P()); });
     On("CreateDirAction3", [this, P]() { CreateDirectory(P()); });
     On("AddEditLinkAction3", [this, P]() { AddEditLink(P(), false); });
-    On("StatusBarAction2", [this, P, Remote]()
+    On("StatusBarAction2", [this, Remote]()
     {
       bool Visible = FA->Get(QString::fromLatin1(Remote ? "RemoteStatusBarAction2" : "LocalStatusBarAction2"))->isChecked();
       for (SessionTab * Tab : FTabs)
@@ -828,7 +829,7 @@ void CommanderWindow::ConnectActions()
   {
     // Change Drive (Alt+F1): the places of the desktop (home, bookmarks, volumes)
     FilePanel * Panel = SidePanel(false);
-    DesktopIntegration::ShowPlacesMenu(Panel, [this, Panel](const QString & Path) { Panel->ChangeDirectory(Path); });
+    DesktopIntegration::ShowPlacesMenu(Panel, [Panel](const QString & Path) { Panel->ChangeDirectory(Path); });
   });
   A.On("RemoteChangePathAction2", [this]()
   {
@@ -1199,6 +1200,9 @@ void CommanderWindow::CreateMenus()
   // Help: Contents (F1), Homepage, Forum, History, Donate, About
   QMenu * Help = menuBar()->addMenu(QStringLiteral("&Help"));
   HelpSystem::PopulateHelpMenu(Help, this);
+
+  // NixSCP Pro: "Cloud Sync" when signed out, "Pro" when signed in
+  CloudSyncUi::SetupMenu(menuBar()->addMenu(QStringLiteral("Cloud Sync")), this);
   Q_UNUSED(FileNames);
 }
 

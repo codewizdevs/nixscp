@@ -6,6 +6,7 @@
 // source/windows/SynchronizeController.cpp, source/forms/CustomScpExplorer.cpp
 // (DoSynchronizeMove) and source/packages/filemng/CustomDirView.pas (ProcessChangedFiles)
 #include "core/Synchronize.h"
+#include "core/Platform.h"
 
 #include "core/FtpFileSystem.h"
 #include "core/LocalFileOperations.h"
@@ -28,10 +29,14 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <QFileSystemWatcher>
+
+#ifndef Q_OS_WIN
 #include <fcntl.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 //---------------------------------------------------------------------------
 // Helpers
@@ -93,12 +98,10 @@ static bool TemporaryTransferFile(const QString & FileName)
 
 static void SetLocalModificationTime(const QString & Path, const QDateTime & Time)
 {
-  struct timespec Times[2];
-  Times[0].tv_sec = Times[1].tv_sec = static_cast<time_t>(Time.toSecsSinceEpoch());
-  Times[0].tv_nsec = Times[1].tv_nsec = 0;
-  if (utimensat(AT_FDCWD, QFile::encodeName(Path).constData(), Times, 0) != 0)
+  QString Error;
+  if (!Platform::SetFileTimes(Path, Time.toSecsSinceEpoch(), -1, &Error))
   {
-    throw ExtException(QStringLiteral("Can't set attributes of file '%1'.").arg(Path), QString::fromLocal8Bit(strerror(errno)));
+    throw ExtException(QStringLiteral("Can't set attributes of file '%1'.").arg(Path), Error);
   }
 }
 
@@ -1047,7 +1050,7 @@ void SynchronizeCollector::CollectDirectory(const QString & Directory1, const QS
       continue; // broken symlink
     }
     QString FileName = Info.fileName();
-    QString RemoteFileName = FParam.ChangeFileName(FileName);
+    QString RemoteFileName = CopyParam::RestoreChars(FParam.ChangeFileName(FileName));
     if (AllowLocalFileTransfer(Info, true) &&
         (MatchesFilter(Data, FileName) || MatchesFilter(Data, RemoteFileName)))
     {
@@ -1151,7 +1154,7 @@ void SynchronizeCollector::CollectFile(Level & Data, const RemoteFile & File)
     FStatus->IncFiles();
   }
 
-  QString LocalFileName = FParam.ChangeFileName(File.FileName);
+  QString LocalFileName = CopyParam::ValidLocalFileName(FParam.ChangeFileName(File.FileName));
   QString FullRemoteFileName = UnixPath::Combine(Data.Directory2, File.FileName);
   if (AllowRemoteFileTransfer(FullRemoteFileName, File, true) &&
       (MatchesFilter(Data, File.FileName) || MatchesFilter(Data, LocalFileName)))
@@ -2056,9 +2059,11 @@ QString InotifyErrorMessage(int Error)
   return Message;
 }
 
+#ifndef Q_OS_WIN
 static const uint32_t WatchMask =
   IN_CLOSE_WRITE | IN_MODIFY | IN_ATTRIB | IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO |
   IN_DELETE_SELF | IN_MOVE_SELF | IN_DONT_FOLLOW;
+#endif
 
 SynchronizeController::SynchronizeController(Terminal * Term, QObject * Parent) :
   QObject(Parent),
@@ -2174,6 +2179,21 @@ bool SynchronizeController::AddDirectory(const QString & Directory, bool Recurse
     }
     FDirectoriesLimit = MaxDirectories;
   }
+#ifdef Q_OS_WIN
+  if (!AlreadyWatched)
+  {
+    if (!FWatcher->addPath(Directory))
+    {
+      if (!QFileInfo(Directory).isDir() && (Directory != FParams.LocalDirectory))
+      {
+        return true; // vanished meanwhile
+      }
+      Error = QStringLiteral("Cannot watch directory '%1' for changes.").arg(Directory);
+      return false;
+    }
+    FWatches.insert(++FNextWatch, Directory);
+  }
+#else
   int Wd = inotify_add_watch(FInotify, QFile::encodeName(Directory).constData(), WatchMask);
   if (Wd < 0)
   {
@@ -2186,6 +2206,7 @@ bool SynchronizeController::AddDirectory(const QString & Directory, bool Recurse
     return false;
   }
   FWatches.insert(Wd, Directory);
+#endif
   FWatchedPaths.insert(Directory);
   if (Recurse)
   {
@@ -2203,6 +2224,12 @@ bool SynchronizeController::AddDirectory(const QString & Directory, bool Recurse
 
 void SynchronizeController::RemoveWatches()
 {
+#ifdef Q_OS_WIN
+  if ((FWatcher != nullptr) && !FWatcher->directories().isEmpty())
+  {
+    FWatcher->removePaths(FWatcher->directories());
+  }
+#else
   if (FInotify >= 0)
   {
     for (auto It = FWatches.cbegin(); It != FWatches.cend(); ++It)
@@ -2210,6 +2237,7 @@ void SynchronizeController::RemoveWatches()
       inotify_rm_watch(FInotify, It.key());
     }
   }
+#endif
   FWatches.clear();
   FWatchedPaths.clear();
 }
@@ -2217,7 +2245,11 @@ void SynchronizeController::RemoveWatches()
 void SynchronizeController::Rescan()
 {
   // DiscMon AddDirectory + Open (initially) / directories change (later)
+#ifdef Q_OS_WIN
+  bool Initial = (FWatcher == nullptr);
+#else
   bool Initial = (FInotify < 0);
+#endif
   bool Recurse = ((FParams.Options & soRecurse) != 0);
   if (Initial)
   {
@@ -2225,6 +2257,11 @@ void SynchronizeController::Rescan()
     {
       emit Log(slScan, QStringLiteral("Scanning '%1' for subdirectories...").arg(FParams.LocalDirectory), QString());
     }
+#ifdef Q_OS_WIN
+    FWatcher = new QFileSystemWatcher(this);
+    connect(FWatcher, &QFileSystemWatcher::directoryChanged, this, &SynchronizeController::WatchedDirectoryChanged);
+  }
+#else
     FInotify = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (FInotify < 0)
     {
@@ -2235,6 +2272,7 @@ void SynchronizeController::Rescan()
     FNotifier = new QSocketNotifier(FInotify, QSocketNotifier::Read, this);
     connect(FNotifier, &QSocketNotifier::activated, this, &SynchronizeController::ReadEvents);
   }
+#endif
   int Before = FWatches.size();
   QString Error;
   if (!QFileInfo(FParams.LocalDirectory).isDir())
@@ -2266,6 +2304,71 @@ void SynchronizeController::Rescan()
   }
 }
 
+#ifdef Q_OS_WIN
+// QFileSystemWatcher: "something changed in Directory" (files or subdirectories)
+void SynchronizeController::WatchedDirectoryChanged(const QString & Directory)
+{
+  if (!FActive)
+  {
+    return;
+  }
+  if (!QFileInfo(Directory).isDir())
+  {
+    if (Directory == FParams.LocalDirectory)
+    {
+      // TSynchronizeController::SynchronizeInvalid
+      Abort(false, QStringLiteral("Error watching for changes in directory '%1'.").arg(Directory),
+        QString::fromLocal8Bit(strerror(ENOENT)));
+      return;
+    }
+    // A watched subdirectory (and the tree below it) is gone
+    QString Prefix = Directory + QLatin1Char('/');
+    for (auto W = FWatches.begin(); W != FWatches.end(); )
+    {
+      if ((W.value() == Directory) || W.value().startsWith(Prefix))
+      {
+        FWatcher->removePath(W.value());
+        FWatchedPaths.remove(W.value());
+        W = FWatches.erase(W);
+      }
+      else
+      {
+        ++W;
+      }
+    }
+    return;
+  }
+  bool DirectoriesChanged = false;
+  if ((FParams.Options & soRecurse) != 0)
+  {
+    // New subdirectories are watched too
+    const QFileInfoList Entries = QDir(Directory).entryInfoList(QDir::Dirs | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot | QDir::NoSymLinks);
+    for (const QFileInfo & Info : Entries)
+    {
+      QString Path = Info.filePath();
+      if (!FWatchedPaths.contains(Path) && AllowDirectory(Path))
+      {
+        QString Error;
+        if (!AddDirectory(Path, true, Error))
+        {
+          Abort(false, FTooManyAborted ? QString() : QStringLiteral("Error watching for changes in directory '%1'.").arg(Path), Error);
+          return;
+        }
+        DirectoriesChanged = true;
+      }
+    }
+  }
+  DirectoryChanged(Directory);
+  if (DirectoriesChanged && FActive)
+  {
+    emit Log(slDirChange, QStringLiteral("Watching for changes in %1 directories...").arg(FWatches.size()), QString());
+  }
+}
+
+void SynchronizeController::ReadEvents()
+{
+}
+#else
 void SynchronizeController::ReadEvents()
 {
   alignas(struct inotify_event) char Buffer[16384];
@@ -2363,6 +2466,7 @@ void SynchronizeController::ReadEvents()
     emit Log(slDirChange, QStringLiteral("Watching for changes in %1 directories...").arg(FWatches.size()), QString());
   }
 }
+#endif
 
 void SynchronizeController::DirectoryChanged(const QString & Directory)
 {
@@ -2573,6 +2677,10 @@ void SynchronizeController::Stop()
     FStatus.reset();
   }
   RemoveWatches();
+#ifdef Q_OS_WIN
+  delete FWatcher;
+  FWatcher = nullptr;
+#else
   if (FNotifier != nullptr)
   {
     delete FNotifier;
@@ -2583,6 +2691,7 @@ void SynchronizeController::Stop()
     close(FInotify);
     FInotify = -1;
   }
+#endif
   if (WasActive)
   {
     SetBusy(false);

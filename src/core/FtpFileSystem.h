@@ -183,7 +183,6 @@ private:
   bool FUtf8 = true;
   bool FPasswordFailed = false;
   bool FAnyPassword = false;
-  bool FPasswordUsed = false;
   bool FAwaitingWelcome = false;
   bool FAsciiTransfer = false;
   // reply parser state
@@ -201,7 +200,6 @@ private:
   QString FHashAlg;             // algorithm selected with OPTS HASH
   bool FSupportsAnyChecksumFeature = false;
   bool FHasClntCommand = false;
-  bool FAnnouncesUtf8 = false;
   int FServerType = 0;          // FtpListParser::ServerTypeFlag
   bool FMVS = false;
   bool FVMS = false;
@@ -215,7 +213,6 @@ private:
   bool FAnyTransferSucceeded = false;
   QElapsedTimer FLastActivity;  // last command (dummy command keepalive)
   QElapsedTimer FLastDataSent;  // last directory listing (directory keepalive)
-  qint64 FNextKeepaliveMs = 0;
   // timestamps
   bool FDetectTimeDifference = true;
   qint64 FTimeDifference = 0;   // seconds added to listing times (server local time)

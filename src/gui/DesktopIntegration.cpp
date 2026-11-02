@@ -5,6 +5,7 @@
 // ApplicationRestore, TrayIconClick, PopupTrayBalloon, OperationComplete,
 // taskbar progress) and forms/Login.cpp (DesktopIconActionExecute).
 #include "gui/DesktopIntegration.h"
+#include "core/Platform.h"
 #include "gui/CustomCommandRunner.h"
 #include "gui/GuiUserInterface.h"
 #include "gui/ProgressDialog.h"
@@ -288,7 +289,7 @@ QList<Place> Places()
   }
 
   // Mounted volumes a file manager would show (removable media, /mnt, gvfs...)
-  QString RuntimeGvfs = QStringLiteral("/run/user/%1/gvfs/").arg(getuid());
+  QString RuntimeGvfs = QStringLiteral("/run/user/%1/gvfs/").arg(Platform::UserKey());
   const QList<QStorageInfo> Volumes = QStorageInfo::mountedVolumes();
   for (const QStorageInfo & Volume : Volumes)
   {

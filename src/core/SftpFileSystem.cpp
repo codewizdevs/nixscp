@@ -18,6 +18,13 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 
+// File type bits of SFTP attributes (POSIX values, as sent by the server: they
+// describe remote files, whatever the local operating system)
+static constexpr unsigned SftpTypeMask = 0170000;
+static constexpr unsigned SftpTypeDirectory = 0040000;
+static constexpr unsigned SftpTypeSymlink = 0120000;
+static constexpr unsigned SftpTypeFile = 0100000;
+
 namespace
 {
 
@@ -742,11 +749,11 @@ RemoteFile SftpFileSystem::RawFileFromName(const QByteArray & Payload, int & Pos
   File.IsHidden = (NameData[0] == '.');
   if (A.Flags & ATTR_PERMISSIONS)
   {
-    switch (A.Permissions & S_IFMT)
+    switch (A.Permissions & SftpTypeMask)
     {
-      case S_IFDIR: File.FileType = RemoteFile::Directory; break;
-      case S_IFLNK: File.FileType = RemoteFile::Symlink; break;
-      case S_IFREG: File.FileType = RemoteFile::File; break;
+      case SftpTypeDirectory: File.FileType = RemoteFile::Directory; break;
+      case SftpTypeSymlink: File.FileType = RemoteFile::Symlink; break;
+      case SftpTypeFile: File.FileType = RemoteFile::File; break;
       default: File.FileType = RemoteFile::Other; break;
     }
   }
@@ -950,7 +957,7 @@ void SftpFileSystem::ResolveSymlinks(const QString & Directory, RemoteFileList &
       PacketReader Reader(StatResponse.Payload);
       RawAttrs A = ReadAttrs(Reader);
       // broken links stay links to nothing
-      File.IsDirectory = (A.Flags & ATTR_PERMISSIONS) && ((A.Permissions & S_IFMT) == S_IFDIR);
+      File.IsDirectory = (A.Flags & ATTR_PERMISSIONS) && ((A.Permissions & SftpTypeMask) == SftpTypeDirectory);
       if (!File.IsDirectory)
       {
         File.Size = static_cast<qint64>(A.Size);

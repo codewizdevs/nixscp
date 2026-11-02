@@ -4,6 +4,7 @@
 // RemoteTransferFiles, AddEditLink, CalculateDirectorySizes;
 // source/forms/ScpCommander.cpp: local links, Linux symlink(2)/link(2))
 #include "gui/FileOperations.h"
+#include "core/LocalFileSystem.h"
 
 #include "core/Configuration.h"
 #include "core/CopyParam.h"
@@ -23,8 +24,10 @@
 #include <QTemporaryDir>
 #include <QThread>
 
+#ifndef Q_OS_WIN
 #include <grp.h>
 #include <pwd.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cerrno>
@@ -35,11 +38,6 @@ namespace
 {
 
 const QString AnyMask = QStringLiteral("*.*");
-
-QString ErrnoText()
-{
-  return QString::fromLocal8Bit(strerror(errno));
-}
 
 QString AbsoluteRemotePath(const QString & Directory, const QString & Path)
 {
@@ -169,22 +167,8 @@ bool ResolveLocalToken(const QString & AText, bool User, unsigned int & Id)
     Id = Text.mid(IDStart + 1, Text.size() - IDStart - 2).toUInt(&Ok);
     return Ok;
   }
-  QByteArray Name = Text.toLocal8Bit();
-  if (User)
-  {
-    if (struct passwd * Pw = getpwnam(Name.constData()))
-    {
-      Id = Pw->pw_uid;
-      return true;
-    }
-  }
-  else if (struct group * Gr = getgrnam(Name.constData()))
-  {
-    Id = Gr->gr_gid;
-    return true;
-  }
-  Id = Text.toUInt(&Ok);
-  return Ok;
+  // a user / group name, or a number
+  return User ? LocalFs::ResolveUser(Text, Id) : LocalFs::ResolveGroup(Text, Id);
 }
 
 // Local counterpart of Terminal::ChangeFilesProperties (chmod/chown of the
@@ -203,18 +187,17 @@ QStringList ChangeLocalProperties(const QStringList & Paths, const RemotePropert
   }
   std::function<void(const QString &)> Change = [&](const QString & Path)
   {
-    QByteArray Name = QFile::encodeName(Path);
-    struct stat St = {};
-    if (lstat(Name.constData(), &St) != 0)
+    LocalFs::Stat St;
+    if (!LocalFs::LStat(Path, St))
     {
-      Errors << QStringLiteral("Can't change properties of file '%1'.\n%2").arg(Path, ErrnoText());
+      Errors << QStringLiteral("Can't change properties of file '%1'.\n%2").arg(Path, LocalFs::ErrorText(LocalFs::LastError()));
       return;
     }
-    if (S_ISLNK(St.st_mode))
+    if (St.IsSymlink())
     {
       return; // chmod/chown would change the target
     }
-    bool Directory = S_ISDIR(St.st_mode);
+    bool Directory = St.IsDirectory();
     if (Properties.Recursive && Directory)
     {
       QDir Dir(Path);
@@ -226,17 +209,17 @@ QStringList ChangeLocalProperties(const QStringList & Paths, const RemotePropert
     }
     if (!Properties.Owner.isEmpty() || !Properties.Group.isEmpty())
     {
-      if (chown(Name.constData(), static_cast<uid_t>(Uid), static_cast<gid_t>(Gid)) != 0)
+      if (!LocalFs::ChangeOwner(Path, Uid, Gid, !Properties.Owner.isEmpty(), !Properties.Group.isEmpty()))
       {
-        Errors << QStringLiteral("Can't change properties of file '%1'.\n%2").arg(Path, ErrnoText());
+        Errors << QStringLiteral("Can't change properties of file '%1'.\n%2").arg(Path, LocalFs::ErrorText(LocalFs::LastError()));
       }
     }
     if (Properties.ValidRights)
     {
-      unsigned int Mode = Properties.CombineRights(St.st_mode & 07777, Directory);
-      if (chmod(Name.constData(), Mode) != 0)
+      unsigned int Mode = Properties.CombineRights(St.Mode, Directory);
+      if (!LocalFs::SetMode(Path, Mode))
       {
-        Errors << QStringLiteral("Can't change properties of file '%1'.\n%2").arg(Path, ErrnoText());
+        Errors << QStringLiteral("Can't change properties of file '%1'.\n%2").arg(Path, LocalFs::ErrorText(LocalFs::LastError()));
       }
     }
   };
@@ -249,6 +232,11 @@ QStringList ChangeLocalProperties(const QStringList & Paths, const RemotePropert
 
 void LocalUsersGroups(QStringList & Users, QStringList & Groups)
 {
+#ifdef Q_OS_WIN
+  // No Unix owners on Windows
+  Q_UNUSED(Users);
+  Q_UNUSED(Groups);
+#else
   // the current user and its groups
   if (struct passwd * Pw = getpwuid(getuid()))
   {
@@ -267,6 +255,7 @@ void LocalUsersGroups(QStringList & Users, QStringList & Groups)
       }
     }
   }
+#endif
 }
 
 void AddUnique(QStringList & List, const QString & Value)
@@ -742,30 +731,20 @@ void AddEditLink(QWidget * Parent, Terminal * Term, const QString & Directory, c
     }
     return;
   }
-  // Linux: symlink(2) / link(2) instead of a Windows .lnk shortcut
+  // Symbolic / hard links (Linux symlink(2) / link(2); Windows symbolic links,
+  // not .lnk shortcuts)
   QString Path = QDir(Directory).absoluteFilePath(FileName);
-  QByteArray Name = QFile::encodeName(Path);
-  QByteArray Target = QFile::encodeName(PointTo);
-  if (Edit && (unlink(Name.constData()) != 0))
+  if (Edit && !LocalFs::RemoveFile(Path))
   {
-    ShowErrorMessage(Parent, QStringLiteral("Cannot create link '%1'.").arg(Path), ErrnoText());
+    ShowErrorMessage(Parent, QStringLiteral("Cannot create link '%1'.").arg(Path), LocalFs::ErrorText(LocalFs::LastError()));
     return;
   }
-  int Rc;
-  if (SymbolicLink)
-  {
-    Rc = symlink(Target.constData(), Name.constData());
-  }
-  else
-  {
-    // a relative target is relative to the link's directory, as with "ln"
-    QByteArray AbsoluteTarget = QFile::encodeName(QDir(QFileInfo(Path).absolutePath()).absoluteFilePath(PointTo));
-    Rc = link(AbsoluteTarget.constData(), Name.constData());
-  }
-  if (Rc != 0)
+  // a relative hard link target is relative to the link's directory, as with "ln"
+  QString Target = SymbolicLink ? PointTo : QDir(QFileInfo(Path).absolutePath()).absoluteFilePath(PointTo);
+  if (!LocalFs::CreateLink(Path, Target, SymbolicLink))
   {
     // CREATE_LINK_ERROR
-    ShowErrorMessage(Parent, QStringLiteral("Cannot create link '%1'.").arg(Path), ErrnoText());
+    ShowErrorMessage(Parent, QStringLiteral("Cannot create link '%1'.").arg(Path), LocalFs::ErrorText(LocalFs::LastError()));
     return;
   }
   if (Done) Done(true);

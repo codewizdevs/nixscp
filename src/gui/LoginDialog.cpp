@@ -1,6 +1,8 @@
 // Port of WinSCP source/forms/Login.cpp, forms/ImportSessions.cpp,
 // forms/Cleanup.cpp and TSaveSessionDialog/DoSaveSession of forms/Custom.cpp
 #include "gui/LoginDialog.h"
+#include "core/Platform.h"
+#include "gui/CloudSyncUi.h"
 #include "gui/Translator.h"
 #include "gui/HelpSystem.h"
 #include "gui/SiteAdvancedDialog.h"
@@ -433,12 +435,12 @@ void LoginDialog::CreateActions()
   NewSessionFolderAction = Action(QStringLiteral("Ne&w Folder..."), [this]() { NewSessionFolderActionExecute(); });
   NewSessionFolderAction->setIcon(Icons::Get(QStringLiteral("new-folder")));
   // Unix PuTTY tools; shown only when installed (FindTool)
-  RunPageantAction = Action(QStringLiteral("Run Pagea&nt"), [this]()
+  RunPageantAction = Action(QStringLiteral("Run Pagea&nt"), []()
   {
     QProcess::startDetached(QStandardPaths::findExecutable(QStringLiteral("pageant")), QStringList());
   });
   RunPageantAction->setVisible(!QStandardPaths::findExecutable(QStringLiteral("pageant")).isEmpty());
-  RunPuttygenAction = Action(QStringLiteral("Run PuTTY&gen"), [this]()
+  RunPuttygenAction = Action(QStringLiteral("Run PuTTY&gen"), []()
   {
     QProcess::startDetached(QStandardPaths::findExecutable(QStringLiteral("puttygen")), QStringList());
   });
@@ -2777,7 +2779,7 @@ void LoginDialog::ImportActionExecute()
     return;
   }
   QString Error;
-  if (!Config.Import(FileName, &Error))
+  if (!CloudSyncUi::ImportConfiguration(this, FileName, &Error))
   {
     ShowErrorMessage(this, Error);
     return;
@@ -2804,7 +2806,7 @@ void LoginDialog::ExportActionExecute()
   }
   SaveState();
   QString Error;
-  if (!Config.Export(FileName, &Error))
+  if (!CloudSyncUi::ExportConfiguration(this, FileName, &Error))
   {
     ShowErrorMessage(this, Error);
   }
@@ -2817,7 +2819,7 @@ static QStringList FindTemporaryFolders()
   QDir Dir(Configuration::Instance().ExpandedTemporaryDirectory());
   for (const QFileInfo & Info : Dir.entryInfoList({QStringLiteral("nixscp-*")}, QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden))
   {
-    if (Info.isDir() && !Info.isSymLink() && (Info.ownerId() == static_cast<uint>(getuid())))
+    if (Info.isDir() && !Info.isSymLink() && Platform::OwnedByCurrentUser(Info.ownerId()))
     {
       Result.append(Info.absoluteFilePath());
     }

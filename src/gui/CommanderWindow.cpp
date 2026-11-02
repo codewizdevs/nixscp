@@ -19,6 +19,7 @@
 #include "gui/GuiUserInterface.h"
 #include "gui/LoginDialog.h"
 #include "gui/ProgressDialog.h"
+#include "gui/CloudSyncUi.h"
 #include "gui/PreferencesDialog.h"
 #include "gui/EditMaskDialog.h"
 #include "gui/FindFilesDialog.h"
@@ -377,6 +378,8 @@ CommanderWindow::CommanderWindow(QWidget * Parent) :
     }
   };
   connect(&Config, &Configuration::Changed, this, &CommanderWindow::ApplyConfiguration);
+  // NixSCP Pro: status bar indicator, conflict prompt, open tabs to the cloud
+  CloudSyncUi::Attach(this);
   // Stale temporary folders of edited files (TemporaryDirectoryCleanup), once
   // per application start; only in the application itself (main.cpp names it
   // "NixSCP"), not in tools and tests that create a window
@@ -682,6 +685,8 @@ static QIcon ColoredTabIcon(const QIcon & Base, int Color)
 
 void CommanderWindow::UpdateTabCaption(SessionTab * Tab)
 {
+  // Connected, disconnected or another directory: the cloud session follows
+  CloudSyncUi::SessionsChanged(this);
   int Index = TabIndex(Tab);
   if (Index < 0)
   {
@@ -796,6 +801,7 @@ void CommanderWindow::CloseTab(SessionTab * Tab, bool KeepOne)
   FUpdatingTabs = false;
   Tab->Page->deleteLater();
   delete Tab;
+  CloudSyncUi::SessionsChanged(this);
   if (FTabs.isEmpty() && KeepOne)
   {
     // TScpCommanderForm::GetReplacementForLastSession: a local browser
@@ -3595,6 +3601,8 @@ void CommanderWindow::closeEvent(QCloseEvent * Event)
   Config.PanelSplitter = CurrentTab()->Page->saveState();
   Config.LastLocalDirectory = CurrentTab()->LocalPanel->CurrentDirectory();
   Config.Save();
+  // NixSCP Pro: settings changed just now and the open tabs reach the cloud
+  CloudSyncUi::FlushOnExit(this, Tabs);
   Event->accept();
 }
 

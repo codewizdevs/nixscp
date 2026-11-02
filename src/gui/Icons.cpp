@@ -4,6 +4,7 @@
 #include "gui/Icons.h"
 
 #include <QApplication>
+#include <QCoreApplication>
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
@@ -470,6 +471,13 @@ void EnsureIconTheme()
   Done = true;
 
   QStringList Paths = QIcon::themeSearchPaths();
+  // An icon theme shipped with NixSCP (Windows, portable builds): <program folder>/icons
+  QString Bundled = QCoreApplication::applicationDirPath() + QStringLiteral("/icons");
+  if (QFileInfo(Bundled).isDir() && !Paths.contains(Bundled))
+  {
+    Paths.prepend(Bundled);
+    QIcon::setThemeSearchPaths(Paths);
+  }
   bool HasSystemPath = std::any_of(Paths.cbegin(), Paths.cend(),
     [](const QString & Path) { return !Path.startsWith(QLatin1Char(':')) && QFileInfo(Path).isDir(); });
   if (!HasSystemPath)

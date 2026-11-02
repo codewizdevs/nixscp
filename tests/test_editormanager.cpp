@@ -13,6 +13,7 @@
 // tests/test_sftp.cpp); it assumes the server runs on this machine.
 #include "core/Configuration.h"
 #include "core/IniStorage.h"
+#include "core/Platform.h"
 #include "core/SessionData.h"
 #include "core/Terminal.h"
 #include "gui/EditorManager.h"
@@ -73,11 +74,7 @@ static QByteArray ReadFile(const QString & Path)
 
 static void SetAge(const QString & Path, int Seconds)
 {
-  struct timeval Times[2];
-  Times[0].tv_sec = time(nullptr) - Seconds;
-  Times[0].tv_usec = 0;
-  Times[1] = Times[0];
-  utimes(QFile::encodeName(Path).constData(), Times);
+  Platform::SetFileTimes(Path, time(nullptr) - Seconds);
 }
 
 // Processes events until Cond or Timeout (ms)

@@ -1430,7 +1430,7 @@ SynchronizeChecklistDialog::SynchronizeChecklistDialog(SynchronizeChecklistPtr C
   Ok.Arrow->setVisible(static_cast<bool>(FCallbacks.QueueSynchronize) && ((FParams & spTimestamp) == 0));
   FCancelButton = new QPushButton(QStringLiteral("Cancel"));
   FCancelButton->setAutoDefault(false);
-  auto ActionButton = [this](QAction * Action)
+  auto ActionButton = [](QAction * Action)
   {
     auto * Button = new QPushButton(Action->text());
     Button->setAutoDefault(false);

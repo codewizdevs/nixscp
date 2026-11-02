@@ -6,6 +6,7 @@
 // ScpFileSystem.
 #pragma once
 
+#include "core/Sockets.h"
 #include "core/FileSystem.h"
 #include "core/SessionData.h"
 
@@ -123,7 +124,7 @@ private:
 
   void Connect();
   void ApplyOptions();
-  int OpenProxySocket();
+  Net::Socket OpenProxySocket();
   bool PromptProxyCredentials();
   void VerifyHostKey();
   void Authenticate();

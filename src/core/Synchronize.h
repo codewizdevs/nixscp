@@ -39,6 +39,7 @@
 #include <vector>
 
 class QSocketNotifier;
+class QFileSystemWatcher;
 class TransferQueue;
 
 // TTerminal::TSynchronizeMode; TScript::SynchronizeProc and WinSCP.ini rely on the order
@@ -401,6 +402,9 @@ private:
   SynchronizeListingCachePtr FCache;
   int FInotify = -1;
   QSocketNotifier * FNotifier = nullptr;
+  // Windows: QFileSystemWatcher (ReadDirectoryChangesW); FWatches keys are then counters
+  QFileSystemWatcher * FWatcher = nullptr;
+  int FNextWatch = 0;
   QHash<int, QString> FWatches;       // watch descriptor -> directory
   QSet<QString> FWatchedPaths;        // directories of FWatches
   QSet<QString> FPending;             // changed directories
@@ -415,6 +419,7 @@ private:
   void RemoveWatches();
   void Rescan();
   void ReadEvents();
+  void WatchedDirectoryChanged(const QString & Directory);
   void DirectoryChanged(const QString & Directory);
   void ProcessPending();
   void SynchronizeDirectory(const QString & LocalDirectory, bool Full);

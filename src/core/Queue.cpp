@@ -30,6 +30,7 @@
 // queue object first, so a Terminal can be deleted and a receiver of
 // ItemFinished/Changed may even delete the queue.
 #include "core/Queue.h"
+#include "core/Platform.h"
 
 #include "core/Configuration.h"
 #include "core/IniStorage.h"
@@ -577,7 +578,7 @@ static void ScanRemote(FileSystem & Fs, FileOperationProgress & Progress, const 
         continue;
       }
       ScanRemote(Fs, Progress, UnixPath::Combine(Path, Child.FileName), Child,
-        QDir(Target).filePath(Param.ChangeFileName(Child.FileName)), static_cast<int>(Index), Param, Entries);
+        QDir(Target).filePath(CopyParam::ValidLocalFileName(Param.ChangeFileName(Child.FileName))), static_cast<int>(Index), Param, Entries);
     }
     if (Param.ExcludeEmptyDirectories && !AnyFileFrom(Entries, Index + 1))
     {
@@ -631,7 +632,7 @@ static void ScanLocal(FileOperationProgress & Progress, const QString & Path, co
     const QFileInfoList Children = Dir.entryInfoList(QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot, QDir::Name);
     for (const QFileInfo & Child : Children)
     {
-      ScanLocal(Progress, Child.filePath(), UnixPath::Combine(Target, Param.ChangeFileName(Child.fileName())),
+      ScanLocal(Progress, Child.filePath(), UnixPath::Combine(Target, CopyParam::RestoreChars(Param.ChangeFileName(Child.fileName()))),
         static_cast<int>(Index), Param, Visited, Entries);
     }
     if (Param.ExcludeEmptyDirectories && !AnyFileFrom(Entries, Index + 1))
@@ -657,10 +658,7 @@ static void RenameLocalForce(const QString & From, const QString & To)
 
 static void SetLocalModificationTime(const QString & Path, const QDateTime & Time)
 {
-  struct timespec Times[2];
-  Times[0].tv_sec = Times[1].tv_sec = static_cast<time_t>(Time.toSecsSinceEpoch());
-  Times[0].tv_nsec = Times[1].tv_nsec = 0;
-  utimensat(AT_FDCWD, QFile::encodeName(Path).constData(), Times, 0);
+  Platform::SetFileTimes(Path, Time.toSecsSinceEpoch());
 }
 
 // Worker thread: appends finished parts to "<file>.filepart" in order and
@@ -1498,7 +1496,7 @@ void TransferQueue::Private::StartScan(Item & I, Worker & W)
       QSet<QString> Visited;
       for (const QString & Path : Sources)
       {
-        ScanLocal(Progress, Path, UnixPath::Combine(TargetDir, Param.ChangeFileName(QFileInfo(Path).fileName(), true)), -1,
+        ScanLocal(Progress, Path, UnixPath::Combine(TargetDir, CopyParam::RestoreChars(Param.ChangeFileName(QFileInfo(Path).fileName(), true))), -1,
           Param, Visited, Scan->Entries);
       }
       return;
@@ -1511,7 +1509,7 @@ void TransferQueue::Private::StartScan(Item & I, Worker & W)
       {
         OnlyFile = File;
       }
-      ScanRemote(Fs, Progress, Path, File, QDir(TargetDir).filePath(Param.ChangeFileName(UnixPath::ExtractFileName(Path), true)),
+      ScanRemote(Fs, Progress, Path, File, QDir(TargetDir).filePath(CopyParam::ValidLocalFileName(Param.ChangeFileName(UnixPath::ExtractFileName(Path), true))),
         -1, Param, Scan->Entries);
     }
     // Local directories are created right away; files wait for nothing

@@ -41,6 +41,7 @@ int main()
 #include "gui/ProgressDialog.h"
 #include "gui/QueuePanel.h"
 
+#include <QSettings>
 #include <QAbstractButton>
 #include <QAction>
 #include <QApplication>
@@ -527,6 +528,7 @@ static void TestApplyConfiguration(CommanderWindow & Window)
   CHECK(Queue->Queue()->TransfersLimit() == New);
 }
 
+#ifndef _WIN32
 static QString XdgQuery(const QString & Scheme)
 {
   QProcess P;
@@ -534,6 +536,7 @@ static QString XdgQuery(const QString & Scheme)
   P.waitForFinished(10000);
   return QString::fromUtf8(P.readAllStandardOutput()).trimmed();
 }
+#endif
 
 static void TestUrlRegistration(QWidget * Parent, const QString & DataHome, const QString & ConfigHome)
 {
@@ -556,6 +559,18 @@ static void TestUrlRegistration(QWidget * Parent, const QString & DataHome, cons
     CHECK(MessageBoxTexts.size() == 1);
     CHECK(MessageBoxTexts.value(0) == (Register ? QStringLiteral("Do you want to register NixSCP to handle URL addresses?") :
       QStringLiteral("Do you want to unregister NixSCP from handling all URL addresses?")));
+#ifdef _WIN32
+    {
+      QSettings Classes(QStringLiteral("HKEY_CURRENT_USER\\Software\\Classes"), QSettings::NativeFormat);
+      for (const char * Scheme : {"sftp", "scp", "ftp", "ftps", "ftpes", "dav", "davs", "s3"})
+      {
+        QString Command = Classes.value(QString::fromLatin1(Scheme) + QStringLiteral("/shell/open/command/Default")).toString();
+        CHECK_MSG(Register == Command.contains(QStringLiteral(" /unsafe ")), QString::fromLatin1(Scheme));
+      }
+      Q_UNUSED(DesktopFile);
+      Q_UNUSED(ConfigHome);
+    }
+#else
     if (Register)
     {
       QFile F(DesktopFile);
@@ -580,6 +595,7 @@ static void TestUrlRegistration(QWidget * Parent, const QString & DataHome, cons
         CHECK(!QString::fromUtf8(F.readAll()).contains(QStringLiteral("nixscp-url-handler.desktop")));
       }
     }
+#endif
   }
   // declined: nothing happens
   QTimer::singleShot(200, []()

@@ -222,9 +222,10 @@ static void TestStructure(CommanderWindow & Window)
   std::printf("[structure]\n");
   CommanderActions & A = *Window.Actions();
   QMenuBar * Bar = Window.menuBar();
-  // ScpCommander.dfm MenuToolbar; a local browser tab says Left/Right
+  // ScpCommander.dfm MenuToolbar; a local browser tab says Left/Right.
+  // NixSCP Pro adds its menu after Help ("Cloud Sync" when signed out).
   QStringList Titles = MenuTitles(Bar);
-  CHECK_MSG(Titles == QStringList({"&Left", "&Mark", "&Files", "&Commands", "&Tabs", "&Options", "&Right", "&Help"}),
+  CHECK_MSG(Titles == QStringList({"&Left", "&Mark", "&Files", "&Commands", "&Tabs", "&Options", "&Right", "&Help", "Cloud Sync"}),
     Titles.join(QStringLiteral("|")));
   QStringList Files = MenuItems(TopMenu(Bar, QStringLiteral("&Files")));
   CHECK_MSG(StartsWith(Files, QStringList({"&New", "-", "&Open", "&Edit", "Edit &Link...", "-"})), Files.join(QStringLiteral("|")));

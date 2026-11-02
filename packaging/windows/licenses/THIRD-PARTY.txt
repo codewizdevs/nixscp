@@ -1,0 +1,23 @@
+NixSCP for Windows includes the following third-party software.
+
+Qt 6 (Core, Gui, Widgets, Network, Svg and plugins)
+  The Qt Company Ltd. and other contributors, https://www.qt.io/
+  Used under the GNU Lesser General Public License v3 (LGPL-3.txt), dynamically
+  linked (Qt6*.dll, plugins/). Source code: https://download.qt.io/official_releases/qt/
+  You may replace the Qt libraries with compatible versions of your own.
+
+OpenSSL 3.5 (libcrypto-3-x64.dll, libssl-3-x64.dll)
+  The OpenSSL Project, https://www.openssl.org/ - Apache License 2.0 (OpenSSL-LICENSE.txt)
+
+libssh 0.11 (libssh.dll)
+  The libssh team, https://www.libssh.org/ - GNU LGPL v2.1 (libssh-COPYING.txt)
+
+LLVM / llvm-mingw runtime (libc++.dll, libunwind.dll, libwinpthread-1.dll)
+  https://github.com/mstorsjo/llvm-mingw - Apache License 2.0 with LLVM exceptions,
+  MIT and others (llvm-mingw-LICENSE.txt)
+
+Adwaita icon theme (icons/Adwaita)
+  The GNOME Project - GNU LGPL v3 or Creative Commons BY-SA 3.0 (Adwaita-copyright.txt)
+
+NixSCP itself is free software under the GNU General Public License v3
+(LICENSE.txt), based on WinSCP (c) 2000-2026 Martin Prikryl.

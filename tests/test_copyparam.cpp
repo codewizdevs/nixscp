@@ -55,6 +55,30 @@ static void TestFileMask()
   CHECK(Message.contains(QStringLiteral("directory '/srv/b.txt/'")));
 }
 
+// TCopyParamType::ValidLocalFileName / RestoreChars (Windows only)
+static void TestLocalFileNames()
+{
+  const QStringList Names = {
+    QStringLiteral("report 12:30.txt"), QStringLiteral("a?b*c|d<e>f\"g\\h"), QStringLiteral("dot."), QStringLiteral("space "),
+    QStringLiteral("con"), QStringLiteral("NUL.txt"), QStringLiteral("100%"), QStringLiteral("x%3Ay"), QStringLiteral("x%00y"),
+    QStringLiteral("plain.txt"), QStringLiteral("tab\there")};
+#ifdef _WIN32
+  CHECK_EQ(CopyParam::ValidLocalFileName(QStringLiteral("report 12:30.txt")), QStringLiteral("report 12%3A30.txt"));
+  CHECK_EQ(CopyParam::ValidLocalFileName(QStringLiteral("a?b|c")), QStringLiteral("a%3Fb%7Cc"));
+  CHECK_EQ(CopyParam::ValidLocalFileName(QStringLiteral("dot.")), QStringLiteral("dot%2E"));
+  CHECK_EQ(CopyParam::ValidLocalFileName(QStringLiteral("con")), QStringLiteral("con%00"));
+  CHECK_EQ(CopyParam::ValidLocalFileName(QStringLiteral("NUL.txt")), QStringLiteral("NUL%00.txt"));
+  CHECK_EQ(CopyParam::ValidLocalFileName(QStringLiteral("100%")), QStringLiteral("100%"));
+  // a literal token is protected, so that it comes back unchanged
+  CHECK_EQ(CopyParam::ValidLocalFileName(QStringLiteral("x%3Ay")), QStringLiteral("x%253Ay"));
+  CHECK_EQ(CopyParam::ValidLocalFileName(QStringLiteral("plain.txt")), QStringLiteral("plain.txt"));
+#endif
+  for (const QString & Name : Names)
+  {
+    CHECK_EQ(CopyParam::RestoreChars(CopyParam::ValidLocalFileName(Name)), Name);
+  }
+}
+
 static void TestPreserveReadOnly()
 {
   CopyParam P;
@@ -412,6 +436,7 @@ int main(int argc, char ** argv)
   qputenv("XDG_CONFIG_HOME", Scratch.path().toUtf8());
 
   TestFileMask();
+  TestLocalFileNames();
   TestPreserveReadOnly();
   TestUsableAttrs();
   TestEOL();

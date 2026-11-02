@@ -5,6 +5,7 @@
 // SFTPConfirmResume) and source/core/FtpFileSystem.cpp (ConfirmOverwrite),
 // and the IsCapable tables of the protocol classes.
 #include "core/Terminal.h"
+#include "core/Platform.h"
 #include "core/ActionsLog.h"
 #include "core/SessionLog.h"
 #include "core/Configuration.h"
@@ -32,10 +33,7 @@
 
 static void SetLocalModificationTime(const QString & Path, const QDateTime & Time)
 {
-  struct timespec Times[2];
-  Times[0].tv_sec = Times[1].tv_sec = static_cast<time_t>(Time.toSecsSinceEpoch());
-  Times[0].tv_nsec = Times[1].tv_nsec = 0;
-  utimensat(AT_FDCWD, QFile::encodeName(Path).constData(), Times, 0);
+  Platform::SetFileTimes(Path, Time.toSecsSinceEpoch());
 }
 
 // "**main instruction**" markup of WinSCP messages (MainInstructions)
@@ -1495,7 +1493,7 @@ void Terminal::ScanRemote(const QString & Path, const RemoteFile & File, const Q
       }
       // Symlinked directories are followed, as WinSCP does
       ScanRemote(UnixPath::Combine(Path, Child.FileName), Child,
-        QDir(Target).filePath(Param.ChangeFileName(Child.FileName)), Items, Param, State);
+        QDir(Target).filePath(CopyParam::ValidLocalFileName(Param.ChangeFileName(Child.FileName))), Items, Param, State);
     }
     if (Param.ExcludeEmptyDirectories && !AnyFileFrom(Items, Index + 1))
     {
@@ -1560,7 +1558,7 @@ void Terminal::ScanLocal(const QString & Path, const QString & Target, QList<Tra
     const QFileInfoList Entries = Dir.entryInfoList(QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot, QDir::Name);
     for (const QFileInfo & Child : Entries)
     {
-      ScanLocal(Child.filePath(), UnixPath::Combine(Target, Param.ChangeFileName(Child.fileName())), Items, Visited, Param, State);
+      ScanLocal(Child.filePath(), UnixPath::Combine(Target, CopyParam::RestoreChars(Param.ChangeFileName(Child.fileName()))), Items, Visited, Param, State);
     }
     if (Param.ExcludeEmptyDirectories && !AnyFileFrom(Items, Index + 1))
     {
@@ -2461,7 +2459,7 @@ void Terminal::CopyToLocal(const QStringList & RemotePaths, const QString & Targ
       FileAttempt Attempt;
       if (ProcessFile(State, Attempt, [&](FileAttempt &) { File = FFileSystem->ReadFile(Path); return true; }))
       {
-        ScanRemote(Path, File, QDir(TargetDir).filePath(AParam.ChangeFileName(UnixPath::ExtractFileName(Path), true)), Items, AParam, State);
+        ScanRemote(Path, File, QDir(TargetDir).filePath(CopyParam::ValidLocalFileName(AParam.ChangeFileName(UnixPath::ExtractFileName(Path), true))), Items, AParam, State);
       }
     }
     if (!AParam.AllowAnyTransfer())
@@ -2598,7 +2596,7 @@ void Terminal::CopyToRemote(const QStringList & LocalPaths, const QString & Targ
     QSet<QString> Visited;
     for (const QString & Path : LocalPaths)
     {
-      ScanLocal(Path, UnixPath::Combine(TargetDir, AParam.ChangeFileName(QFileInfo(Path).fileName(), true)), Items, Visited, AParam, State);
+      ScanLocal(Path, UnixPath::Combine(TargetDir, CopyParam::RestoreChars(AParam.ChangeFileName(QFileInfo(Path).fileName(), true))), Items, Visited, AParam, State);
     }
     if (!AParam.AllowAnyTransfer())
     {

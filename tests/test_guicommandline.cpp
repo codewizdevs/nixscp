@@ -31,6 +31,7 @@ int main()
 #include "gui/LoginDialog.h"
 #include "gui/SingleInstance.h"
 
+#include <QSettings>
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
@@ -424,6 +425,21 @@ static void TestSwitches(const QString & Scratch)
 
 static void TestUrlHandler(const QString & Scratch)
 {
+#ifdef _WIN32
+  // HKCU\\Software\\Classes\\<scheme>, as WinSCP
+  Q_UNUSED(Scratch);
+  QSettings Classes(QStringLiteral("HKEY_CURRENT_USER\\Software\\Classes"), QSettings::NativeFormat);
+  QString Error;
+  CHECK(RegisterForDefaultProtocols(&Error));
+  for (const QString & Scheme : UrlSchemes())
+  {
+    CHECK(Classes.contains(Scheme + QStringLiteral("/URL Protocol")));
+    QString Command = Classes.value(Scheme + QStringLiteral("/shell/open/command/Default")).toString();
+    CHECK(Command.contains(QStringLiteral("\" /unsafe \"%1\"")));
+  }
+  CHECK(UnregisterForProtocols(&Error));
+  CHECK(!Classes.contains(QStringLiteral("sftp/shell/open/command/Default")));
+#else
   // fake xdg-mime / update-desktop-database: never touch the real desktop
   QString Bin = Scratch + QStringLiteral("/bin");
   QString LogFile = Scratch + QStringLiteral("/xdg-mime.log");
@@ -446,6 +462,7 @@ static void TestUrlHandler(const QString & Scratch)
   CHECK(UnregisterForProtocols(&Error));
   CHECK(!QFile::exists(FileName));
   qputenv("PATH", OldPath);
+#endif
 }
 
 static void TestSingleInstance(const QString & Scratch)

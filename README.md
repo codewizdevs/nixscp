@@ -85,13 +85,18 @@ Download the package for your distribution from the [latest release](../../relea
 | Ubuntu 26.04 | `nixscp_<version>_ubuntu26.04_amd64.deb` |
 | Debian 13 | `nixscp_<version>_debian13_amd64.deb` |
 | Fedora 42 / 43 | `nixscp-<version>.fc42.x86_64.rpm` / `.fc43` |
+| Other distributions (Ubuntu 24.04+, Linux Mint, Arch, openSUSE…) | `NixSCP-<version>-x86_64.AppImage` |
+| Windows 10 / 11 (64-bit) | `NixSCP-<version>-setup.exe` (installer) or `NixSCP-<version>-windows-x64.zip` (portable) |
 
 ```bash
 sudo apt install ./nixscp_*_amd64.deb      # Ubuntu / Debian
 sudo dnf install ./nixscp-*.x86_64.rpm     # Fedora
+chmod +x NixSCP-*-x86_64.AppImage && ./NixSCP-*-x86_64.AppImage   # any other distribution
 ```
 
-Release packages use your desktop icon theme. NixSCP needs **libssh 0.11 or newer** (Ubuntu 24.04 ships 0.10 — build from source with a newer libssh there).
+Release packages use your desktop icon theme. The AppImage bundles Qt, libssh and OpenSSL and runs on distributions with glibc 2.39 or newer. Building from source needs **libssh 0.11 or newer** and **OpenSSL 3.2 or newer**.
+
+On Windows, the installer can add `nixscp-cli` to `PATH`; the portable zip runs from any folder. Settings are stored in `%APPDATA%\NixSCP`.
 
 ### Build from source
 
@@ -114,6 +119,10 @@ sudo cmake --install build      # optional: menu entry, icons, sftp:// handler
 ```
 
 Build your own packages with `cd build && cpack -G DEB` (or `-DCPACK_GENERATOR=RPM` at configure time and `cpack -G RPM` on Fedora).
+
+### Building for Windows
+
+The Windows version is cross-compiled on Linux with llvm-mingw, Qt for Windows (llvm-mingw build) and OpenSSL/libssh built for Windows; see `cmake/windows-llvm-mingw.cmake` for the expected `win-sdk/` layout. `packaging/build-windows.sh` builds the portable folder, the zip and (with NSIS) the installer into `bin/windows/`.
 
 ### Building with WinSCP's original icons
 
@@ -141,13 +150,17 @@ nixscp-cli /script=deploy.txt /log=deploy.log
 
 Your existing WinSCP scripts (`winscp.com /script=…`) generally run unchanged with `nixscp-cli`.
 
+## Cloud sync (NixSCP Pro beta)
+
+Optional end-to-end encrypted sync of sites, stored passwords, preferences, workspaces, bookmarks and open sessions between your computers (Linux and Windows): **Cloud Sync › Sign In…** in NixSCP. Everything is encrypted on your computer (Argon2id + AES-256-GCM) with a sync password that never leaves it; the server only stores ciphertext. Sync is **free during the beta**; afterwards it becomes a paid NixSCP Pro feature and NixSCP tells you in the app. NixSCP itself stays free and open source. Details: [nixscp.com/security](https://nixscp.com/security).
+
 ## Status
 
-**Version 1.0.** NixSCP ports WinSCP's features, captions, defaults and shortcuts one-to-one where they make sense on Linux. Windows-only features without a sane Linux equivalent (registry storage, drive letters, Windows file attributes, shell extensions) are replaced by Linux equivalents or removed. Bug reports and feature requests are welcome in [Issues](../../issues).
+**Version 1.1.** NixSCP ports WinSCP's features, captions, defaults and shortcuts one-to-one where they make sense on Linux. Windows-only features without a sane Linux equivalent (registry storage, drive letters, Windows file attributes, shell extensions) are replaced by Linux equivalents or removed. Bug reports and feature requests are welcome in [Issues](../../issues).
 
 ## FAQ
 
-**Is this WinSCP?** No. NixSCP is an independent Linux port based on WinSCP's GPL source code. It is not affiliated with or endorsed by the WinSCP project. If you are on Windows, use [WinSCP](https://winscp.net/).
+**Is this WinSCP?** No. NixSCP is an independent port based on WinSCP's GPL source code. It is not affiliated with or endorsed by the WinSCP project. On Windows, [WinSCP](https://winscp.net/) itself is the original; the Windows version of NixSCP is for people who also use NixSCP on Linux and want the same application and synced settings everywhere.
 
 **Can I keep using WinSCP on Windows and NixSCP on Linux with the same sites?** Yes — export from one, import into the other; the file format is the same.
 

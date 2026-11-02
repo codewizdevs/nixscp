@@ -39,6 +39,7 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QProcess>
+#include <QSettings>
 #include <QScopeGuard>
 #include <QStandardPaths>
 #include <QTemporaryDir>
@@ -975,8 +976,44 @@ QString GuiCommandLine::UrlHandlerDesktopFileName()
     QStringLiteral("/nixscp-url-handler.desktop");
 }
 
+#ifdef Q_OS_WIN
+// Windows: as WinSCP (RegisterProtocol), per user: HKCU\Software\Classes\<scheme>
+static const QString ClassesKey = QStringLiteral("HKEY_CURRENT_USER\\Software\\Classes");
+
+static QString UrlHandlerCommand()
+{
+  // /unsafe, so that a link cannot use dangerous switches (CheckSafe)
+  return QStringLiteral("\"%1\" /unsafe \"%2\"")
+    .arg(QDir::toNativeSeparators(QCoreApplication::applicationFilePath()), QStringLiteral("%1"));
+}
+#endif
+
 bool GuiCommandLine::RegisterForDefaultProtocols(QString * Error)
 {
+#ifdef Q_OS_WIN
+  QSettings Classes(ClassesKey, QSettings::NativeFormat);
+  for (const QString & Scheme : UrlSchemes())
+  {
+    Classes.beginGroup(Scheme);
+    Classes.setValue(QStringLiteral("Default"), QStringLiteral("URL:%1 Protocol").arg(Scheme.toUpper()));
+    Classes.setValue(QStringLiteral("URL Protocol"), QString());
+    Classes.setValue(QStringLiteral("EditFlags"), 2);
+    Classes.setValue(QStringLiteral("DefaultIcon/Default"),
+      QDir::toNativeSeparators(QCoreApplication::applicationFilePath()) + QStringLiteral(",0"));
+    Classes.setValue(QStringLiteral("shell/open/command/Default"), UrlHandlerCommand());
+    Classes.endGroup();
+  }
+  Classes.sync();
+  if (Classes.status() != QSettings::NoError)
+  {
+    if (Error != nullptr)
+    {
+      *Error = QStringLiteral("Cannot register NixSCP for the URL protocols in the registry.");
+    }
+    return false;
+  }
+  return true;
+#endif
   QString FileName = UrlHandlerDesktopFileName();
   QString Dir = QFileInfo(FileName).absolutePath();
   QStringList MimeTypes;
@@ -1013,6 +1050,27 @@ bool GuiCommandLine::RegisterForDefaultProtocols(QString * Error)
 
 bool GuiCommandLine::UnregisterForProtocols(QString * Error)
 {
+#ifdef Q_OS_WIN
+  // only the schemes that are still ours
+  QSettings Classes(ClassesKey, QSettings::NativeFormat);
+  for (const QString & Scheme : UrlSchemes())
+  {
+    if (Classes.value(Scheme + QStringLiteral("/shell/open/command/Default")).toString() == UrlHandlerCommand())
+    {
+      Classes.remove(Scheme);
+    }
+  }
+  Classes.sync();
+  if (Classes.status() != QSettings::NoError)
+  {
+    if (Error != nullptr)
+    {
+      *Error = QStringLiteral("Cannot unregister NixSCP for the URL protocols in the registry.");
+    }
+    return false;
+  }
+  return true;
+#endif
   QString FileName = UrlHandlerDesktopFileName();
   if (QFile::exists(FileName))
   {

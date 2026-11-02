@@ -6,6 +6,8 @@
 // (path combo, history/navigation toolbars, status bar, incremental search,
 // drag & drop, column persistence in DirViewParams).
 #include "gui/FilePanel.h"
+#include "core/Platform.h"
+#include "core/LocalPath.h"
 #include "gui/Translator.h"
 #include "gui/FileListModel.h"
 #include "core/Configuration.h"
@@ -63,11 +65,13 @@
 #include <cerrno>
 #include <climits>
 #include <cstring>
+#ifndef Q_OS_WIN
 #include <dirent.h>
 #include <fcntl.h>
 #include <functional>
 #include <grp.h>
 #include <pwd.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
@@ -87,6 +91,7 @@ static const int ReadingProgressDelay = 500;
 namespace
 {
 
+#ifndef Q_OS_WIN
 // uid/gid -> name, shared by all listings (getpwuid/NSS can be slow, e.g. LDAP)
 QMutex NameCacheMutex;
 QHash<uint, QString> UserNameCache;
@@ -149,6 +154,7 @@ QString GroupNameOf(gid_t Gid)
   GroupNameCache.insert(Gid, Name);
   return Name;
 }
+#endif
 
 QString ExpandHome(const QString & Path)
 {
@@ -176,6 +182,69 @@ bool LocalDirectoryProvider::ReadDirectory(const QString & Path, QString & Canon
     Canonical.clear();
     return false;
   }
+#ifdef Q_OS_WIN
+  // One FindFirstFileExW call returns name, size, time and attributes of each entry
+  std::wstring Pattern = QDir::toNativeSeparators(Canonical + QStringLiteral("/*")).toStdWString();
+  WIN32_FIND_DATAW Data;
+  HANDLE Find = FindFirstFileExW(Pattern.c_str(), FindExInfoBasic, &Data, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+  if (Find == INVALID_HANDLE_VALUE)
+  {
+    if (GetLastError() == ERROR_FILE_NOT_FOUND)
+    {
+      Error.clear();
+      return true;
+    }
+    MoreMessages = Platform::LastErrorText();
+    return false;
+  }
+  QElapsedTimer ProgressTimer;
+  ProgressTimer.start();
+  do
+  {
+    QString Name = QString::fromWCharArray(Data.cFileName);
+    if ((Name == QStringLiteral(".")) || (Name == QStringLiteral("..")))
+    {
+      continue;
+    }
+    if ((Cancel != nullptr) && Cancel->load())
+    {
+      FindClose(Find);
+      Files.clear();
+      MoreMessages = QStringLiteral("Operation was aborted.");
+      return false;
+    }
+    RemoteFile File;
+    File.FileName = Name;
+    DWORD Attributes = Data.dwFileAttributes;
+    // Symbolic links and junctions (dwReserved0 is the reparse tag)
+    File.IsSymLink = (Attributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+      ((Data.dwReserved0 == IO_REPARSE_TAG_SYMLINK) || (Data.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT));
+    if (File.IsSymLink)
+    {
+      File.LinkTo = QFileInfo(Canonical + QLatin1Char('/') + Name).symLinkTarget();
+    }
+    File.IsDirectory = (Attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    File.FileType = File.IsSymLink ? RemoteFile::Symlink : (File.IsDirectory ? RemoteFile::Directory : RemoteFile::File);
+    File.Size = File.IsDirectory ? 0 : ((static_cast<qint64>(Data.nFileSizeHigh) << 32) | Data.nFileSizeLow);
+    ULARGE_INTEGER Time;
+    Time.LowPart = Data.ftLastWriteTime.dwLowDateTime;
+    Time.HighPart = Data.ftLastWriteTime.dwHighDateTime;
+    // 100 ns intervals since 1601-01-01
+    File.Modification = QDateTime::fromMSecsSinceEpoch((static_cast<qint64>(Time.QuadPart) - 116444736000000000LL) / 10000);
+    File.Permissions = File.IsDirectory ? 0777 : ((Attributes & FILE_ATTRIBUTE_READONLY) ? 0444 : 0666);
+    File.IsHidden = (Attributes & FILE_ATTRIBUTE_HIDDEN) || Name.startsWith(QLatin1Char('.'));
+    Files.append(File);
+    if (Progress && ((Files.size() & 0xFF) == 0) && (ProgressTimer.elapsed() >= 100))
+    {
+      Progress(Files.size());
+      ProgressTimer.restart();
+    }
+  }
+  while (FindNextFileW(Find, &Data));
+  FindClose(Find);
+  Error.clear();
+  return true;
+#else
   QByteArray NativePath = QFile::encodeName(Canonical);
   if (::access(NativePath.constData(), R_OK | X_OK) != 0)
   {
@@ -249,6 +318,7 @@ bool LocalDirectoryProvider::ReadDirectory(const QString & Path, QString & Canon
   ::closedir(Dir);
   Error.clear();
   return true;
+#endif
 }
 
 LocalDirectoryProvider::~LocalDirectoryProvider()
@@ -988,19 +1058,29 @@ protected:
       return Result;
     }
     QFontMetrics Metrics(font());
-    // Components: "/", "home/", "user/", "dir"
+    // Components: "/", "home/", "user/", "dir" (Windows local: "C:\", "Users\"...)
     QList<Segment> Parts;
     Segment Root;
-    Root.Text = QStringLiteral("/");
-    Root.Path = QStringLiteral("/");
+    QString RootPath = QStringLiteral("/");
+    QChar Separator = QLatin1Char('/');
+#ifdef Q_OS_WIN
+    // Remote paths always start with "/"; local ones with a drive or a UNC share
+    if (!FPath.startsWith(QLatin1Char('/')) || FPath.startsWith(QStringLiteral("//")))
+    {
+      RootPath = LocalPath::Root(FPath);
+      Separator = QLatin1Char('\\');
+    }
+#endif
+    Root.Text = (Separator == QLatin1Char('/')) ? RootPath : LocalPath::Display(RootPath);
+    Root.Path = RootPath;
     Parts.append(Root);
-    QStringList Names = FPath.split(QLatin1Char('/'), Qt::SkipEmptyParts);
-    QString Current;
+    QStringList Names = FPath.mid(RootPath.size()).split(QLatin1Char('/'), Qt::SkipEmptyParts);
+    QString Current = RootPath;
     for (int Index = 0; Index < Names.size(); Index++)
     {
-      Current += QLatin1Char('/') + Names.at(Index);
+      Current = (Index == 0) ? (RootPath + Names.at(Index)) : (Current + QLatin1Char('/') + Names.at(Index));
       Segment Part;
-      Part.Text = Names.at(Index) + QLatin1Char('/');
+      Part.Text = Names.at(Index) + Separator;
       Part.Path = Current;
       Parts.append(Part);
     }
@@ -1072,9 +1152,15 @@ protected:
     QPalette Pal = palette();
     QColor Background = FActive ? Pal.color(QPalette::Highlight) : Pal.color(QPalette::Mid);
     QColor Text = FActive ? Pal.color(QPalette::HighlightedText) : Pal.color(QPalette::Window);
-    if (!FActive && (qGray(Background.rgb()) > 160))
+    if (!FActive)
     {
-      Text = Pal.color(QPalette::WindowText);
+      // Unreadable on the background (light Mid, or the dark theme where
+      // Window is dark too): WindowText instead
+      auto Distance = [&Background](const QColor & Color) { return std::abs(qGray(Color.rgb()) - qGray(Background.rgb())); };
+      if ((Distance(Text) < 64) && (Distance(Pal.color(QPalette::WindowText)) > Distance(Text)))
+      {
+        Text = Pal.color(QPalette::WindowText);
+      }
     }
     Painter.fillRect(rect(), Background);
     const QList<Segment> List = Segments();
@@ -1376,7 +1462,13 @@ struct FilePanel::Private : public QObject, public PanelViewHandler
 
   QString ParentOf(const QString & Path) const
   {
-    return UnixPath::Parent(Path);   // local paths are unix paths too on Linux
+    // local paths: "/" on Linux, "C:/" and UNC roots on Windows
+    return Q->FRemote ? UnixPath::Parent(Path) : LocalPath::Parent(Path);
+  }
+
+  bool IsRootPath(const QString & Path) const
+  {
+    return Q->FRemote ? UnixPath::IsRoot(Path) : LocalPath::IsRoot(Path);
   }
 
   QString NormalizeRequest(const QString & Path) const
@@ -1537,7 +1629,7 @@ struct FilePanel::Private : public QObject, public PanelViewHandler
           QString Parent;
           if (!Request.ClimbFrom.isEmpty())
           {
-            if (!UnixPath::IsRoot(Request.ClimbFrom))
+            if (!IsRootPath(Request.ClimbFrom))
             {
               Parent = ParentOf(Request.ClimbFrom);
             }
@@ -1545,7 +1637,7 @@ struct FilePanel::Private : public QObject, public PanelViewHandler
           else if (!QFileInfo(Directory).isDir())
           {
             Parent = Directory;
-            while (!UnixPath::IsRoot(Parent) && !QFileInfo(Parent).isDir())
+            while (!IsRootPath(Parent) && !QFileInfo(Parent).isDir())
             {
               Parent = ParentOf(Parent);
             }
@@ -1706,19 +1798,32 @@ struct FilePanel::Private : public QObject, public PanelViewHandler
     }
     else
     {
-      int Existing = PathCombo->findText(Directory);
+      // Shown as the user writes them (C:\Users\... on Windows)
+      QString Shown = LocalPath::Display(Directory);
+      int Existing = PathCombo->findText(Shown, Qt::MatchFixedString);
       if (Existing >= 0)
       {
         PathCombo->removeItem(Existing);
       }
-      PathCombo->insertItem(0, Directory);
+      PathCombo->insertItem(0, Shown);
       while (PathCombo->count() > 30)
       {
         PathCombo->removeItem(PathCombo->count() - 1);
       }
+#ifdef Q_OS_WIN
+      // The drives, always at hand
+      for (const QString & Root : LocalPath::Roots())
+      {
+        QString Drive = LocalPath::Display(Root);
+        if (PathCombo->findText(Drive, Qt::MatchFixedString) < 0)
+        {
+          PathCombo->addItem(Drive);
+        }
+      }
+#endif
       PathCombo->setCurrentIndex(0);
     }
-    PathCombo->setEditText(Directory);
+    PathCombo->setEditText(Q->FRemote ? Directory : LocalPath::Display(Directory));
   }
 
   void UpdateButtons()
@@ -1729,7 +1834,7 @@ struct FilePanel::Private : public QObject, public PanelViewHandler
     // EXPLORER_BACK_HINT / EXPLORER_FORWARD_HINT
     BackButton->setToolTip(Q->CanBack() ? QStringLiteral("Back to %1").arg(Q->HistoryPath(-1)) : QStringLiteral("Back"));
     ForwardButton->setToolTip(Q->CanForward() ? QStringLiteral("Forward to %1").arg(Q->HistoryPath(1)) : QStringLiteral("Forward"));
-    bool AtRoot = UnixPath::IsRoot(Directory);
+    bool AtRoot = IsRootPath(Directory);
     ParentButton->setEnabled(Connected && !AtRoot);
     RootButton->setEnabled(Connected && !AtRoot);
     HomeButton->setEnabled(Q->FProvider != nullptr);
@@ -3480,7 +3585,7 @@ int FilePanel::ForwardCount() const
 
 void FilePanel::ParentDirectory()
 {
-  if (d->Directory.isEmpty() || UnixPath::IsRoot(d->Directory))
+  if (d->Directory.isEmpty() || d->IsRootPath(d->Directory))
   {
     return;
   }
@@ -3493,7 +3598,9 @@ void FilePanel::RootDirectory()
 {
   if (d->Live() != nullptr)
   {
-    d->Load(QStringLiteral("/"), Private::LoadRequest());
+    // Windows: the root of the current drive
+    d->Load(FRemote ? QStringLiteral("/") : LocalPath::Root(d->Directory.isEmpty() ? QDir::homePath() : d->Directory),
+      Private::LoadRequest());
   }
 }
 

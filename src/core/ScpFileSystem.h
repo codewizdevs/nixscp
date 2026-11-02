@@ -146,7 +146,6 @@ public:
 
 private:
   SessionData FData;
-  UserInterface * FUI;
   std::unique_ptr<SecureShell> FOwnShell;
   SecureShell * FShell;
   std::unique_ptr<SshChannel> FChannel;

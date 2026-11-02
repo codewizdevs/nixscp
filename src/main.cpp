@@ -15,8 +15,10 @@
 #include "core/Configuration.h"
 #include "core/FileSystem.h"
 #include "core/IniStorage.h"
+#include "core/CloudSync.h"
 #include "core/RemoteFile.h"
 #include "core/Workspaces.h"
+#include "gui/CloudSyncUi.h"
 #include "gui/CommanderWindow.h"
 #include "gui/GuiCommandLine.h"
 #include "gui/GuiUserInterface.h"
@@ -26,6 +28,7 @@
 #include <QApplication>
 #include <QDir>
 #include <QFile>
+#include <QProxyStyle>
 #include <QTimer>
 #include <cstdio>
 #include <cstdlib>
@@ -88,6 +91,21 @@ static bool OpenInNewWindow()
   return (QGuiApplication::queryKeyboardModifiers() & Qt::ShiftModifier) != 0;
 }
 
+// Keyboard accelerators (Alt+letter in menus and dialogs) keep working, but
+// their underlines are not drawn
+class NoShortcutUnderlineStyle : public QProxyStyle
+{
+public:
+  int styleHint(StyleHint Hint, const QStyleOption * Option, const QWidget * Widget, QStyleHintReturn * Return) const override
+  {
+    if (Hint == QStyle::SH_UnderlineShortcut)
+    {
+      return 0;
+    }
+    return QProxyStyle::styleHint(Hint, Option, Widget, Return);
+  }
+};
+
 int main(int argc, char * argv[])
 {
   if (const char * AskPassFile = getenv("NIXSCP_ASKPASS_FILE"))
@@ -117,6 +135,7 @@ int main(int argc, char * argv[])
   ssh_init();
   QApplication App(argc, argv);
   QApplication::setApplicationName(QStringLiteral("NixSCP"));
+  App.setStyle(new NoShortcutUnderlineStyle());
   QApplication::setApplicationVersion(QStringLiteral(PROJECT_VERSION));
   QApplication::setOrganizationName(QStringLiteral("NixSCP"));
   QApplication::setDesktopFileName(QStringLiteral("nixscp"));
@@ -136,6 +155,8 @@ int main(int argc, char * argv[])
   ApplyIniSwitch(Params, &IniFileMissing);
   Config.Load();
   ApplyRawConfig(Params);
+  // NixSCP Pro settings and session sync (inactive until signed in)
+  CloudSync::Instance().Initialize(Config);
   if (!IniFileMissing.isEmpty())
   {
     // FILE_NOT_EXISTS
@@ -389,14 +410,18 @@ int main(int argc, char * argv[])
         ExploreFile(&Window, ExploreFileName);
       }
     }
-    else if (Config.ShowLoginOnStartup && !Screenshotting)
+    else if (!Screenshotting)
     {
-      // NeedSession(Startup)
-      LoginData Login;
-      if (DoLoginDialog(&Window, nullptr, true, Login))
+      // NixSCP Pro: the tabs open when NixSCP was last closed, on any computer;
+      // otherwise NeedSession(Startup)
+      CloudSyncUi::RestoreSessions(&Window, [&Window, &Config](bool Restored)
       {
-        OpenSessions(&Window, Login);
-      }
+        LoginData Login;
+        if (!Restored && Config.ShowLoginOnStartup && DoLoginDialog(&Window, nullptr, true, Login))
+        {
+          OpenSessions(&Window, Login);
+        }
+      });
     }
   });
 

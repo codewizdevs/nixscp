@@ -18,8 +18,8 @@
 #include <QTemporaryDir>
 #include <QTimer>
 
-#include <fcntl.h>
-#include <sys/stat.h>
+#include "core/Platform.h"
+
 #include <cstdio>
 
 static int Failures = 0;
@@ -85,8 +85,7 @@ static void WriteFile(const QString & FileName, const QByteArray & Data, qint64 
     Failures++;
   }
   F.close();
-  struct timespec Times[2] = {{static_cast<time_t>(MTime), 0}, {static_cast<time_t>(MTime), 0}};
-  utimensat(AT_FDCWD, QFile::encodeName(FileName).constData(), Times, 0);
+  Platform::SetFileTimes(FileName, MTime);
 }
 
 static QByteArray ReadAll(const QString & FileName)

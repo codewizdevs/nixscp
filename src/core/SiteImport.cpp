@@ -90,10 +90,23 @@ static void SelectSessionsToImportIfAny(ImportSessionList & List, const StoredSe
 //---------------------------------------------------------------------------
 // Locations
 
+// The user's profile folder; on Windows %USERPROFILE%, as OpenSSH for Windows
+static QString HomeFolder()
+{
+#ifdef Q_OS_WIN
+  QString Profile = qEnvironmentVariable("USERPROFILE");
+  if (!Profile.isEmpty())
+  {
+    return QDir::fromNativeSeparators(Profile);
+  }
+#endif
+  return QDir::homePath();
+}
+
 QString SiteImport::OpensshFolder()
 {
   // GetOpensshFolder: profile folder + ".ssh"
-  return QDir::homePath() + QStringLiteral("/.ssh");
+  return HomeFolder() + QStringLiteral("/.ssh");
 }
 
 QString SiteImport::OpensshConfigFile()
@@ -110,7 +123,7 @@ QString SiteImport::PuttyFolder()
 {
   // Unix PuTTY: ~/.putty, unless $PUTTYDIR (unix/storage.c make_filename)
   QString PuttyDir = qEnvironmentVariable("PUTTYDIR");
-  return PuttyDir.isEmpty() ? (QDir::homePath() + QStringLiteral("/.putty")) : PuttyDir;
+  return PuttyDir.isEmpty() ? (HomeFolder() + QStringLiteral("/.putty")) : PuttyDir;
 }
 
 QString SiteImport::PuttySessionsFolder()
@@ -127,12 +140,19 @@ QString SiteImport::FilezillaFolder()
 {
   // FileZilla 3 on Linux: $XDG_CONFIG_HOME/filezilla, legacy ~/.filezilla
   QString ConfigHome = qEnvironmentVariable("XDG_CONFIG_HOME");
+#ifdef Q_OS_WIN
+  // Windows: %APPDATA%\FileZilla
+  if (ConfigHome.isEmpty() && !qEnvironmentVariable("APPDATA").isEmpty())
+  {
+    return QDir::fromNativeSeparators(qEnvironmentVariable("APPDATA")) + QStringLiteral("/FileZilla");
+  }
+#endif
   if (ConfigHome.isEmpty())
   {
-    ConfigHome = QDir::homePath() + QStringLiteral("/.config");
+    ConfigHome = HomeFolder() + QStringLiteral("/.config");
   }
   QString Result = ConfigHome + QStringLiteral("/filezilla");
-  QString Legacy = QDir::homePath() + QStringLiteral("/.filezilla");
+  QString Legacy = HomeFolder() + QStringLiteral("/.filezilla");
   if (!QFileInfo::exists(Result + QStringLiteral("/sitemanager.xml")) && QFileInfo::exists(Legacy + QStringLiteral("/sitemanager.xml")))
   {
     Result = Legacy;
@@ -266,10 +286,10 @@ QString SiteImport::ConvertPathFromOpenssh(const QString & Path)
   QString Result = Path;
   if ((Result == QStringLiteral("~")) || Result.startsWith(QStringLiteral("~/")))
   {
-    Result = QDir::homePath() + Result.mid(1);
+    Result = HomeFolder() + Result.mid(1);
   }
   // ssh_config TOKENS: %d = local home directory, %% = literal %
-  Result.replace(QStringLiteral("%d"), QDir::homePath());
+  Result.replace(QStringLiteral("%d"), HomeFolder());
   Result.replace(QStringLiteral("%%"), QStringLiteral("%"));
   return Result;
 }
@@ -1596,6 +1616,11 @@ bool SiteImport::IsWindowsPath(const QString & Path)
 
 bool SiteImport::HasWindowsPaths(const SessionData & Data)
 {
+#ifdef Q_OS_WIN
+  // Native paths there: nothing to remap
+  Q_UNUSED(Data);
+  return false;
+#endif
   return
     IsWindowsPath(Data.PublicKeyFile) || IsWindowsPath(Data.DetachedCertificate) ||
     IsWindowsPath(Data.TunnelPublicKeyFile) || IsWindowsPath(Data.TlsCertificateFile) ||
@@ -1616,7 +1641,7 @@ QString SiteImport::RemapWindowsPath(const QString & Path, bool IsDirectory)
   QRegularExpressionMatch Match = ProfileRe.match(Result);
   if (Match.hasMatch())
   {
-    Result = QDir::homePath() + QLatin1Char('/') + Result.mid(Match.capturedLength());
+    Result = HomeFolder() + QLatin1Char('/') + Result.mid(Match.capturedLength());
   }
   if (Result.endsWith(QLatin1Char('/')) && (Result.size() > 1))
   {
@@ -1631,7 +1656,7 @@ QString SiteImport::RemapWindowsPath(const QString & Path, bool IsDirectory)
   {
     // the key may have been copied to ~/.ssh (possibly converted from .ppk)
     QString Name = QFileInfo(Result).fileName();
-    QStringList Candidates = {OpensshFolder() + QLatin1Char('/') + Name, QDir::homePath() + QLatin1Char('/') + Name};
+    QStringList Candidates = {OpensshFolder() + QLatin1Char('/') + Name, HomeFolder() + QLatin1Char('/') + Name};
     if (Name.endsWith(QStringLiteral(".ppk"), Qt::CaseInsensitive))
     {
       Candidates.append(OpensshFolder() + QLatin1Char('/') + Name.left(Name.size() - 4));

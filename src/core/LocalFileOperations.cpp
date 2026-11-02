@@ -10,40 +10,20 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QLocale>
-#include <QProcess>
 #include <QRandomGenerator>
-#include <QStandardPaths>
 
-#include <algorithm>
-#include <cerrno>
-#include <cstring>
-#include <dirent.h>
-#include <fcntl.h>
-#include <grp.h>
-#include <linux/fs.h>
-#include <pwd.h>
-#include <sys/ioctl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-#include <vector>
+#include "core/LocalFileSystem.h"
+
+#include <exception>
 
 namespace
 {
 
+using LocalFs::Stat;
+
 QString ErrnoText(int Error)
 {
-  return QString::fromLocal8Bit(std::strerror(Error));
-}
-
-QByteArray Native(const QString & Path)
-{
-  return QFile::encodeName(Path);
-}
-
-QString FromNative(const char * Path)
-{
-  return QFile::decodeName(QByteArray(Path));
+  return LocalFs::ErrorText(Error);
 }
 
 QString CleanPath(const QString & Path)
@@ -62,62 +42,18 @@ QString MainInstructions(const QString & S)
   return QStringLiteral("**%1**").arg(S);
 }
 
-// The process umask without changing it (umask(2) cannot be read atomically)
-mode_t CurrentUmask()
-{
-  static mode_t Result = []()
-  {
-    QFile Status(QStringLiteral("/proc/self/status"));
-    if (Status.open(QIODevice::ReadOnly))
-    {
-      for (const QByteArray & Line : Status.readAll().split('\n'))
-      {
-        if (Line.startsWith("Umask:"))
-        {
-          bool Ok = false;
-          unsigned int Value = Line.mid(6).trimmed().toUInt(&Ok, 8);
-          if (Ok)
-          {
-            return static_cast<mode_t>(Value);
-          }
-        }
-      }
-    }
-    return static_cast<mode_t>(022);
-  }();
-  return Result;
-}
-
 QStringList ListDirectory(const QString & Path)
 {
-  QStringList Result;
-  DIR * Dir = opendir(Native(Path).constData());
-  if (Dir == nullptr)
-  {
-    int Error = errno;
-    throw ExtException(QStringLiteral("Error listing directory '%1'.").arg(Path), ErrnoText(Error));
-  }
-  while (dirent * Entry = readdir(Dir))
-  {
-    if ((std::strcmp(Entry->d_name, ".") == 0) || (std::strcmp(Entry->d_name, "..") == 0))
-    {
-      continue;
-    }
-    Result.append(FromNative(Entry->d_name));
-  }
-  closedir(Dir);
-  return Result;
+  return LocalFs::ListDirectory(Path);
 }
 
-bool LStat(const QString & Path, struct stat & St)
-{
-  return (lstat(Native(Path).constData(), &St) == 0);
-}
+// LStat(Path, Stat): LocalFs::LStat (found through the Stat argument)
+using LocalFs::LStat;
 
-QString FormatStat(const struct stat & St)
+QString FormatStat(const Stat & St)
 {
-  QDateTime Modified = QDateTime::fromSecsSinceEpoch(St.st_mtim.tv_sec);
-  return QStringLiteral("%1 bytes, %2").arg(QLocale().toString(static_cast<qint64>(St.st_size)),
+  QDateTime Modified = QDateTime::fromSecsSinceEpoch(St.ModifiedSec);
+  return QStringLiteral("%1 bytes, %2").arg(QLocale().toString(St.Size),
     QLocale().toString(Modified, QLocale::ShortFormat));
 }
 
@@ -130,25 +66,12 @@ public:
   {
     if (!FPath.isEmpty())
     {
-      unlink(Native(FPath).constData());
+      LocalFs::RemoveFile(FPath);
     }
   }
   void Release() { FPath.clear(); }
 private:
   QString FPath;
-};
-
-class FdGuard
-{
-public:
-  explicit FdGuard(int Fd = -1) : FFd(Fd) {}
-  FdGuard(const FdGuard &) = delete;
-  FdGuard & operator=(const FdGuard &) = delete;
-  ~FdGuard() { if (FFd >= 0) ::close(FFd); }
-  int Get() const { return FFd; }
-  int Release() { int Fd = FFd; FFd = -1; return Fd; }
-private:
-  int FFd;
 };
 
 class Engine
@@ -170,7 +93,7 @@ private:
   LocalOperationResult FResult;
   OverwriteBatch FBatch = obNone;
   bool FSkipAll = false;
-  dev_t FTargetDevice = 0;
+  quint64 FTargetDevice = 0;
 
   bool IsMove() const { return (FParams.Op == LocalFileOperations::opMove); }
 
@@ -184,12 +107,12 @@ private:
 
   void Scan(const QString & Path, qint64 & Size, int & Count)
   {
-    struct stat St;
+    Stat St;
     if (!LStat(Path, St))
     {
       return;
     }
-    if (S_ISDIR(St.st_mode))
+    if (St.IsDirectory())
     {
       QStringList Names;
       try
@@ -209,9 +132,9 @@ private:
     else
     {
       Count++;
-      if (S_ISREG(St.st_mode))
+      if (St.IsRegular())
       {
-        Size += St.st_size;
+        Size += St.Size;
       }
     }
   }
@@ -296,7 +219,7 @@ private:
   }
 
   // true = overwrite, false = skip; Cancel throws AbortException
-  bool ConfirmOverwrite(const QString & Target, const struct stat & SourceSt, const struct stat & TargetSt)
+  bool ConfirmOverwrite(const QString & Target, const Stat & SourceSt, const Stat & TargetSt)
   {
     if (!FParams.ConfirmOverwrite)
     {
@@ -314,7 +237,7 @@ private:
     {
       return false;
     }
-    bool Directory = S_ISDIR(TargetSt.st_mode);
+    bool Directory = TargetSt.IsDirectory();
     QString Name = QFileInfo(Target).fileName();
     QString Query = MainInstructions(Directory ?
       QStringLiteral("Directory '%1' already exists. Overwrite?").arg(Name) :
@@ -359,244 +282,120 @@ private:
       .arg(QRandomGenerator::global()->generate(), 8, 16, QLatin1Char('0')));
   }
 
-  void SetOwner(int Fd, const QString & Path, const struct stat & St, bool Link)
+  unsigned int TargetMode(const Stat & St, bool Directory) const
   {
-    if (!FParams.PreserveOwner)
+    return FParams.PreserveRights ? St.Mode : LocalFs::DefaultMode(Directory);
+  }
+
+  // Owner, permissions and times of a copy (before it is renamed to its target)
+  void ApplyMetadata(const QString & Path, const QString & Target, const Stat & St, bool Link, bool MustSucceed)
+  {
+    // chown before chmod: chown clears set-user-ID bits
+    if (FParams.PreserveOwner)
     {
-      return;
+      LocalFs::CopyOwner(Path, St, Link);
     }
-    if ((St.st_uid == geteuid()) && (St.st_gid == getegid()))
+    if (!Link && !LocalFs::SetMode(Path, TargetMode(St, false)) && MustSucceed)
     {
-      return;
+      int Error = LocalFs::LastError();
+      throw ExtException(QStringLiteral("Cannot set permissions of file '%1'.").arg(Target), ErrnoText(Error));
     }
-    // Only root may give files away; a group change works for own groups
-    int Result = (Fd >= 0) ? fchown(Fd, St.st_uid, St.st_gid) :
-      fchownat(AT_FDCWD, Native(Path).constData(), St.st_uid, St.st_gid, Link ? AT_SYMLINK_NOFOLLOW : 0);
-    if (Result != 0)
+    if (FParams.PreserveTime && !LocalFs::SetTimes(Path, St, Link) && MustSucceed)
     {
-      if (Fd >= 0)
-      {
-        if (fchown(Fd, static_cast<uid_t>(-1), St.st_gid) != 0) {}
-      }
-      else
-      {
-        if (fchownat(AT_FDCWD, Native(Path).constData(), static_cast<uid_t>(-1), St.st_gid, Link ? AT_SYMLINK_NOFOLLOW : 0) != 0) {}
-      }
+      int Error = LocalFs::LastError();
+      throw ExtException(QStringLiteral("Cannot set timestamp of file '%1'.").arg(Target), ErrnoText(Error));
     }
   }
 
-  mode_t TargetMode(const struct stat & St, bool Directory) const
+  void CopyRegular(const QString & Source, const Stat & St, const QString & Target)
   {
-    if (FParams.PreserveRights)
+    // Cancel, pause and "skip file" of the progress, from within the copy
+    std::exception_ptr Stopped;
+    auto Progress = [&](qint64 Delta) -> bool
     {
-      return St.st_mode & 07777;
-    }
-    return (Directory ? 0777 : 0666) & ~CurrentUmask();
-  }
-
-  void CopyRegular(const QString & Source, const struct stat & St, const QString & Target)
-  {
-    FdGuard In(open(Native(Source).constData(), O_RDONLY | O_CLOEXEC | O_NOCTTY));
-    if (In.Get() < 0)
-    {
-      int Error = errno;
-      throw ExtException(QStringLiteral("Cannot open file '%1'.").arg(Source), ErrnoText(Error));
-    }
+      try
+      {
+        if ((Delta > 0) && (FProgress != nullptr))
+        {
+          FProgress->AddTransferred(Delta);
+        }
+        CheckCancel();
+        return true;
+      }
+      catch (...)
+      {
+        Stopped = std::current_exception();
+        return false;
+      }
+    };
     QString Temp;
-    int OutFd = -1;
+    bool Ok = false;
+    bool Cancelled = false;
+    LocalFs::TCopyStep Step = LocalFs::csOpenSource;
+    int Error = 0;
     for (int Attempt = 0; Attempt < 10; Attempt++)
     {
       Temp = TemporaryName(Target);
-      OutFd = open(Native(Temp).constData(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOCTTY, 0600);
-      if ((OutFd >= 0) || (errno != EEXIST))
+      Ok = LocalFs::CopyFileData(Source, Temp, St.Size, FParams.UseReflink, Progress, Cancelled, Step);
+      Error = Ok ? 0 : LocalFs::LastError();
+      if (Ok || (Step != LocalFs::csCreateTarget) || !LocalFs::IsExistsError(Error))
       {
         break;
       }
     }
-    FdGuard Out(OutFd);
-    if (Out.Get() < 0)
+    // A file created by the attempt is removed unless renamed to its target
+    TemporaryGuard TempGuard((Step == LocalFs::csCopy) ? Temp : QString());
+    if (!Ok)
     {
-      int Error = errno;
-      throw ExtException(QStringLiteral("Cannot create file '%1'.").arg(Target), ErrnoText(Error));
-    }
-    TemporaryGuard TempGuard(Temp);
-
-    bool Done = false;
-    if (FParams.UseReflink && (St.st_size > 0))
-    {
-      // Copy-on-write clone (btrfs, xfs, bcachefs; same file system only)
-      if (ioctl(Out.Get(), FICLONE, In.Get()) == 0)
+      if (Cancelled && Stopped)
       {
-        Done = true;
-        if (FProgress != nullptr)
-        {
-          FProgress->AddTransferred(St.st_size);
-        }
+        std::rethrow_exception(Stopped);
       }
-    }
-    if (!Done)
-    {
-      bool UseCopyFileRange = true;
-      qint64 Copied = 0;
-      std::vector<char> Buffer;
-      for (;;)
+      switch (Step)
       {
-        CheckCancel();
-        ssize_t Count;
-        if (UseCopyFileRange)
-        {
-          Count = copy_file_range(In.Get(), nullptr, Out.Get(), nullptr, 8 * 1024 * 1024, 0);
-          if ((Count < 0) && (Copied == 0) &&
-              ((errno == EXDEV) || (errno == EINVAL) || (errno == ENOSYS) || (errno == EOPNOTSUPP) ||
-               (errno == EBADF) || (errno == EPERM) || (errno == ETXTBSY)))
-          {
-            UseCopyFileRange = false;
-            continue;
-          }
-        }
-        else
-        {
-          if (Buffer.empty())
-          {
-            Buffer.resize(1024 * 1024);
-          }
-          Count = read(In.Get(), Buffer.data(), Buffer.size());
-          if (Count > 0)
-          {
-            ssize_t Written = 0;
-            while (Written < Count)
-            {
-              ssize_t W = write(Out.Get(), Buffer.data() + Written, static_cast<size_t>(Count - Written));
-              if (W < 0)
-              {
-                if (errno == EINTR)
-                {
-                  continue;
-                }
-                int Error = errno;
-                throw ExtException(QStringLiteral("Error copying file '%1' to '%2'.").arg(Source, Target), ErrnoText(Error));
-              }
-              Written += W;
-            }
-          }
-        }
-        if (Count < 0)
-        {
-          if (errno == EINTR)
-          {
-            continue;
-          }
-          int Error = errno;
+        case LocalFs::csOpenSource:
+          throw ExtException(QStringLiteral("Cannot open file '%1'.").arg(Source), ErrnoText(Error));
+        case LocalFs::csCreateTarget:
+          throw ExtException(QStringLiteral("Cannot create file '%1'.").arg(Target), ErrnoText(Error));
+        default:
           throw ExtException(QStringLiteral("Error copying file '%1' to '%2'.").arg(Source, Target), ErrnoText(Error));
-        }
-        if (Count == 0)
-        {
-          break;
-        }
-        Copied += Count;
-        if (FProgress != nullptr)
-        {
-          FProgress->AddTransferred(Count);
-        }
       }
     }
-
-    // chown before chmod: chown clears set-user-ID bits
-    SetOwner(Out.Get(), QString(), St, false);
-    if (fchmod(Out.Get(), TargetMode(St, false)) != 0)
-    {
-      int Error = errno;
-      throw ExtException(QStringLiteral("Cannot set permissions of file '%1'.").arg(Target), ErrnoText(Error));
-    }
-    if (FParams.PreserveTime)
-    {
-      struct timespec Times[2] = {St.st_atim, St.st_mtim};
-      if (futimens(Out.Get(), Times) != 0)
-      {
-        int Error = errno;
-        throw ExtException(QStringLiteral("Cannot set timestamp of file '%1'.").arg(Target), ErrnoText(Error));
-      }
-    }
-    if (::close(Out.Release()) != 0)
-    {
-      int Error = errno;
-      throw ExtException(QStringLiteral("Error copying file '%1' to '%2'.").arg(Source, Target), ErrnoText(Error));
-    }
+    ApplyMetadata(Temp, Target, St, false, true);
     // Atomically replaces an existing target, only now that the copy is complete
-    if (rename(Native(Temp).constData(), Native(Target).constData()) != 0)
+    if (!LocalFs::Rename(Temp, Target))
     {
-      int Error = errno;
-      throw ExtException(QStringLiteral("Error copying file '%1' to '%2'.").arg(Source, Target), ErrnoText(Error));
+      int RenameError = LocalFs::LastError();
+      throw ExtException(QStringLiteral("Error copying file '%1' to '%2'.").arg(Source, Target), ErrnoText(RenameError));
     }
     TempGuard.Release();
   }
 
-  void CopySpecial(const QString & Source, const struct stat & St, const QString & Target)
+  void CopySpecial(const QString & Source, const Stat & St, const QString & Target)
   {
     QString Temp;
-    bool Link = S_ISLNK(St.st_mode);
-    QByteArray LinkTarget;
-    if (Link)
-    {
-      std::vector<char> Buffer(static_cast<size_t>(std::max<off_t>(St.st_size, 255)) + 1);
-      for (;;)
-      {
-        ssize_t Length = readlink(Native(Source).constData(), Buffer.data(), Buffer.size());
-        if (Length < 0)
-        {
-          int Error = errno;
-          throw ExtException(QStringLiteral("Cannot read symbolic link '%1'.").arg(Source), ErrnoText(Error));
-        }
-        if (static_cast<size_t>(Length) < Buffer.size())
-        {
-          LinkTarget = QByteArray(Buffer.data(), static_cast<int>(Length));
-          break;
-        }
-        Buffer.resize(Buffer.size() * 2);
-      }
-    }
-    int Result = -1;
+    bool Ok = false;
+    int Error = 0;
     for (int Attempt = 0; Attempt < 10; Attempt++)
     {
       Temp = TemporaryName(Target);
-      if (Link)
-      {
-        Result = symlink(LinkTarget.constData(), Native(Temp).constData());
-      }
-      else if (S_ISFIFO(St.st_mode))
-      {
-        Result = mkfifo(Native(Temp).constData(), 0600);
-      }
-      else
-      {
-        // character/block devices and sockets: only root can create devices
-        Result = mknod(Native(Temp).constData(), (St.st_mode & S_IFMT) | 0600, St.st_rdev);
-      }
-      if ((Result == 0) || (errno != EEXIST))
+      Ok = LocalFs::CopySpecial(Source, St, Temp);
+      Error = Ok ? 0 : LocalFs::LastError();
+      if (Ok || !LocalFs::IsExistsError(Error))
       {
         break;
       }
     }
-    if (Result != 0)
+    if (!Ok)
     {
-      int Error = errno;
       throw ExtException(QStringLiteral("Error copying file '%1' to '%2'.").arg(Source, Target), ErrnoText(Error));
     }
     TemporaryGuard TempGuard(Temp);
-    SetOwner(-1, Temp, St, Link);
-    if (!Link)
+    ApplyMetadata(Temp, Target, St, St.IsSymlink(), false);
+    if (!LocalFs::Rename(Temp, Target))
     {
-      (void)chmod(Native(Temp).constData(), TargetMode(St, false));
-    }
-    if (FParams.PreserveTime)
-    {
-      struct timespec Times[2] = {St.st_atim, St.st_mtim};
-      (void)utimensat(AT_FDCWD, Native(Temp).constData(), Times, AT_SYMLINK_NOFOLLOW);
-    }
-    if (rename(Native(Temp).constData(), Native(Target).constData()) != 0)
-    {
-      int Error = errno;
-      throw ExtException(QStringLiteral("Error copying file '%1' to '%2'.").arg(Source, Target), ErrnoText(Error));
+      int RenameError = LocalFs::LastError();
+      throw ExtException(QStringLiteral("Error copying file '%1' to '%2'.").arg(Source, Target), ErrnoText(RenameError));
     }
     TempGuard.Release();
     if (FProgress != nullptr)
@@ -605,17 +404,19 @@ private:
     }
   }
 
-  void FinishDirectory(const QString & Target, const struct stat & St)
+  void FinishDirectory(const QString & Target, const Stat & St)
   {
-    struct stat Current;
+    Stat Current;
     if (LStat(Target, Current))
     {
-      SetOwner(-1, Target, St, false);
-      (void)chmod(Native(Target).constData(), TargetMode(St, true));
+      if (FParams.PreserveOwner)
+      {
+        LocalFs::CopyOwner(Target, St, false);
+      }
+      (void)LocalFs::SetMode(Target, TargetMode(St, true));
       if (FParams.PreserveTime)
       {
-        struct timespec Times[2] = {St.st_atim, St.st_mtim};
-        (void)utimensat(AT_FDCWD, Native(Target).constData(), Times, 0);
+        (void)LocalFs::SetTimes(Target, St, false);
       }
     }
   }
@@ -625,25 +426,25 @@ private:
   bool CopyItem(const QString & Source, const QString & Target, bool Confirmed, bool DeleteSource)
   {
     CheckCancel();
-    struct stat St;
+    Stat St;
     if (!LStat(Source, St))
     {
-      int Error = errno;
+      int Error = LocalFs::LastError();
       throw ExtException(QStringLiteral("File or folder '%1' does not exist.").arg(Source), ErrnoText(Error));
     }
-    struct stat TargetSt;
+    Stat TargetSt;
     bool Exists = LStat(Target, TargetSt);
-    if (Exists && (TargetSt.st_dev == St.st_dev) && (TargetSt.st_ino == St.st_ino))
+    if (Exists && TargetSt.SameFile(St))
     {
       // the same file (hard link or the item itself)
       return true;
     }
-    if (S_ISDIR(St.st_mode))
+    if (St.IsDirectory())
     {
       bool Created = false;
       if (Exists)
       {
-        if (!S_ISDIR(TargetSt.st_mode))
+        if (!TargetSt.IsDirectory())
         {
           throw ExtException(QStringLiteral("Cannot overwrite file '%1' with directory '%2'.").arg(Target, Source));
         }
@@ -655,9 +456,9 @@ private:
       }
       else
       {
-        if (mkdir(Native(Target).constData(), 0700) != 0)
+        if (!LocalFs::MakeDirectory(Target))
         {
-          int Error = errno;
+          int Error = LocalFs::LastError();
           throw ExtException(QStringLiteral("Cannot create folder '%1'.").arg(Target), ErrnoText(Error));
         }
         Created = true;
@@ -679,9 +480,9 @@ private:
       }
       if (DeleteSource && Complete)
       {
-        if (rmdir(Native(Source).constData()) != 0)
+        if (!LocalFs::RemoveDirectory(Source))
         {
-          int Error = errno;
+          int Error = LocalFs::LastError();
           throw ExtException(QStringLiteral("Cannot delete folder '%1'.").arg(Source), ErrnoText(Error));
         }
       }
@@ -690,7 +491,7 @@ private:
 
     if (Exists)
     {
-      if (S_ISDIR(TargetSt.st_mode))
+      if (TargetSt.IsDirectory())
       {
         throw ExtException(QStringLiteral("Cannot overwrite directory '%1' with file '%2'.").arg(Target, Source));
       }
@@ -702,9 +503,9 @@ private:
     }
     if (FProgress != nullptr)
     {
-      FProgress->SetFile(Source, S_ISREG(St.st_mode) ? St.st_size : 0);
+      FProgress->SetFile(Source, St.IsRegular() ? St.Size : 0);
     }
-    if (S_ISREG(St.st_mode))
+    if (St.IsRegular())
     {
       CopyRegular(Source, St, Target);
     }
@@ -714,9 +515,9 @@ private:
     }
     if (DeleteSource)
     {
-      if (unlink(Native(Source).constData()) != 0)
+      if (!LocalFs::RemoveFile(Source))
       {
-        int Error = errno;
+        int Error = LocalFs::LastError();
         throw ExtException(QStringLiteral("Cannot delete file '%1'.").arg(Source), ErrnoText(Error));
       }
     }
@@ -730,22 +531,22 @@ private:
   bool MoveItem(const QString & Source, const QString & Target, bool Confirmed)
   {
     CheckCancel();
-    struct stat St;
+    Stat St;
     if (!LStat(Source, St))
     {
-      int Error = errno;
+      int Error = LocalFs::LastError();
       throw ExtException(QStringLiteral("File or folder '%1' does not exist.").arg(Source), ErrnoText(Error));
     }
-    struct stat TargetSt;
+    Stat TargetSt;
     bool Exists = LStat(Target, TargetSt);
-    if (Exists && (TargetSt.st_dev == St.st_dev) && (TargetSt.st_ino == St.st_ino))
+    if (Exists && TargetSt.SameFile(St))
     {
       return true;
     }
-    bool Directory = S_ISDIR(St.st_mode);
+    bool Directory = St.IsDirectory();
     if (Exists)
     {
-      if (Directory != S_ISDIR(TargetSt.st_mode))
+      if (Directory != TargetSt.IsDirectory())
       {
         throw ExtException(Directory ?
           QStringLiteral("Cannot overwrite file '%1' with directory '%2'.").arg(Target, Source) :
@@ -771,9 +572,9 @@ private:
             Complete = false;
           }
         }
-        if (Complete && (rmdir(Native(Source).constData()) != 0))
+        if (Complete && !LocalFs::RemoveDirectory(Source))
         {
-          int Error = errno;
+          int Error = LocalFs::LastError();
           throw ExtException(QStringLiteral("Cannot delete folder '%1'.").arg(Source), ErrnoText(Error));
         }
         return Complete;
@@ -783,7 +584,7 @@ private:
     {
       FProgress->SetFile(Source, 0);
     }
-    if (rename(Native(Source).constData(), Native(Target).constData()) == 0)
+    if (LocalFs::Rename(Source, Target))
     {
       if (FProgress != nullptr)
       {
@@ -791,8 +592,8 @@ private:
       }
       return true;
     }
-    int Error = errno;
-    if (Error != EXDEV)
+    int Error = LocalFs::LastError();
+    if (!LocalFs::IsCrossDeviceError(Error))
     {
       throw ExtException(QStringLiteral("Error moving file '%1' to '%2'.").arg(Source, Target), ErrnoText(Error));
     }
@@ -804,17 +605,17 @@ private:
 LocalOperationResult Engine::Run()
 {
   QString TargetDirectory = CleanPath(FParams.TargetDirectory);
-  struct stat TargetDirSt;
-  if (!LStat(TargetDirectory, TargetDirSt) || !S_ISDIR(TargetDirSt.st_mode))
+  Stat TargetDirSt;
+  if (!LStat(TargetDirectory, TargetDirSt) || !TargetDirSt.IsDirectory())
   {
-    if (stat(Native(TargetDirectory).constData(), &TargetDirSt) != 0 || !S_ISDIR(TargetDirSt.st_mode))
+    if (!LocalFs::StatFollow(TargetDirectory, TargetDirSt) || !TargetDirSt.IsDirectory())
     {
       FResult.Ok = false;
       FResult.Message = QStringLiteral("Target directory '%1' does not exist.").arg(TargetDirectory);
       return FResult;
     }
   }
-  FTargetDevice = TargetDirSt.st_dev;
+  FTargetDevice = TargetDirSt.Device;
 
   // Totals for the progress (moves within the file system are renames, not scanned)
   qint64 TotalSize = 0;
@@ -823,8 +624,8 @@ LocalOperationResult Engine::Run()
   {
     for (const QString & Source : FParams.Sources)
     {
-      struct stat St;
-      if (IsMove() && LStat(Source, St) && (St.st_dev == FTargetDevice))
+      Stat St;
+      if (IsMove() && LStat(Source, St) && (St.Device == FTargetDevice))
       {
         Count++;
       }
@@ -862,8 +663,8 @@ LocalOperationResult Engine::Run()
         }
         Target = Combine(TargetDirectory, LocalFileOperations::DuplicateName(TargetDirectory, Name));
       }
-      struct stat St;
-      bool IsDir = LStat(Source, St) && S_ISDIR(St.st_mode);
+      Stat St;
+      bool IsDir = LStat(Source, St) && St.IsDirectory();
       bool Complete = ItemLoop([&]()
       {
         if (IsDir && LocalFileOperations::IsSubPath(Source, Target))
@@ -897,42 +698,6 @@ LocalOperationResult Engine::Run()
   return FResult;
 }
 
-bool ResolveUser(const QString & Name, uid_t & Uid)
-{
-  bool Numeric = false;
-  unsigned int Value = Name.toUInt(&Numeric);
-  if (Numeric)
-  {
-    Uid = static_cast<uid_t>(Value);
-    return true;
-  }
-  struct passwd * Entry = getpwnam(Name.toLocal8Bit().constData());
-  if (Entry == nullptr)
-  {
-    return false;
-  }
-  Uid = Entry->pw_uid;
-  return true;
-}
-
-bool ResolveGroup(const QString & Name, gid_t & Gid)
-{
-  bool Numeric = false;
-  unsigned int Value = Name.toUInt(&Numeric);
-  if (Numeric)
-  {
-    Gid = static_cast<gid_t>(Value);
-    return true;
-  }
-  struct group * Entry = getgrnam(Name.toLocal8Bit().constData());
-  if (Entry == nullptr)
-  {
-    return false;
-  }
-  Gid = Entry->gr_gid;
-  return true;
-}
-
 } // namespace
 
 LocalOperationResult LocalFileOperations::Execute(const Params & AParams, FileOperationProgress * Progress, UserInterface * UI)
@@ -952,35 +717,16 @@ bool LocalFileOperations::MoveToTrash(const QString & Path, QString * Error)
     }
     return false;
   }
-  // freedesktop Trash specification: the home trash for files on the home
-  // volume, $topdir/.Trash/$uid or $topdir/.Trash-$uid on other volumes
-  // (USB drives, /tmp...)
+  // Linux: the freedesktop Trash (the home trash for files on the home volume,
+  // $topdir/.Trash/$uid or $topdir/.Trash-$uid on other volumes); Windows: the Recycle Bin
   if (QFile::moveToTrash(Path))
   {
     return true;
   }
-  // GVfs knows more (network and FUSE mounts under /run/user/<uid>/gvfs)
-  QString Gio = QStandardPaths::findExecutable(QStringLiteral("gio"));
   QString Output;
-  if (!Gio.isEmpty())
+  if (LocalFs::MoveToTrashFallback(Path, Output))
   {
-    QProcess Process;
-    Process.setProcessChannelMode(QProcess::MergedChannels);
-    Process.start(Gio, {QStringLiteral("trash"), QStringLiteral("--"), Info.absoluteFilePath()});
-    if (Process.waitForFinished(60000) && (Process.exitStatus() == QProcess::NormalExit) && (Process.exitCode() == 0))
-    {
-      QFileInfo After(Path);
-      if (!After.exists() && !After.isSymLink())
-      {
-        return true;
-      }
-    }
-    else if (Process.state() != QProcess::NotRunning)
-    {
-      Process.kill();
-      Process.waitForFinished(1000);
-    }
-    Output = QString::fromLocal8Bit(Process.readAll()).trimmed();
+    return true;
   }
   if (Error != nullptr)
   {
@@ -1014,7 +760,7 @@ QString LocalFileOperations::DuplicateName(const QString & Directory, const QStr
     QString Name = (Index == 1) ?
       QStringLiteral("%1 (copy)%2").arg(Base, Extension) :
       QStringLiteral("%1 (copy %2)%3").arg(Base).arg(Index).arg(Extension);
-    struct stat St;
+    Stat St;
     if (!LStat(Combine(Directory, Name), St))
     {
       return Name;
@@ -1026,26 +772,30 @@ bool LocalFileOperations::IsSubPath(const QString & Directory, const QString & P
 {
   QString D = CleanPath(Directory);
   QString P = CleanPath(Path);
-  if (P == D)
+  // Windows paths are case insensitive
+  Qt::CaseSensitivity Case = LocalFs::HasUnixPermissions() ? Qt::CaseSensitive : Qt::CaseInsensitive;
+  if (P.compare(D, Case) == 0)
   {
     return true;
   }
-  return P.startsWith((D == QStringLiteral("/")) ? D : (D + QLatin1Char('/')));
+  return P.startsWith(D.endsWith(QLatin1Char('/')) ? D : (D + QLatin1Char('/')), Case);
 }
 
 LocalOperationResult LocalFileOperations::ChangeProperties(const PropertiesParams & AParams, FileOperationProgress * Progress,
   UserInterface * UI)
 {
   LocalOperationResult Result;
-  uid_t Uid = static_cast<uid_t>(-1);
-  gid_t Gid = static_cast<gid_t>(-1);
-  if (!AParams.Owner.isEmpty() && !ResolveUser(AParams.Owner, Uid))
+  unsigned int Uid = 0;
+  unsigned int Gid = 0;
+  bool ChangeUid = !AParams.Owner.isEmpty();
+  bool ChangeGid = !AParams.Group.isEmpty();
+  if (ChangeUid && !LocalFs::ResolveUser(AParams.Owner, Uid))
   {
     Result.Ok = false;
     Result.Message = QStringLiteral("User '%1' does not exist.").arg(AParams.Owner);
     return Result;
   }
-  if (!AParams.Group.isEmpty() && !ResolveGroup(AParams.Group, Gid))
+  if (ChangeGid && !LocalFs::ResolveGroup(AParams.Group, Gid))
   {
     Result.Ok = false;
     Result.Message = QStringLiteral("Group '%1' does not exist.").arg(AParams.Group);
@@ -1068,39 +818,36 @@ LocalOperationResult LocalFileOperations::ChangeProperties(const PropertiesParam
           Progress->CheckCancel();
           Progress->SetFile(Path, 0);
         }
-        struct stat St;
+        Stat St;
         if (!LStat(Path, St))
         {
-          int Error = errno;
+          int Error = LocalFs::LastError();
           throw ExtException(QStringLiteral("File or folder '%1' does not exist.").arg(Path), ErrnoText(Error));
         }
-        bool Link = S_ISLNK(St.st_mode);
-        if ((Uid != static_cast<uid_t>(-1)) || (Gid != static_cast<gid_t>(-1)))
+        bool Link = St.IsSymlink();
+        if ((ChangeUid && (Uid != St.Uid)) || (ChangeGid && (Gid != St.Gid)))
         {
-          if ((Uid != St.st_uid && Uid != static_cast<uid_t>(-1)) || (Gid != St.st_gid && Gid != static_cast<gid_t>(-1)))
+          if (!LocalFs::ChangeOwner(Path, Uid, Gid, ChangeUid, ChangeGid))
           {
-            if (fchownat(AT_FDCWD, Native(Path).constData(), Uid, Gid, AT_SYMLINK_NOFOLLOW) != 0)
-            {
-              int Error = errno;
-              throw ExtException(QStringLiteral("Cannot change owner of file '%1'.").arg(Path), ErrnoText(Error));
-            }
+            int Error = LocalFs::LastError();
+            throw ExtException(QStringLiteral("Cannot change owner of file '%1'.").arg(Path), ErrnoText(Error));
           }
         }
         // permissions of symbolic links cannot be changed on Linux (and do not matter)
         if (AParams.ChangeMode && !Link)
         {
-          mode_t Mode = AParams.ModeMasks ?
-            static_cast<mode_t>(((St.st_mode & 07777) & ~AParams.ClearMask) | AParams.SetMask) :
-            static_cast<mode_t>(AParams.Mode & 07777);
-          if (AParams.AddXToDirectories && S_ISDIR(St.st_mode))
+          unsigned int Mode = AParams.ModeMasks ?
+            ((St.Mode & ~AParams.ClearMask) | AParams.SetMask) :
+            (AParams.Mode & 07777);
+          if (AParams.AddXToDirectories && St.IsDirectory())
           {
-            if (Mode & S_IRUSR) Mode |= S_IXUSR;
-            if (Mode & S_IRGRP) Mode |= S_IXGRP;
-            if (Mode & S_IROTH) Mode |= S_IXOTH;
+            if (Mode & 0400) Mode |= 0100;
+            if (Mode & 0040) Mode |= 0010;
+            if (Mode & 0004) Mode |= 0001;
           }
-          if ((Mode != (St.st_mode & 07777)) && (chmod(Native(Path).constData(), Mode) != 0))
+          if ((Mode != St.Mode) && !LocalFs::SetMode(Path, Mode))
           {
-            int Error = errno;
+            int Error = LocalFs::LastError();
             throw ExtException(QStringLiteral("Cannot change permissions of file '%1'.").arg(Path), ErrnoText(Error));
           }
         }
@@ -1108,7 +855,7 @@ LocalOperationResult LocalFileOperations::ChangeProperties(const PropertiesParam
         {
           Progress->FileFinished();
         }
-        if (AParams.Recursive && S_ISDIR(St.st_mode))
+        if (AParams.Recursive && St.IsDirectory())
         {
           for (const QString & Name : ListDirectory(Path))
           {
@@ -1189,40 +936,20 @@ LocalOperationResult LocalFileOperations::ChangeProperties(const PropertiesParam
 
 QStringList LocalFileOperations::UserNames()
 {
-  QStringList Result;
-  setpwent();
-  while (struct passwd * Entry = getpwent())
-  {
-    Result.append(QString::fromLocal8Bit(Entry->pw_name));
-  }
-  endpwent();
-  Result.removeDuplicates();
-  Result.sort(Qt::CaseInsensitive);
-  return Result;
+  return LocalFs::UserNames();
 }
 
 QStringList LocalFileOperations::GroupNames()
 {
-  QStringList Result;
-  setgrent();
-  while (struct group * Entry = getgrent())
-  {
-    Result.append(QString::fromLocal8Bit(Entry->gr_name));
-  }
-  endgrent();
-  Result.removeDuplicates();
-  Result.sort(Qt::CaseInsensitive);
-  return Result;
+  return LocalFs::GroupNames();
 }
 
 QString LocalFileOperations::OwnerName(unsigned int Uid)
 {
-  struct passwd * Entry = getpwuid(static_cast<uid_t>(Uid));
-  return (Entry != nullptr) ? QString::fromLocal8Bit(Entry->pw_name) : QString::number(Uid);
+  return LocalFs::OwnerName(Uid);
 }
 
 QString LocalFileOperations::GroupName(unsigned int Gid)
 {
-  struct group * Entry = getgrgid(static_cast<gid_t>(Gid));
-  return (Entry != nullptr) ? QString::fromLocal8Bit(Entry->gr_name) : QString::number(Gid);
+  return LocalFs::GroupName(Gid);
 }

@@ -221,12 +221,15 @@ RemoteFileList ListLocalDirectory(const QString & Path)
     {
       File.LinkTo = Info.symLinkTarget();
     }
+#ifndef Q_OS_WIN
+    // Unix permission bits (Windows has none)
     QByteArray EntryPath = QFile::encodeName(Info.absoluteFilePath());
     struct stat St;
     if ((::stat(EntryPath.constData(), &St) == 0) || (::lstat(EntryPath.constData(), &St) == 0))
     {
       File.Permissions = St.st_mode & 07777;
     }
+#endif
     File.Owner = Info.owner();
     File.Group = Info.group();
     Result.append(File);

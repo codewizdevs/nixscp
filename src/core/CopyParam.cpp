@@ -416,6 +416,118 @@ QString CopyParam::ChangeFileName(const QString & FileName) const
   }
 }
 
+#ifdef Q_OS_WIN
+static constexpr QChar TokenPrefix = QLatin1Char('%');
+
+// LocalInvalidChars ("/\\:*?\"<>|", plus the control characters) + TokenPrefix
+static bool IsTokenizible(QChar Char)
+{
+  return (Char.unicode() < 0x20) || QStringView(u"/\\:*?\"<>|%").contains(Char);
+}
+
+// IsReservedName: CON, PRN, AUX, NUL, COM1-9, LPT1-9, also with an extension
+static bool IsReservedName(const QString & FileName)
+{
+  qsizetype Dot = FileName.indexOf(QLatin1Char('.'));
+  QString Base = ((Dot >= 0) ? FileName.left(Dot) : FileName).toUpper();
+  static const QStringList Reserved = {
+    QStringLiteral("CON"), QStringLiteral("PRN"), QStringLiteral("AUX"), QStringLiteral("NUL"),
+    QStringLiteral("COM1"), QStringLiteral("COM2"), QStringLiteral("COM3"), QStringLiteral("COM4"), QStringLiteral("COM5"),
+    QStringLiteral("COM6"), QStringLiteral("COM7"), QStringLiteral("COM8"), QStringLiteral("COM9"),
+    QStringLiteral("LPT1"), QStringLiteral("LPT2"), QStringLiteral("LPT3"), QStringLiteral("LPT4"), QStringLiteral("LPT5"),
+    QStringLiteral("LPT6"), QStringLiteral("LPT7"), QStringLiteral("LPT8"), QStringLiteral("LPT9")};
+  return Reserved.contains(Base);
+}
+
+static QString CharToken(QChar Char)
+{
+  return TokenPrefix + QStringLiteral("%1").arg(static_cast<uint>(Char.unicode()), 2, 16, QLatin1Char('0')).toUpper();
+}
+
+// The character of a %XX token at Index (TokenPrefix position); null if none
+static QChar TokenChar(const QString & FileName, qsizetype Index)
+{
+  if (Index + 2 >= FileName.size())
+  {
+    return QChar();
+  }
+  bool Ok = false;
+  uint Code = FileName.mid(Index + 1, 2).toUInt(&Ok, 16);
+  return Ok ? QChar(static_cast<char16_t>(Code)) : QChar();
+}
+#endif
+
+QString CopyParam::ValidLocalFileName(const QString & FileName)
+{
+#ifdef Q_OS_WIN
+  QString Result;
+  Result.reserve(FileName.size());
+  for (qsizetype Index = 0; Index < FileName.size(); Index++)
+  {
+    QChar Char = FileName.at(Index);
+    // a "%" stays, unless it would read as a token
+    QChar Token = (Char == TokenPrefix) ? TokenChar(FileName, Index) : QChar();
+    if ((Char == TokenPrefix) && (Token.isNull() || !IsTokenizible(Token)))
+    {
+      Result += Char;
+    }
+    else if (IsTokenizible(Char))
+    {
+      Result += CharToken(Char);
+    }
+    else
+    {
+      Result += Char;
+    }
+  }
+  // Windows trims a trailing space or dot
+  if (Result.endsWith(QLatin1Char(' ')) || Result.endsWith(QLatin1Char('.')))
+  {
+    Result = Result.left(Result.size() - 1) + CharToken(Result.back());
+  }
+  if (IsReservedName(Result))
+  {
+    qsizetype Dot = Result.indexOf(QLatin1Char('.'));
+    Result.insert((Dot >= 0) ? Dot : Result.size(), QStringLiteral("%00"));
+  }
+  return Result;
+#else
+  return FileName;
+#endif
+}
+
+QString CopyParam::RestoreChars(const QString & FileName)
+{
+#ifdef Q_OS_WIN
+  QString Result = FileName;
+  qsizetype Index = 0;
+  while ((Index = Result.indexOf(TokenPrefix, Index)) >= 0)
+  {
+    QChar Char = TokenChar(Result, Index);
+    bool Last = (Index == Result.size() - 3);
+    if (!Char.isNull() && (Char != QChar(u'\0')) &&
+        (IsTokenizible(Char) || (((Char == QLatin1Char(' ')) || (Char == QLatin1Char('.'))) && Last)))
+    {
+      Result.replace(Index, 3, Char);
+      Index++;
+    }
+    else if ((Result.mid(Index + 1, 2) == QStringLiteral("00")) &&
+      (Last || ((Index + 3 < Result.size()) && (Result.at(Index + 3) == QLatin1Char('.')))) &&
+      IsReservedName(Result.left(Index) + Result.mid(Index + 3)))
+    {
+      Result.remove(Index, 3);
+    }
+    else
+    {
+      Index++;
+    }
+  }
+  return Result;
+#else
+  return FileName;
+#endif
+}
+
 unsigned int CopyParam::RemoteFileRights(bool Directory) const
 {
   return (Directory && AddXToDirectories) ? AddExecute(Rights) : Rights;

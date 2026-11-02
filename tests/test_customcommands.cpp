@@ -167,7 +167,11 @@ static void TestPrompts()
   CHECK(Aborted);
 
   // local command output
+#ifdef _WIN32
+  CHECK_EQ(Remote(QStringLiteral("echo !`echo hi there`"), QString()), QStringLiteral("echo hi there"));
+#else
   CHECK_EQ(Remote(QStringLiteral("echo !`printf 'hi there\\n\\n'`"), QString()), QStringLiteral("echo hi there"));
+#endif
   CustomCommandData Data = Session();
   RemoteCustomCommand RemoteCommand(Data, QStringLiteral("/home/martin"));
   InteractiveCustomCommand Interactive(&RemoteCommand, InteractiveCustomCommand::PromptsCallback(),
@@ -194,6 +198,16 @@ static void TestErrors()
 
 static void TestLocalPatterns()
 {
+#ifdef _WIN32
+  // cmd.exe: not delimited, as WinSCP; file lists in double quotes (AddQuotes)
+  CHECK_EQ(Local(QStringLiteral("meld \"!\" \"!^!\""), QStringLiteral("C:/tmp/a b.txt"), QStringLiteral("C:/me/a b.txt")),
+    QStringLiteral("meld \"C:/tmp/a b.txt\" \"C:/me/a b.txt\""));
+  QString List = MakeLocalFileList({QStringLiteral("C:/a b/c"), QStringLiteral("C:/d")});
+  CHECK_EQ(List, QStringLiteral("\"C:/a b/c\" \"C:/d\""));
+  // server chosen names with cmd.exe syntax are quoted when the command does not
+  CHECK_EQ(Local(QStringLiteral("type !"), QStringLiteral("C:/t/a&calc")), QStringLiteral("type \"C:/t/a&calc\""));
+  CHECK_EQ(Local(QStringLiteral("type !"), QStringLiteral("C:/t/plain.txt")), QStringLiteral("type C:/t/plain.txt"));
+#else
   // shell-escaped (run by /bin/sh); !^! and !\ only for local commands
   CHECK_EQ(Local(QStringLiteral("meld \"!\" \"!^!\""), QStringLiteral("/tmp/a $b.txt"), QStringLiteral("/home/me/a b.txt")),
     QStringLiteral("meld \"/tmp/a \\$b.txt\" \"/home/me/a b.txt\""));
@@ -207,6 +221,7 @@ static void TestLocalPatterns()
     QStringLiteral("putty -ssh 'martin'@'example.com' -P '2222' -pw 'pa$$!word'"));
   CHECK_EQ(Local(QStringLiteral("cat '!'"), QStringLiteral("x'; rm -rf y; 'z")), QStringLiteral("cat 'x'\\''; rm -rf y; '\\''z'"));
   CHECK_EQ(Local(QStringLiteral("cat !"), QStringLiteral("x$(id)`id`")), QStringLiteral("cat 'x$(id)`id`'"));
+#endif
 }
 
 static void TestAnalysis()
