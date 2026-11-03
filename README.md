@@ -2,10 +2,10 @@
   <img src="docs/screenshots/nixscp-icon.png" width="128" alt="NixSCP icon">
 </p>
 
-<h1 align="center">NixSCP — WinSCP for Linux</h1>
+<h1 align="center">NixSCP — WinSCP for Linux and macOS</h1>
 
 <p align="center">
-  <b>A native Linux SFTP, SCP, FTP/FTPS, WebDAV and Amazon S3 client with the familiar WinSCP interface.</b><br>
+  <b>A native SFTP, SCP, FTP/FTPS, WebDAV and Amazon S3 client for Linux, macOS and Windows, with the familiar WinSCP interface.</b><br>
   Same Commander layout, same shortcuts, same settings file — your WinSCP sites, passwords and preferences move over in one click.
 </p>
 
@@ -20,7 +20,7 @@
 
 ---
 
-**NixSCP** is a free, open-source **WinSCP alternative for Linux** — not a Wine wrapper, but a native C++/Qt 6 rewrite of WinSCP's code base. If you moved from Windows to Ubuntu, Fedora, Debian, Linux Mint, Arch or openSUSE and miss WinSCP, NixSCP gives you the same two-panel file manager for secure file transfer, with the same keyboard shortcuts (F5 Copy, F6 Move, F7 New folder, F8 Delete…), dialogs and behaviour — and it reads and writes WinSCP's own configuration format.
+**NixSCP** is a free, open-source **WinSCP alternative for Linux and macOS**, also available for Windows — not a Wine wrapper, but a native C++/Qt 6 rewrite of WinSCP's code base. If you moved from Windows to Ubuntu, Fedora, Debian, Linux Mint, Arch, openSUSE or a Mac and miss WinSCP, NixSCP gives you the same two-panel file manager for secure file transfer, with the same keyboard shortcuts (F5 Copy, F6 Move, F7 New folder, F8 Delete…), dialogs and behaviour — and it reads and writes WinSCP's own configuration format.
 
 ## Documentation
 
@@ -32,13 +32,15 @@ WinSCP's own documentation covers everything NixSCP shares with WinSCP. The feat
 
 ## Why NixSCP?
 
-- 🖥️ **WinSCP interface, natively on Linux** — the Commander two-panel layout, Login/Site Manager, Copy/Move dialogs, transfer queue, Synchronize, Find Files and Preferences you already know. No Wine, no lag.
+- 🖥️ **WinSCP interface, natively on Linux and macOS** — the Commander two-panel layout, Login/Site Manager, Copy/Move dialogs, transfer queue, Synchronize, Find Files and Preferences you already know. No Wine, no lag.
 - 🔁 **1:1 WinSCP data compatibility** — sites, folders, stored passwords, workspaces, bookmarks, custom commands, transfer settings presets and preferences use **WinSCP's own `WinSCP.ini` format and key names**. Import from Windows, export back to Windows, keep using both.
 - 🔑 **Your keys just work** — PuTTY `.ppk` private keys (v2 and v3, RSA, Ed25519, ECDSA), OpenSSH keys, ssh-agent, password, keyboard-interactive.
 - 📜 **Scripting like `winscp.com`** — `nixscp-cli` runs WinSCP scripts with the same commands, switches and exit codes (`open`, `get`, `put`, `synchronize`, `keepuptodate`, `call`, `option batch`…).
 - ⚡ **Fast** — pipelined SFTP, directory cache, parallel background transfers, segmented downloads of large files, batched SCP; large-file SFTP throughput on par with or above OpenSSH's own client.
 - 🌍 **55 languages** — WinSCP's translations, picked automatically from your system language (Preferences → Languages to change).
 - 🐧 **Feels at home on Linux** — GNOME, KDE Plasma and XFCE; Wayland and X11; desktop Trash, `xdg-open`, your terminal for "Open in PuTTY", `sftp://` link handling.
+- 🍎 **And on the Mac** — one universal app for Apple Silicon and Intel: the macOS menu bar, Finder, Terminal.app for "Open in Terminal", ⌘ shortcuts.
+- 🪟 **Same app on Windows** — for teams and people who switch between systems, with the same sites synced everywhere.
 
 ## WinSCP compatibility: import & export across versions
 
@@ -167,7 +169,7 @@ Your existing WinSCP scripts (`winscp.com /script=…`) generally run unchanged 
 
 ## Cloud sync (NixSCP Pro beta)
 
-Optional end-to-end encrypted sync of sites, stored passwords, preferences, workspaces, bookmarks and open sessions between your computers (Linux and Windows): **Cloud Sync › Sign In…** in NixSCP. Everything is encrypted on your computer (Argon2id + AES-256-GCM) with a sync password that never leaves it; the server only stores ciphertext. Sync is **free during the beta**; afterwards it becomes a paid NixSCP Pro feature and NixSCP tells you in the app. NixSCP itself stays free and open source. Details: [nixscp.com/security](https://nixscp.com/security).
+Optional end-to-end encrypted sync of sites, stored passwords, preferences, workspaces, bookmarks and open sessions between your computers (Linux, Windows and macOS): **Cloud Sync › Sign In…** in NixSCP. Everything is encrypted on your computer (Argon2id + AES-256-GCM) with a sync password that never leaves it; the server only stores ciphertext. Sync is **free during the beta**; afterwards it becomes a paid NixSCP Pro feature and NixSCP tells you in the app. NixSCP itself stays free and open source. Details: [nixscp.com/security](https://nixscp.com/security).
 
 ## Agent Access
 
@@ -203,15 +205,17 @@ Share site folders with colleagues, end-to-end encrypted: **Pro › Teams...**. 
 
 ## Status
 
-**Version 1.2.1** for Linux, Windows and (new) macOS. NixSCP ports WinSCP's features, captions, defaults and shortcuts one-to-one where they make sense on Linux. Windows-only features without a sane Linux equivalent (registry storage, drive letters, Windows file attributes, shell extensions) are replaced by Linux equivalents or removed. Bug reports and feature requests are welcome in [Issues](../../issues).
+**Version 1.2.1** for Linux, Windows and (new) macOS. NixSCP ports WinSCP's features, captions, defaults and shortcuts one-to-one where they make sense on Linux and macOS. Windows-only features without a sane equivalent there (registry storage, drive letters, Windows file attributes, shell extensions) are replaced by native equivalents or removed. The macOS app is not signed by Apple yet; signing is in progress. Bug reports and feature requests are welcome in [Issues](../../issues).
 
 ## FAQ
 
-**Is this WinSCP?** No. NixSCP is an independent port based on WinSCP's GPL source code. It is not affiliated with or endorsed by the WinSCP project. On Windows, [WinSCP](https://winscp.net/) itself is the original; the Windows version of NixSCP is for people who also use NixSCP on Linux and want the same application and synced settings everywhere.
+**Is this WinSCP?** No. NixSCP is an independent port based on WinSCP's GPL source code. It is not affiliated with or endorsed by the WinSCP project. On Windows, [WinSCP](https://winscp.net/) itself is the original; the Windows version of NixSCP is for people who also use NixSCP on Linux or macOS and want the same application and synced settings everywhere.
 
-**Can I keep using WinSCP on Windows and NixSCP on Linux with the same sites?** Yes — export from one, import into the other; the file format is the same.
+**Can I keep using WinSCP on Windows and NixSCP on Linux or a Mac with the same sites?** Yes — export from one, import into the other; the file format is the same.
 
-**Does it need Wine?** No. NixSCP is a native Linux application built with Qt 6, libssh and OpenSSL.
+**Does it need Wine?** No. NixSCP is a native Linux and macOS application built with Qt 6, libssh and OpenSSL.
+
+**Does it run on Apple Silicon?** Yes. The macOS download is one universal app for Apple Silicon (M1 and newer) and Intel Macs, macOS 12 or newer. It is not signed by Apple yet, so the first start needs right-click › Open.
 
 **Which Linux desktops are supported?** GNOME, KDE Plasma, XFCE and others, on Wayland and X11.
 
@@ -229,4 +233,4 @@ NixSCP is based on **[WinSCP](https://winscp.net/)**, Copyright © 2000–2026 M
 
 **Dragan Plavšić** — [CodeWiz](https://codewizdev.com/), Banja Luka, Bosnia and Herzegovina · [hello@codewizdev.com](mailto:hello@codewizdev.com)
 
-<sub>Keywords: WinSCP for Linux, WinSCP alternative, WinSCP Linux, SFTP client for Linux, SCP client, FTP client, FTPS, WebDAV client, S3 client, Ubuntu SFTP GUI, file transfer, two-panel file manager, Commander, Qt.</sub>
+<sub>Keywords: WinSCP for Linux, WinSCP for Mac, WinSCP macOS, WinSCP alternative, WinSCP Linux, SFTP client for Mac, SFTP client for Linux, SCP client, FTP client, FTPS, WebDAV client, S3 client, Ubuntu SFTP GUI, file transfer, two-panel file manager, Commander, Qt.</sub>

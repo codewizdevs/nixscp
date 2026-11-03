@@ -27,7 +27,8 @@ Agent Access is **free**. It does not need a NixSCP Pro account.
 1. You enable Agent Access for a site in NixSCP and choose what agents may do there.
 2. An agent runs, for example, `nixscp --connect web1 --cmd "df -h"`.
 3. That command connects to the running NixSCP over a local socket that only your user account can open
-   (`$XDG_RUNTIME_DIR/nixscp-agent.sock` on Linux, a per-user named pipe on Windows).
+   (`$XDG_RUNTIME_DIR/nixscp-agent.sock` on Linux, `nixscp-agent.sock` in the private `$TMPDIR` on macOS,
+   a per-user named pipe on Windows).
 4. NixSCP checks the site's settings, asks you if the site is set to ask, logs the request, opens the SSH
    connection with the stored credentials, runs the command and streams the output and exit code back.
 

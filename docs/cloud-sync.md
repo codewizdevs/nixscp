@@ -1,6 +1,6 @@
 # Cloud sync (NixSCP Pro)
 
-Cloud sync keeps your NixSCP settings the same on all your computers, Linux and Windows: sites and site folders,
+Cloud sync keeps your NixSCP settings the same on all your computers, Linux, macOS and Windows: sites and site folders,
 stored passwords, preferences, workspaces, bookmarks, custom commands, transfer presets, and the session tabs you
 had open. Everything is **end-to-end encrypted** on your computer before it is uploaded; the NixSCP cloud stores only
 ciphertext it cannot read.

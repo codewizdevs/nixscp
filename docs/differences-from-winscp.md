@@ -25,13 +25,13 @@ the WinSCP project.
 
 | Area | WinSCP | NixSCP |
 |---|---|---|
-| Configuration storage | Windows registry (default) or `WinSCP.ini` | Always an INI file in WinSCP's format: `~/.config/nixscp/nixscp.ini` (Linux), `%APPDATA%\NixSCP\nixscp.ini` (Windows), or `/ini=<file>`. Import registry settings from a `.reg` export. |
+| Configuration storage | Windows registry (default) or `WinSCP.ini` | Always an INI file in WinSCP's format: `~/.config/nixscp/nixscp.ini` (Linux), `~/Library/Application Support/NixSCP/nixscp.ini` (macOS), `%APPDATA%\NixSCP\nixscp.ini` (Windows), or `/ini=<file>`. Import registry settings from a `.reg` export. |
 | Keys and values NixSCP does not use | n/a | Kept untouched, so a configuration that goes WinSCP > NixSCP > WinSCP loses nothing. |
 | Stored passwords | Obfuscated, or encrypted with a master password | The same, compatible with WinSCP; with NixSCP Pro the whole file is encrypted with the NixSCP password, which replaces the master password ([encryption.md](encryption.md)). |
 | Exports with NixSCP Pro | n/a | Choice of an encrypted backup (NixSCP only) or a plain WinSCP-compatible file. |
 | Console client | `winscp.com` | `nixscp-cli`, with the same script commands, switches and exit codes. |
-| Authentication agent | Pageant | ssh-agent (`SSH_AUTH_SOCK`) on Linux; there is no agent choice in Preferences. The Windows build does not support Pageant or the Windows OpenSSH agent yet. |
-| Local files | Drive letters, Windows file attributes, Recycle Bin | Linux paths and permissions, desktop Trash. |
+| Authentication agent | Pageant | ssh-agent (`SSH_AUTH_SOCK`) on Linux and macOS; there is no agent choice in Preferences. The Windows build does not support Pageant or the Windows OpenSSH agent yet. |
+| Local files | Drive letters, Windows file attributes, Recycle Bin | Linux and macOS paths and permissions; desktop Trash on Linux, the Trash on macOS. |
 | Help | Help buttons and F1 open winscp.net | Still open the matching WinSCP documentation page; NixSCP's own features open nixscp.com. The Help menu links to nixscp.com, GitHub issues and GitHub releases. |
 | Updates | Built-in update checker and Updates page | A notice about new GitHub releases and Preferences > Updates ([updates.md](updates.md)). |
 | Languages | Translations installed separately | WinSCP's translations included, chosen from the system language (Preferences > Languages). |
@@ -48,7 +48,7 @@ the WinSCP project.
 - **.NET assembly and COM** (`WinSCPnet.dll`): use `nixscp-cli` scripts instead.
 - **Settings without a Linux equivalent**: e.g. clearing the archive attribute, invalid-character replacement in file
   names, the random seed file, the PuTTY registry key, tips. Their values in `WinSCP.ini` are preserved.
-- **KiTTY** session import (KiTTY is Windows-only). "Open in PuTTY" opens your terminal with OpenSSH on Linux.
+- **KiTTY** session import (KiTTY is Windows-only). "Open in PuTTY" opens your terminal with OpenSSH on Linux, and Terminal.app on macOS.
 - Smaller interface details, such as some animations and balloon hints, and drag and drop of bookmarks within the
   bookmark tree (Up/Down/Move To cover it).
 

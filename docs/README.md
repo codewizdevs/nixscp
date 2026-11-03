@@ -1,6 +1,6 @@
 # NixSCP documentation
 
-NixSCP is a native port of WinSCP for Linux and Windows. Everything WinSCP does is documented by WinSCP itself
+NixSCP is a native port of WinSCP for Linux, macOS and Windows. Everything WinSCP does is documented by WinSCP itself
 ([winscp.net/eng/docs](https://winscp.net/eng/docs/)); the Help buttons and F1 in NixSCP open those pages.
 The pages below cover what NixSCP adds on top of WinSCP.
 
@@ -19,7 +19,7 @@ The website versions of these pages are at [nixscp.com/docs](https://nixscp.com/
 
 ## Where NixSCP keeps its files
 
-All files live next to the configuration file: `~/.config/nixscp/` on Linux, `%APPDATA%\NixSCP` on Windows
+All files live next to the configuration file: `~/.config/nixscp/` on Linux, `~/Library/Application Support/NixSCP` on macOS, `%APPDATA%\NixSCP` on Windows
 (or the folder of the file given with `/ini=`).
 
 | File | Contents | Encrypted with the NixSCP password (Pro) |
