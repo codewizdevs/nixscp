@@ -141,6 +141,11 @@ static std::function<bool(QWidget *)> Titled(const QString & Title)
 
 static QString KeywordUrl(const QString & Keyword)
 {
+  // NixSCP's own pages live on nixscp.com
+  if (Keyword.startsWith(QStringLiteral("nixscp:")))
+  {
+    return QStringLiteral("https://nixscp.com/") + Keyword.mid(7);
+  }
   return QStringLiteral("https://winscp.net/eng/docs/") + Keyword;
 }
 
@@ -681,6 +686,7 @@ static QString PreferencesKeyword(const QString & Caption)
     { QStringLiteral("Applications"), QStringLiteral("ui_pref_integration_app") },
     { QStringLiteral("Commands"), QStringLiteral("ui_pref_commands") },
     { QStringLiteral("Storage"), QStringLiteral("ui_pref_storage") },
+    { QStringLiteral("Updates"), QStringLiteral("nixscp:download") },
   };
   return Keywords.value(Caption);
 }

@@ -1092,6 +1092,8 @@ ImportSessionList SiteImport::SelectSessionsForImport(const StoredSessionList & 
       Session->Load(SiteStorage);
       Session->Name = Data->Name;
     }
+    // agent access is granted on this computer only, never by an imported file
+    Session->AgentAccess = 0;
     Result.Add(Session);
   }
   // INI_NO_SITES

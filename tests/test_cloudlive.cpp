@@ -10,6 +10,7 @@
 // should be empty before the run.
 #include "core/CloudCrypto.h"
 #include "core/CloudSync.h"
+#include "core/ConfigVault.h"
 #include "core/Configuration.h"
 #include "core/SessionData.h"
 
@@ -303,7 +304,16 @@ static int RunStep(const QString & Dir, const QString & Step)
 {
   Configuration & Config = Configuration::Instance();
   Config.SetIniFileName(Dir + QStringLiteral("/nixscp.ini"));
+  // as the application at startup: a computer that set up sync before has its
+  // configuration encrypted with the sync (NixSCP) password
+  bool Encrypted = ConfigVault::IsSealedFile(Config.IniFileName());
+  if (Encrypted)
+  {
+    CHECK(!ConfigVault::Unlock(Config.IniFileName(), QStringLiteral("wrong password"), false));
+    CHECK(ConfigVault::Unlock(Config.IniFileName(), SyncPassword, false));
+  }
   Config.Load();
+  CHECK(!Config.IsLocked());
   CloudSync::Instance().Initialize(Config);
   if (Step == QStringLiteral("first")) StepFirst();
   else if (Step == QStringLiteral("second")) StepSecond();
@@ -312,6 +322,11 @@ static int RunStep(const QString & Dir, const QString & Step)
   else if (Step == QStringLiteral("repair")) StepRepair();
   else if (Step == QStringLiteral("unlock-past-junk")) StepUnlockPastJunk();
   else if (Step == QStringLiteral("removed")) StepRemoved();
+  // with the key, the configuration is (now) encrypted on disk
+  if (CloudSync::Instance().HasKey())
+  {
+    CHECK(ConfigVault::IsSealedFile(Config.IniFileName()));
+  }
   std::printf("step %s: %s\n", qPrintable(Step), (Failures == 0) ? "ok" : "FAILED");
   return (Failures == 0) ? 0 : 1;
 }

@@ -1,0 +1,29 @@
+name: WinSCP upstream
+
+# Opens a review issue for every change in the official WinSCP repository
+# after the reviewed baseline (upstream/winscp.json), and one per new WinSCP
+# release. Nothing is ported automatically: see upstream/README.md.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: winscp-upstream
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open review issues for new WinSCP changes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 tools/winscp_upstream.py sync

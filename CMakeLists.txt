@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.19)
-project(nixscp VERSION 1.1.0 LANGUAGES CXX)
+project(nixscp VERSION 1.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -113,6 +113,11 @@ foreach(TEST_SOURCE ${TEST_SOURCES})
     add_test(NAME ${TEST_SHORT} COMMAND ${TEST_NAME})
   endif()
 endforeach()
+# The WinSCP upstream tracker (tools/winscp_upstream.py, upstream/README.md), offline
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(NIXSCP_BUILD_TESTS AND Python3_Interpreter_FOUND AND NOT CMAKE_CROSSCOMPILING)
+  add_test(NAME winscp_upstream COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/tests/winscp_upstream_test.py)
+endif()
 
 # Desktop integration: AppStream metainfo and application icon.
 # The icon is optional (extracted from the WinSCP sources by a separate step),

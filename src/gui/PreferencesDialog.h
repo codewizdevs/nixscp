@@ -10,7 +10,8 @@
 // they change (interface theme; UI language at startup) and handles the master
 // password prompt.
 // Not ported: Explorer (NixSCP has the Commander interface only).
-// Removed (no Linux equivalent): Updates page, Windows registry storage, random seed
+// Updates page: a NixSCP notice of new GitHub releases (gui/UpdateCheck).
+// Removed (no Linux equivalent): Windows registry storage, random seed
 // file, PuTTY registry key, authentication agent choice (ssh-agent only), tips,
 // "Get more" translations.
 #pragma once

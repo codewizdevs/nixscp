@@ -2,7 +2,7 @@
 // contents and keyword help on winscp.net), windows/Tools.cpp (ShowHelp,
 // FormHelp) and the Help menu actions of forms/NonVisual.{cpp,dfm}
 // (TableOfContentsAction F1, HomepageAction, ForumPageAction,
-// HistoryPageAction, DonatePageAction, AboutAction).
+// HistoryPageAction, AboutAction; no Donate: that is WinSCP's).
 //
 // Linux adaptation: the documentation, homepage, forum, history and donation
 // pages are WinSCP's (NixSCP is a port; its features, captions and help
@@ -25,13 +25,14 @@ namespace HelpSystem
 
 // HOMEPAGE_URL, HISTORY_URL, FORUM_URL, DONATE_URL, DOCUMENTATION_URL2 (without ver/lang)
 QUrl HomepageUrl();
+// GitHub issues of the NixSCP repository
+QUrl IssuesUrl();
 // Original WinSCP project (credited in About)
 QUrl WinSCPHomepageUrl();
 // mailto: link to the NixSCP author
 QUrl ContactUrl();
 QUrl HistoryUrl();
 QUrl ForumUrl();
-QUrl DonateUrl();
 QUrl DocumentationUrl();
 // DOCUMENTATION_KEYWORD_URL2: https://winscp.net/eng/docs/<page>[#fragment];
 // "task_navigate#bookmarks" keeps the fragment
@@ -66,8 +67,8 @@ QString InputDialog(QWidget * Parent, const QString & Caption, const QString & P
   const QString & Keyword, bool * Ok = nullptr);
 
 // Help menu of the main windows (forms/ScpCommander.dfm TBXSubmenuItem22):
-// &Contents (F1), -, Product &Homepage, &Support Forum, &Version History, -,
-// &Donate, -, &About... (AboutDialog). Creates the actions as children of Menu.
+// &Contents (F1), -, Product &Homepage (nixscp.com), &Report a Bug (GitHub),
+// &Send Feedback, &Version History (GitHub releases), -, &About... (AboutDialog). Creates the actions as children of Menu.
 // The F1 action uses Qt::WindowShortcut on Window (the menu's window).
 void PopulateHelpMenu(QMenu * Menu, QWidget * Window);
 

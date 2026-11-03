@@ -12,18 +12,24 @@
 // The rest of the command line logic lives in gui/GuiCommandLine and
 // gui/SingleInstance.
 #include "cli/Options.h"
+#include "core/ConfigVault.h"
+#include "core/TeamSync.h"
 #include "core/Configuration.h"
 #include "core/FileSystem.h"
 #include "core/IniStorage.h"
 #include "core/CloudSync.h"
 #include "core/RemoteFile.h"
 #include "core/Workspaces.h"
+#include "gui/AgentBroker.h"
+#include "gui/AgentClient.h"
 #include "gui/CloudSyncUi.h"
 #include "gui/CommanderWindow.h"
 #include "gui/GuiCommandLine.h"
 #include "gui/GuiUserInterface.h"
 #include "gui/Icons.h"
 #include "gui/SingleInstance.h"
+#include "gui/UnlockDialog.h"
+#include "gui/UpdateCheck.h"
 
 #include <QApplication>
 #include <QDir>
@@ -120,6 +126,13 @@ int main(int argc, char * argv[])
   {
     RawArgs.append(QString::fromLocal8Bit(argv[I]));
   }
+  // Agent Access: nixscp --list / --connect / --get / --put / --help
+  // (before --version, which may follow --cmd as part of a remote command)
+  int AgentResult = AgentClient::Run(argc, argv, RawArgs);
+  if (AgentResult >= 0)
+  {
+    return AgentResult;
+  }
   if (RawArgs.contains(QStringLiteral("--version")))
   {
     printf("nixscp %s\n", PROJECT_VERSION);
@@ -153,10 +166,36 @@ int main(int argc, char * argv[])
   Configuration & Config = Configuration::Instance();
   QString IniFileMissing;
   ApplyIniSwitch(Params, &IniFileMissing);
+  if (!Config.IsNulStorage() && ConfigVault::IsSealedFile(Config.IniFileName()))
+  {
+    // NixSCP Pro: the configuration is encrypted. A running NixSCP has it
+    // unlocked: a session or URL to open is handed over without asking
+    Options Probe(Params);
+    static const QStringList OwnFlow{QStringLiteral("upload"), QStringLiteral("uploadifany"), QStringLiteral("synchronize"),
+      QStringLiteral("keepuptodate"), QStringLiteral("refresh"), QStringLiteral("newinstance"), QStringLiteral("rawconfig")};
+    bool HandOver = (Probe.ParamCount() > 0);
+    for (const QString & Switch : OwnFlow)
+    {
+      HandOver = HandOver && !Probe.FindSwitch(Switch);
+    }
+    if (HandOver &&
+        SingleInstance::SendCommandLine(SingleInstance::DefaultServerName(Config.IniFileName()), Args, QDir::currentPath()))
+    {
+      ssh_finalize();
+      return 0;
+    }
+    if (!UnlockDialog::UnlockConfiguration(Config.IniFileName()))
+    {
+      ssh_finalize();
+      return 0;
+    }
+  }
   Config.Load();
   ApplyRawConfig(Params);
   // NixSCP Pro settings and session sync (inactive until signed in)
   CloudSync::Instance().Initialize(Config);
+  // NixSCP Teams: shared site folders (synced by the Pro controller)
+  TeamSync::Instance().Initialize(Config, CloudSync::Instance());
   if (!IniFileMissing.isEmpty())
   {
     // FILE_NOT_EXISTS
@@ -383,6 +422,10 @@ int main(int argc, char * argv[])
 
   CommanderWindow Window;
   Window.show();
+  // Agent Access: programs use the saved sites through this running instance
+  AgentBroker::Start(&Window);
+  // New version on GitHub? (in the background, a notice only)
+  UpdateCheck::Start(&Window);
 
   // Sessions from other instances (ExternalSessionInExistingInstance), /refresh
   SingleInstance Instance(ServerName);

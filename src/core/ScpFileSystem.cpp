@@ -1542,8 +1542,12 @@ void SetLocalTimes(const QString & Path, qint64 MTime, qint64 ATime)
 
 bool ValidScpFileName(const QString & Name)
 {
-  // Security: the server must not escape the target directory
+  // Security: the server must not escape the target directory (WinSCP issue
+  // 2477: "." and ".." at every level); on Windows "\" separates paths too
   return !Name.isEmpty() && (Name != QStringLiteral(".")) && (Name != QStringLiteral("..")) &&
+#ifdef Q_OS_WIN
+    !Name.contains(QLatin1Char('\\')) &&
+#endif
     !Name.contains(QLatin1Char('/'));
 }
 
@@ -2060,9 +2064,14 @@ void ScpFileSystem::BatchSink(const QString & RemotePath, const QString & Target
       continue;
     }
     QString LocalName = Options.TargetName ? Options.TargetName(RemoteFull, IsDirectory) : QString();
-    if (LocalName.isEmpty() || LocalName.contains(QLatin1Char('/')))
+    bool Separator = LocalName.contains(QLatin1Char('/'));
+#ifdef Q_OS_WIN
+    Separator = Separator || LocalName.contains(QLatin1Char('\\'));
+#endif
+    if (LocalName.isEmpty() || Separator)
     {
-      LocalName = FileName;
+      // names Windows cannot store (":"...) encoded as WinSCP does; no change on Linux
+      LocalName = CopyParam::ValidLocalFileName(FileName);
     }
     QString LocalFull = QDir(Current.LocalDir).filePath(LocalName);
 

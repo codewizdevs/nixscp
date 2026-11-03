@@ -146,6 +146,13 @@ void SessionData::Default()
   NameOverride.clear();
   Color = 0;
   Note.clear();
+  AgentAccess = 0;
+  AgentPermissions = 0x07;
+  AgentName.clear();
+  AgentAllow.clear();
+  AgentDeny.clear();
+  AgentRecord = true;
+  PortForwards.clear();
   Special = false;
 
   EOLType = eolLF;
@@ -367,6 +374,13 @@ void SessionData::Load(IniStorage & Storage)
   }
   HostKey = Storage.ReadString(QStringLiteral("SshHostKey"), HostKey);
   Note = Storage.ReadString(QStringLiteral("Note"), Note);
+  AgentAccess = Storage.ReadInteger(QStringLiteral("AgentAccess"), AgentAccess);
+  AgentPermissions = Storage.ReadInteger(QStringLiteral("AgentPermissions"), AgentPermissions);
+  AgentName = Storage.ReadString(QStringLiteral("AgentName"), AgentName);
+  AgentAllow = Storage.ReadString(QStringLiteral("AgentAllow"), AgentAllow);
+  AgentDeny = Storage.ReadString(QStringLiteral("AgentDeny"), AgentDeny);
+  AgentRecord = Storage.ReadBool(QStringLiteral("AgentRecord"), AgentRecord);
+  PortForwards = Storage.ReadString(QStringLiteral("PortForwards"), PortForwards);
   // Putty uses PingIntervalSecs
   int PingIntervalSecs = Storage.ReadInteger(QStringLiteral("PingIntervalSecs"), -1);
   if (PingIntervalSecs < 0)
@@ -598,6 +612,13 @@ void SessionData::Save(IniStorage & Storage, const SessionData * Default) const
   WRITE_DATA(Bool, AuthKIPassword);
   WRITE_DATA_EX(String, "SshHostKey", HostKey);
   WRITE_DATA(String, Note);
+  WRITE_DATA(Integer, AgentAccess);
+  WRITE_DATA(Integer, AgentPermissions);
+  WRITE_DATA(String, AgentName);
+  WRITE_DATA(String, AgentAllow);
+  WRITE_DATA(String, AgentDeny);
+  WRITE_DATA(Bool, AgentRecord);
+  WRITE_DATA(String, PortForwards);
   WRITE_DATA(Bool, AuthGSSAPI);
   WRITE_DATA(Bool, AuthGSSAPIKEX);
   WRITE_DATA(Bool, GSSAPIFwdTGT);
@@ -1457,6 +1478,14 @@ bool SessionData::ApplyRawSettings(const QStringList & Settings)
   Load(Storage);
   Name = AName;
   KnownHostsFile = AKnownHostsFile;
+  // Agent access is granted in NixSCP only, never by a URL or raw settings
+  AgentAccess = Before.AgentAccess;
+  AgentPermissions = Before.AgentPermissions;
+  AgentName = Before.AgentName;
+  AgentAllow = Before.AgentAllow;
+  AgentDeny = Before.AgentDeny;
+  AgentRecord = Before.AgentRecord;
+  PortForwards = Before.PortForwards;
   for (auto It = OldRawValues.cbegin(); It != OldRawValues.cend(); ++It)
   {
     if (!FRawValues.contains(It.key()))

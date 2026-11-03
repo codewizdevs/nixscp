@@ -22,6 +22,14 @@
 
 **NixSCP** is a free, open-source **WinSCP alternative for Linux** — not a Wine wrapper, but a native C++/Qt 6 rewrite of WinSCP's code base. If you moved from Windows to Ubuntu, Fedora, Debian, Linux Mint, Arch or openSUSE and miss WinSCP, NixSCP gives you the same two-panel file manager for secure file transfer, with the same keyboard shortcuts (F5 Copy, F6 Move, F7 New folder, F8 Delete…), dialogs and behaviour — and it reads and writes WinSCP's own configuration format.
 
+## Documentation
+
+WinSCP's own documentation covers everything NixSCP shares with WinSCP. The features NixSCP adds are documented in
+[docs/](docs/README.md): [Agent Access](docs/agent-access.md), [MCP server](docs/mcp.md),
+[Tunnels](docs/tunnels.md), [Cloud sync](docs/cloud-sync.md), [Local encryption](docs/encryption.md),
+[Teams](docs/teams.md), [New-release check](docs/updates.md) and
+[Differences from WinSCP](docs/differences-from-winscp.md). Online: [nixscp.com/docs](https://nixscp.com/docs).
+
 ## Why NixSCP?
 
 - 🖥️ **WinSCP interface, natively on Linux** — the Commander two-panel layout, Login/Site Manager, Copy/Move dialogs, transfer queue, Synchronize, Find Files and Preferences you already know. No Wine, no lag.
@@ -154,9 +162,41 @@ Your existing WinSCP scripts (`winscp.com /script=…`) generally run unchanged 
 
 Optional end-to-end encrypted sync of sites, stored passwords, preferences, workspaces, bookmarks and open sessions between your computers (Linux and Windows): **Cloud Sync › Sign In…** in NixSCP. Everything is encrypted on your computer (Argon2id + AES-256-GCM) with a sync password that never leaves it; the server only stores ciphertext. Sync is **free during the beta**; afterwards it becomes a paid NixSCP Pro feature and NixSCP tells you in the app. NixSCP itself stays free and open source. Details: [nixscp.com/security](https://nixscp.com/security).
 
+## Agent Access
+
+Let AI agents and other programs use your saved SSH sites **without ever getting their passwords or keys**. Enable it per site with **Agent Access...** in the site settings: off, allowed, or ask me each time (allow once, for 1 hour, for 24 hours, or always). The running NixSCP application makes the connection; agents only use these commands:
+
+```bash
+nixscp --list                                    # sites the agent may use
+nixscp --connect web1 --cmd "df -h"              # one command: output and exit code
+nixscp --connect web1                            # interactive shell (in a terminal)
+nixscp --get web1 /var/log/app.log ./app.log     # download a file
+nixscp --put web1 ./build.tar.gz /tmp/           # upload a file
+nixscp --tunnel db1 5433:localhost:5432          # port forwarding while it runs
+nixscp --help                                    # instructions written for agents
+```
+
+**MCP server:** `nixscp --mcp` serves the same through the Model Context Protocol (tools `list_sites`, `run_command`, `download_file`, `upload_file`), e.g. `claude mcp add nixscp -- nixscp --mcp`.
+
+Everything is allowed by default; per site you can optionally:
+- choose what agents may do: commands, downloads, uploads, tunnels;
+- set **command rules**: allowed and denied patterns (`systemctl status *`), checked for every part of a command (`;`, `&&`, `|`...), with a read-only preset. Rules are a safety net, not a sandbox;
+- give the site a different **name for agents**, hiding your folder and client names;
+- keep **session recordings** (on by default): every command and its output, in Commands › Agent Sessions.
+
+Free for everyone. Requires NixSCP running, with your saved passwords encrypted: a **master password** (Preferences › Security) or, with NixSCP Pro, your **NixSCP password**, which encrypts the whole configuration. Every request is written to the agent access log (Commands › Agent Access Log). Private key files should have a passphrase: any program you run can read an unprotected key file directly.
+
+## Tunnels
+
+**Tunnels › Manage Tunnels...** keeps saved port forwards per site (e.g. the server's PostgreSQL on `127.0.0.1:5433`), started and stopped with one click; they listen on this computer only. Agents open them with `nixscp --tunnel <site> <name>` when the site allows it.
+
+## Teams (NixSCP Pro beta)
+
+Share site folders with colleagues, end-to-end encrypted: **Pro › Teams...**. A team's sites appear as `Team: <name>` in the site tree; owners and admins edit them, members use them. Invite with one-time codes (the code's secret never reaches the server); removing a member renews the team key and removes the sites from their NixSCP. Agent access stays each person's own setting.
+
 ## Status
 
-**Version 1.1.** NixSCP ports WinSCP's features, captions, defaults and shortcuts one-to-one where they make sense on Linux. Windows-only features without a sane Linux equivalent (registry storage, drive letters, Windows file attributes, shell extensions) are replaced by Linux equivalents or removed. Bug reports and feature requests are welcome in [Issues](../../issues).
+**Version 1.2.** NixSCP ports WinSCP's features, captions, defaults and shortcuts one-to-one where they make sense on Linux. Windows-only features without a sane Linux equivalent (registry storage, drive letters, Windows file attributes, shell extensions) are replaced by Linux equivalents or removed. Bug reports and feature requests are welcome in [Issues](../../issues).
 
 ## FAQ
 

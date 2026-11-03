@@ -15,6 +15,8 @@
 #include "cli/Options.h"
 #include "cli/Script.h"
 #include "cli/SessionUrl.h"
+#include "core/CloudCrypto.h"
+#include "core/ConfigVault.h"
 #include "core/Configuration.h"
 #include "core/FileMasks.h"
 #include "core/IniStorage.h"
@@ -984,6 +986,32 @@ int main(int argc, char * argv[])
   {
     Config.SetIniFileName((IniFileName.compare(QStringLiteral("nul"), Qt::CaseInsensitive) == 0) ?
       QStringLiteral("nul") : LocalExpandFileName(IniFileName));
+  }
+  if (!Config.IsNulStorage() && ConfigVault::IsSealedFile(Config.IniFileName()))
+  {
+    // NixSCP Pro: the configuration is encrypted with the NixSCP password
+    bool Unlocked = false;
+    for (int Attempt = 0; !Unlocked && (Attempt < 3); Attempt++)
+    {
+      C.Print(QStringLiteral("NixSCP password (or recovery key): "));
+      QString Secret;
+      if (!C.Input(Secret, false, 0) || Secret.isEmpty())
+      {
+        break;
+      }
+      Unlocked = ConfigVault::Unlock(Config.IniFileName(), Secret, false) ||
+        (!CloudCrypto::ParseRecoveryKey(Secret).isEmpty() && ConfigVault::Unlock(Config.IniFileName(), Secret, true));
+      if (!Unlocked)
+      {
+        C.PrintLine(QStringLiteral("The password is not correct."));
+      }
+    }
+    if (!Unlocked)
+    {
+      C.PrintLine(QStringLiteral("The configuration \"%1\" is encrypted (NixSCP Pro) and needs your NixSCP password. "
+        "Run interactively, or use /ini=nul for scripts that do not need stored sites.").arg(Config.IniFileName()));
+      return 1;
+    }
   }
   Config.Load();
   QStringList RawConfig;

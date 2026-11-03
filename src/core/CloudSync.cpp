@@ -1,4 +1,6 @@
 #include "core/CloudSync.h"
+#include "core/ConfigVault.h"
+#include "core/Security.h"
 
 #include "core/CloudSettings.h"
 #include "core/Configuration.h"
@@ -123,10 +125,17 @@ void CloudSync::LoadState()
   FRememberKey = (Read("Options", "RememberKey", QStringLiteral("1")) == QStringLiteral("1"));
   FSyncSessions = (Read("Options", "SyncSessions", QStringLiteral("1")) == QStringLiteral("1"));
   FRestoreSessions = (Read("Options", "RestoreSessions", QStringLiteral("1")) == QStringLiteral("1"));
+  // Versions before 1.2 could remember the raw data key here; it is taken
+  // once (moved into memory and the encrypted configuration) and erased
   FDek = QByteArray::fromBase64(Read("Key", "Dek").toLatin1());
   if (FDek.size() != CloudCrypto::KeyLength)
   {
     FDek.clear();
+  }
+  // Unlocked at startup with the NixSCP password (the same key)
+  if (FDek.isEmpty() && !FUser.isEmpty() && (ConfigVault::User() == FUser) && (ConfigVault::Key().size() == CloudCrypto::KeyLength))
+  {
+    FDek = ConfigVault::Key();
   }
   FWrap = CloudCrypto::SnapshotHeader();
   FWrap.Kdf.MemoryKib = Read("Key", "MemoryKib", QStringLiteral("65536")).toUInt();
@@ -144,6 +153,35 @@ void CloudSync::LoadState()
   if (Read("Settings", "Paused") == QStringLiteral("1"))
   {
     FState = csPaused;
+  }
+}
+
+// The local configuration is encrypted with the data key (NixSCP Pro): on
+// whenever the key is known; rewritten when the key or its password changed.
+// A WinSCP master password is retired: the NixSCP password replaces it.
+void CloudSync::ProtectConfiguration()
+{
+  if ((FDek.size() != CloudCrypto::KeyLength) || FWrap.DekPassword.isEmpty() || FUser.isEmpty())
+  {
+    return;
+  }
+  CloudCrypto::SnapshotHeader Wrap = FWrap;
+  Wrap.User = FUser;
+  CloudCrypto::SnapshotHeader Current = ConfigVault::Wrap();
+  bool Same = ConfigVault::Enabled() && (ConfigVault::Key() == FDek) && (Current.DekPassword == Wrap.DekPassword) &&
+    (Current.DekRecovery == Wrap.DekRecovery) && (Current.User == Wrap.User);
+  if (Same)
+  {
+    return;
+  }
+  ConfigVault::SetKey(FDek, Wrap);
+  if (FConfig != nullptr)
+  {
+    if (FConfig->UseMasterPassword() && Security::IsMasterPasswordKnown())
+    {
+      FConfig->ClearMasterPassword();
+    }
+    FConfig->Rewrite();
   }
 }
 
@@ -167,9 +205,9 @@ void CloudSync::SaveState()
   Write("Options", "RememberKey", Bool(FRememberKey));
   Write("Options", "SyncSessions", Bool(FSyncSessions));
   Write("Options", "RestoreSessions", Bool(FRestoreSessions));
-  // The DEK unlocks the synced settings, which are also in nixscp.ini on this
-  // computer: the file has the same (owner only) protection
-  Write("Key", "Dek", FRememberKey ? QString::fromLatin1(FDek.toBase64()) : QString());
+  // The data key is never stored: the NixSCP password unlocks it at startup
+  // (ConfigVault), and it encrypts the local configuration too
+  Write("Key", "Dek", QString());
   Write("Key", "MemoryKib", QString::number(FWrap.Kdf.MemoryKib));
   Write("Key", "Iterations", QString::number(FWrap.Kdf.Iterations));
   Write("Key", "Lanes", QString::number(FWrap.Kdf.Lanes));
@@ -187,6 +225,7 @@ void CloudSync::SaveState()
   {
     QFile::setPermissions(FStateFileName, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
   }
+  ProtectConfiguration();
 }
 
 void CloudSync::ResetSyncState()
@@ -552,19 +591,30 @@ void CloudSync::FetchAccount(const std::function<void(bool, const QJsonObject &)
   FClient->Api("GET", QStringLiteral("/v1/me"), [Done](const CloudClient::Reply & Reply) { Done(Reply.Ok(), Reply.Json); });
 }
 
-void CloudSync::CheckLicense()
+void CloudSync::CheckLicense(const std::function<void(bool Active)> & Done)
 {
   if (!SignedIn())
   {
+    FLicenseActive = false;
+    if (Done)
+    {
+      Done(false);
+    }
     return;
   }
-  FetchAccount([this](bool Ok, const QJsonObject & Me)
+  FetchAccount([this, Done](bool Ok, const QJsonObject & Me)
   {
     if (!Ok || !SignedIn())
     {
+      if (Done)
+      {
+        Done(Ok ? false : FLicenseActive);
+      }
       return;
     }
-    if (Me.value(QStringLiteral("license")).toObject().value(QStringLiteral("active")).toBool())
+    FLicenseActive = Me.value(QStringLiteral("license")).toObject().value(QStringLiteral("active")).toBool();
+    FLicenseCheckedAt = QDateTime::currentDateTimeUtc();
+    if (FLicenseActive)
     {
       if (FLicenseNotified)
       {
@@ -575,6 +625,10 @@ void CloudSync::CheckLicense()
     else
     {
       NoteNoLicense();
+    }
+    if (Done)
+    {
+      Done(FLicenseActive);
     }
   });
 }
@@ -1240,6 +1294,12 @@ void CloudSync::ApplySettings(const QByteArray & Plaintext, qint64 Version, cons
     FinishSync(csError, Error);
     return;
   }
+  // Settings of a computer still using a WinSCP master password: the NixSCP
+  // password replaces it here as well
+  if (ConfigVault::Enabled() && FConfig->UseMasterPassword() && Security::IsMasterPasswordKnown())
+  {
+    FConfig->ClearMasterPassword();
+  }
   FSettingsBase = Version;
   // As this computer sees the settings now (the configuration may write some
   // values in its own form): no needless upload follows
@@ -1334,15 +1394,14 @@ void CloudSync::WriteSessionCache(const QByteArray & Payload) const
   if (File.open(QIODevice::WriteOnly))
   {
     File.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-    File.write(Payload);
+    File.write(ConfigVault::ForFile(Name, Payload));
     File.commit();
   }
 }
 
 QByteArray CloudSync::ReadSessionCache() const
 {
-  QFile File(SessionCacheFileName());
-  return File.open(QIODevice::ReadOnly) ? File.readAll() : QByteArray();
+  return ConfigVault::ReadFile(SessionCacheFileName());
 }
 
 void CloudSync::PushSession(const QByteArray & Payload)

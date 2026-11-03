@@ -134,6 +134,7 @@ private:
   QPushButton * EditCancelButton;
   QPushButton * EditButton;
   QToolButton * AdvancedButton;
+  QPushButton * AgentAccessButton;
   QGroupBox * NoteGroup;
   QPlainTextEdit * NoteMemo;
   QPushButton * LoginButton;
@@ -162,6 +163,7 @@ private:
   QAction * PreferencesAction;
   QAction * EditCancelAction;
   QAction * SessionAdvancedAction;
+  QAction * AgentAccessAction;
   QAction * PreferencesLoggingAction;
   QAction * CloneToNewSiteAction;
   QAction * PasteUrlAction;
@@ -267,6 +269,7 @@ private:
   void CloneToNewSite();
   void ResetNewSessionActionExecute();
   void SetDefaultSessionActionExecute();
+  void AgentAccessActionExecute();
   void SessionAdvancedActionExecute(bool Raw);
   void ImportSessionsActionExecute();
   void ImportActionExecute();

@@ -56,6 +56,9 @@ public:
   QString Email() const { return FEmail; }
   bool SignedIn() const { return FClient->HasRefreshToken(); }
   bool HasKey() const { return !FDek.isEmpty(); }
+  // Teams (core/TeamSync): the account and its data key
+  QString UserUuid() const { return FUser; }
+  QByteArray DataKey() const { return FDek; }
   CloudClient & Client() { return *FClient; }
   static QString DeviceName();
 
@@ -83,8 +86,12 @@ public:
   // /v1/me: license summary (active, plan, status...) for the UI
   void FetchAccount(const std::function<void(bool, const QJsonObject &)> & Done);
   // Looks the license up (also when nothing uploads, e.g. when the beta ends):
-  // LicenseInactive once per lapse
-  void CheckLicense();
+  // LicenseInactive once per lapse. Done (optional) gets whether it is active
+  // (false also when not signed in or the server cannot be reached).
+  void CheckLicense(const std::function<void(bool Active)> & Done = {});
+  // Result of the last license check
+  bool LicenseActive() const { return FLicenseActive; }
+  QDateTime LicenseCheckedAt() const { return FLicenseCheckedAt; }
 
   // ---- Key (sync password) ----
   // Whether the cloud already has encrypted data (then UnlockKey, else CreateKey)
@@ -182,11 +189,14 @@ private:
   QByteArray FPendingSession;
   bool FSessionBusy = false;
   bool FLicenseNotified = false;
+  bool FLicenseActive = false;
+  QDateTime FLicenseCheckedAt;
   QTimer * FDebounce;
   QTimer * FPeriodic;
 
   void LoadState();
   void SaveState();
+  void ProtectConfiguration();
   void SetState(TState State, const QString & Error = QString());
   bool Ready() const;
   void UpdateReadyState();

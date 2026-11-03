@@ -1,5 +1,7 @@
 // Port of WinSCP source/forms/NonVisual.{cpp,dfm}: the action list
 // (captions, 'Short|Long' hints, Commander shortcuts) and the menu builders
+#include "gui/AgentAccessDialog.h"
+#include "gui/TunnelsDialog.h"
 #include "gui/CloudSyncUi.h"
 #include "gui/CommanderActions.h"
 #include "gui/Icons.h"
@@ -406,6 +408,11 @@ void CommanderActions::CreateActions()
   // PuTTY: the terminal client of Preferences > Integration > Applications (OpenSSH in a terminal emulator by default)
   Add("PuttyAction", "Open in &PuTTY", "Open session in PuTTY|Execute the terminal client (PuTTY/terminal client path of Preferences) and open the current session with it", ssWindow, {K(Ctrl, Qt::Key_P)});
   Add("ClearCachesAction", "Clea&r Caches", "Clear directory listing and directory changes caches", ssWindow);
+  // NixSCP Agent Access (gui/AgentAccessDialog.h)
+  Add("TunnelsAction", "&Manage Tunnels...", "Forward ports through the SSH connection of your sites (start, stop, edit)", ssWindow);
+  Add("AgentAccessLogAction", "A&gent Access Log...", "Show which programs used your sites through Agent Access", ssWindow);
+  Add("AgentSessionsAction", "Agent &Sessions...", "Show the recorded agent sessions (commands and their output)", ssWindow);
+  Add("AgentAccessHelpAction", "Agent Access &Help", "How AI agents and other programs use your sites without their passwords", ssWindow);
   Add("CloseApplicationAction2", "&Quit", "Exit application|Close application (any opened sessions are closed)", ssWindow, {K(Qt::Key_F10)});
 
   // ---- View / Options
@@ -925,6 +932,10 @@ void CommanderWindow::ConnectActions()
   });
   A.On("PuttyAction", [this]() { OpenInPutty(); });
   A.On("ClearCachesAction", [this]() { ClearCaches(); });
+  A.On("TunnelsAction", [this]() { TunnelsDialog::Execute(this); });
+  A.On("AgentAccessLogAction", [this]() { AgentAccessDialog::ShowLog(this); });
+  A.On("AgentSessionsAction", [this]() { AgentAccessDialog::ShowSessions(this); });
+  A.On("AgentAccessHelpAction", [this]() { AgentAccessDialog::ShowHelp(this); });
   A.On("CloseApplicationAction2", [this]() { close(); });
 
   // ---- Options / View
@@ -1123,6 +1134,10 @@ void CommanderWindow::CreateMenus()
     CA::Item(QStringLiteral("ConsoleAction")),
     CA::Item(QStringLiteral("PuttyAction")),
     CA::Separator(),
+    CA::Item(QStringLiteral("AgentAccessLogAction")),
+    CA::Item(QStringLiteral("AgentSessionsAction")),
+    CA::Item(QStringLiteral("AgentAccessHelpAction")),
+    CA::Separator(),
     CA::Item(QStringLiteral("ClearCachesAction")),
     CA::Separator(),
     CA::Item(QStringLiteral("CloseApplicationAction2"))});
@@ -1197,7 +1212,10 @@ void CommanderWindow::CreateMenus()
   FRemoteMenu->setToolTipsVisible(true);
   Side(true, FRemoteMenu);
 
-  // Help: Contents (F1), Homepage, Forum, History, Donate, About
+  // NixSCP: saved SSH tunnels, started and stopped from here
+  TunnelsUi::SetupMenu(menuBar()->addMenu(QStringLiteral("T&unnels")), FA->Get(QStringLiteral("TunnelsAction")));
+
+  // Help: Contents (F1), Homepage, Report a Bug, Send Feedback, History, About
   QMenu * Help = menuBar()->addMenu(QStringLiteral("&Help"));
   HelpSystem::PopulateHelpMenu(Help, this);
 

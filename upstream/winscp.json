@@ -1,0 +1,9 @@
+{
+  "repository": "winscp/winscp",
+  "branch": "master",
+  "nixscp_repository": "codewizdevs/nixscp",
+  "baseline": "246bbd42342c4443bd9ff806e91dc0bca9f83869",
+  "baseline_date": "2026-10-24T22:37:59Z",
+  "baseline_release": "6.7",
+  "note": "NixSCP was ported from WinSCP master at this commit (6.7 plus 7 commits). Changes after it are reviewed through GitHub issues (tools/winscp_upstream.py, .github/workflows/winscp-upstream.yml)."
+}

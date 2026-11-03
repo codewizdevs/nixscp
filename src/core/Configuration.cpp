@@ -3,6 +3,7 @@
 // storage handling of core/HierarchicalStorage.cpp (TIniFileStorage::Flush:
 // re-read and merge before writing, so several instances can share the file)
 #include "core/Configuration.h"
+#include "core/ConfigVault.h"
 #include "core/CloudSettings.h"
 #include "core/FileMasks.h"
 #include "core/Security.h"
@@ -64,14 +65,11 @@ static void WriteSeconds(IniStorage & Storage, const QString & Name, int Seconds
   WriteDateTime(Storage, Name, Seconds / SecsPerDay);
 }
 
-static QByteArray ReadFileData(const QString & FileName)
+// The configuration file, decrypted when it is encrypted (NixSCP Pro);
+// Locked: encrypted and not unlocked (then empty and never to be overwritten)
+static QByteArray ReadFileData(const QString & FileName, bool * Locked = nullptr)
 {
-  QFile File(FileName);
-  if (!File.open(QIODevice::ReadOnly))
-  {
-    return QByteArray();
-  }
-  return File.readAll();
+  return ConfigVault::ReadFile(FileName, Locked);
 }
 
 static QString ExpandPath(const QString & Path)
@@ -656,6 +654,9 @@ void Configuration::LoadFrom(IniFile & File, bool Prompt)
         WindowState = QByteArray::fromHex(Storage.ReadStringRaw(QStringLiteral("WindowState"), QString()).toLatin1());
         PanelSplitter = QByteArray::fromHex(Storage.ReadStringRaw(QStringLiteral("PanelSplitter"), QString()).toLatin1());
         LastLocalDirectory = Storage.ReadString(QStringLiteral("LastLocalDirectory"), LastLocalDirectory);
+        CheckForUpdates = Storage.ReadBool(QStringLiteral("CheckForUpdates"), CheckForUpdates);
+        UpdateLastCheck = QDateTime::fromString(Storage.ReadString(QStringLiteral("UpdateLastCheck"), QString()), Qt::ISODate);
+        UpdateSkipVersion = Storage.ReadString(QStringLiteral("UpdateSkipVersion"), UpdateSkipVersion);
         Storage.CloseSubKey();
       }
       Storage.CloseSubKey();
@@ -847,6 +848,9 @@ void Configuration::SaveTo(IniFile & File)
         Storage.WriteStringRaw(QStringLiteral("WindowState"), QString::fromLatin1(WindowState.toHex()));
         Storage.WriteStringRaw(QStringLiteral("PanelSplitter"), QString::fromLatin1(PanelSplitter.toHex()));
         Storage.WriteString(QStringLiteral("LastLocalDirectory"), LastLocalDirectory);
+        Storage.WriteBool(QStringLiteral("CheckForUpdates"), CheckForUpdates);
+        Storage.WriteString(QStringLiteral("UpdateLastCheck"), UpdateLastCheck.isValid() ? UpdateLastCheck.toUTC().toString(Qt::ISODate) : QString());
+        Storage.WriteString(QStringLiteral("UpdateSkipVersion"), UpdateSkipVersion);
         Storage.CloseSubKey();
       }
       Storage.CloseSubKey();
@@ -945,15 +949,27 @@ void Configuration::Load()
 {
   SessionLog::SetConfigurationLoaded();
   QByteArray DiskData;
+  FLocked = false;
   if (!FNulStorage)
   {
-    DiskData = ReadFileData(FIniFileName);
+    DiskData = ReadFileData(FIniFileName, &FLocked);
   }
   LoadFromDisk(DiskData, QList<IniFile::Change>(), true);
   FLoaded = true;
   StartWatching();
   emit StoredSessionsChanged();
   EmitChangedIfNeeded(true);
+}
+
+bool Configuration::Rewrite()
+{
+  if (FNulStorage)
+  {
+    return true;
+  }
+  SaveTo(FIni);
+  bool External = false;
+  return WriteDisk(QList<IniFile::Change>(), false, IniFile(), External);
 }
 
 bool Configuration::WriteDisk(const QList<IniFile::Change> & Changes, bool Replace, const IniFile & Replacement, bool & External)
@@ -966,7 +982,18 @@ bool Configuration::WriteDisk(const QList<IniFile::Change> & Changes, bool Repla
   Lock.setStaleLockTime(30 * 1000);
   bool Locked = Lock.tryLock(10 * 1000);
 
-  QByteArray DiskData = ReadFileData(FIniFileName);
+  bool Encrypted = false;
+  QByteArray DiskData = ReadFileData(FIniFileName, &Encrypted);
+  if (Encrypted)
+  {
+    // encrypted with a key this process does not have: never overwrite it
+    if (Lock.isLocked())
+    {
+      Lock.unlock();
+    }
+    FLastSaveError = QStringLiteral("The configuration file \"%1\" is encrypted and locked.").arg(FIniFileName);
+    return false;
+  }
   External = (DiskData != FDiskData);
   IniFile Disk;
   if (Replace)
@@ -1086,6 +1113,8 @@ void Configuration::EmitChangedIfNeeded(bool Force)
   Current.WindowState.clear();
   Current.PanelSplitter.clear();
   Current.LastLocalDirectory.clear();
+  // nor is the time of the last new version check
+  Current.UpdateLastCheck = QDateTime();
   if (Force || !FChangedValid || !(Current == FChangedData) || !(FCopyParam == FChangedCopyParam))
   {
     FChangedData = Current;

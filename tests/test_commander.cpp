@@ -225,7 +225,7 @@ static void TestStructure(CommanderWindow & Window)
   // ScpCommander.dfm MenuToolbar; a local browser tab says Left/Right.
   // NixSCP Pro adds its menu after Help ("Cloud Sync" when signed out).
   QStringList Titles = MenuTitles(Bar);
-  CHECK_MSG(Titles == QStringList({"&Left", "&Mark", "&Files", "&Commands", "&Tabs", "&Options", "&Right", "&Help", "Cloud Sync"}),
+  CHECK_MSG(Titles == QStringList({"&Left", "&Mark", "&Files", "&Commands", "&Tabs", "&Options", "&Right", "T&unnels", "&Help", "Cloud Sync"}),
     Titles.join(QStringLiteral("|")));
   QStringList Files = MenuItems(TopMenu(Bar, QStringLiteral("&Files")));
   CHECK_MSG(StartsWith(Files, QStringList({"&New", "-", "&Open", "&Edit", "Edit &Link...", "-"})), Files.join(QStringLiteral("|")));
@@ -236,7 +236,7 @@ static void TestStructure(CommanderWindow & Window)
   QStringList Commands = MenuItems(TopMenu(Bar, QStringLiteral("&Commands")));
   CHECK_MSG(Commands == QStringList({"&Compare Directories", "&Keep Remote Directory up to Date...", "&Synchronize...",
     "Synchronize &Browsing", "&Find Files...", "Q&ueue", "Static &Custom Commands", "-", "Open &Terminal", "Open in &PuTTY",
-    "-", "Clea&r Caches", "-", "&Quit"}), Commands.join(QStringLiteral("|")));
+    "-", "A&gent Access Log...", "Agent &Sessions...", "Agent Access &Help", "-", "Clea&r Caches", "-", "&Quit"}), Commands.join(QStringLiteral("|")));
   QStringList Tabs = MenuItems(TopMenu(Bar, QStringLiteral("&Tabs")));
   CHECK_MSG(StartsWith(Tabs, QStringList({"&New Tab", "&Close Tab", "Du&plicate Tab", "&Rename Tab", "-", "C&olor", "-",
     "&Disconnect Session", "&Reconnect Session", "&Save Session as Site...", "-", "Server/Protocol &Information",

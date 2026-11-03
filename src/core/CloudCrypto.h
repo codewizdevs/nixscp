@@ -39,6 +39,10 @@ namespace CloudCrypto
     QByteArray DekPassword;  // nonce || AES-256-GCM(KEK, DEK) || tag
     QByteArray DekRecovery;  // same, wrapped with the recovery key; empty = no recovery key
     QString Device;          // informational
+    // Team snapshots (slot "team", nixscp-cloud docs/TEAMS.md): User is the team
+    // uuid, the key is the team key (no kdf/dek_pw/dek_rec), KeyVersion its version
+    qint64 KeyVersion = 0;
+    bool IsTeam() const { return Slot == QStringLiteral("team"); }
   };
 
   QByteArray RandomBytes(int Length);

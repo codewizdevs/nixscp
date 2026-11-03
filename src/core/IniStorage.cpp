@@ -1,5 +1,6 @@
 // Port of WinSCP source/core/HierarchicalStorage.cpp (INI part)
 #include "core/IniStorage.h"
+#include "core/ConfigVault.h"
 
 #include <QFile>
 #include <QFileInfo>
@@ -125,7 +126,13 @@ bool IniFile::Load(const QString & FileName)
   {
     return false;
   }
-  return LoadFromData(F.readAll());
+  // an encrypted configuration (NixSCP Pro) is readable once unlocked
+  QByteArray Plaintext;
+  if (!ConfigVault::Open(F.readAll(), Plaintext))
+  {
+    return false;
+  }
+  return LoadFromData(Plaintext);
 }
 
 bool IniFile::LoadFromData(const QByteArray & AData)
@@ -382,7 +389,7 @@ bool IniFile::Save(const QString & FileName) const
       (QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ReadUser | QFileDevice::WriteUser);
     F.setPermissions(Perms | QFileDevice::ReadOwner | QFileDevice::WriteOwner);
   }
-  F.write(SaveToData());
+  F.write(ConfigVault::ForFile(FileName, SaveToData()));
   return F.commit();
 }
 

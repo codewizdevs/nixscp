@@ -19,8 +19,12 @@ namespace HelpSystem
 
 QUrl HomepageUrl()
 {
-  // NixSCP homepage (author: Dragan Plavšić, CodeWiz)
-  return QUrl(QStringLiteral("https://codewizdev.com/"));
+  return QUrl(QStringLiteral("https://nixscp.com/"));
+}
+
+QUrl IssuesUrl()
+{
+  return QUrl(QStringLiteral("https://github.com/codewizdevs/nixscp/issues"));
 }
 
 QUrl WinSCPHomepageUrl()
@@ -35,17 +39,13 @@ QUrl ContactUrl()
 
 QUrl HistoryUrl()
 {
-  return QUrl(QStringLiteral("https://winscp.net/eng/docs/history"));
+  // NixSCP releases (WinSCP's history is about WinSCP)
+  return QUrl(QStringLiteral("https://github.com/codewizdevs/nixscp/releases"));
 }
 
 QUrl ForumUrl()
 {
   return QUrl(QStringLiteral("https://winscp.net/forum/"));
-}
-
-QUrl DonateUrl()
-{
-  return QUrl(QStringLiteral("https://winscp.net/eng/donate.php"));
 }
 
 QUrl DocumentationUrl()
@@ -64,7 +64,9 @@ QUrl KeywordUrl(const QString & Keyword)
     Fragment = Page.mid(P + 1);
     Page = Page.left(P);
   }
-  QUrl Url(DocumentationUrl().toString() + Page);
+  // NixSCP's own pages (features WinSCP does not have): "nixscp:<path>" on nixscp.com
+  QUrl Url(Page.startsWith(QStringLiteral("nixscp:")) ?
+    QStringLiteral("https://nixscp.com/") + Page.mid(7) : DocumentationUrl().toString() + Page);
   if (!Fragment.isEmpty())
   {
     Url.setFragment(Fragment);
@@ -187,7 +189,8 @@ void PopulateHelpMenu(QMenu * Menu, QWidget * Window)
 {
   QAction * Contents = Menu->addAction(QStringLiteral("&Contents"));
   Contents->setObjectName(QStringLiteral("TableOfContentsAction"));
-  Contents->setStatusTip(QStringLiteral("Opens web browser and points it to documentation table of contents"));
+  // NixSCP follows WinSCP's interface one to one: WinSCP's documentation applies
+  Contents->setStatusTip(QStringLiteral("Opens the WinSCP documentation (NixSCP follows WinSCP's interface)"));
   Contents->setShortcut(QKeySequence(Qt::Key_F1));
   Contents->setShortcutContext(Qt::WindowShortcut);
   QObject::connect(Contents, &QAction::triggered, Menu, []() { ShowTableOfContents(); });
@@ -200,25 +203,23 @@ void PopulateHelpMenu(QMenu * Menu, QWidget * Window)
 
   QAction * Homepage = Menu->addAction(QStringLiteral("Product &Homepage"));
   Homepage->setObjectName(QStringLiteral("HomepageAction"));
-  Homepage->setStatusTip(QStringLiteral("Opens web browser and points it to project homepage"));
+  Homepage->setStatusTip(QStringLiteral("Opens web browser and points it to nixscp.com"));
   QObject::connect(Homepage, &QAction::triggered, Menu, []() { OpenUrl(HomepageUrl()); });
 
   // NixSCP: feedback and bug reports go to the author instead of WinSCP's forum
-  QAction * Forum = Menu->addAction(QStringLiteral("&Send Feedback / Report Bug..."));
+  QAction * Issues = Menu->addAction(QStringLiteral("&Report a Bug / Request a Feature"));
+  Issues->setObjectName(QStringLiteral("IssuesPageAction"));
+  Issues->setStatusTip(QStringLiteral("Opens the NixSCP issue tracker on GitHub"));
+  QObject::connect(Issues, &QAction::triggered, Menu, []() { OpenUrl(IssuesUrl()); });
+  QAction * Forum = Menu->addAction(QStringLiteral("&Send Feedback..."));
   Forum->setObjectName(QStringLiteral("ForumPageAction"));
   Forum->setStatusTip(QStringLiteral("Opens your e-mail client to write to the NixSCP author"));
   QObject::connect(Forum, &QAction::triggered, Menu, []() { OpenUrl(ContactUrl()); });
 
   QAction * History = Menu->addAction(QStringLiteral("&Version History"));
   History->setObjectName(QStringLiteral("HistoryPageAction"));
-  History->setStatusTip(QStringLiteral("Opens web browser and points it to application history page"));
+  History->setStatusTip(QStringLiteral("Opens web browser and points it to the NixSCP releases"));
   QObject::connect(History, &QAction::triggered, Menu, []() { OpenUrl(HistoryUrl()); });
-  Menu->addSeparator();
-
-  QAction * Donate = Menu->addAction(QStringLiteral("&Donate"));
-  Donate->setObjectName(QStringLiteral("DonatePageAction"));
-  Donate->setStatusTip(QStringLiteral("Opens web browser and points it to project donation page"));
-  QObject::connect(Donate, &QAction::triggered, Menu, []() { OpenUrl(DonateUrl()); });
   Menu->addSeparator();
 
   QAction * About = Menu->addAction(QStringLiteral("&About..."));

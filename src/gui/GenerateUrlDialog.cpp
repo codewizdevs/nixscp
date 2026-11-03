@@ -168,6 +168,13 @@ void ResetNonCoreData(SessionData & Data, const SessionData & FactoryDefaults)
   Data.Color = FactoryDefaults.Color;
   Data.UpdateDirectories = FactoryDefaults.UpdateDirectories;
   Data.Note = FactoryDefaults.Note;
+  Data.AgentAccess = FactoryDefaults.AgentAccess;
+  Data.AgentPermissions = FactoryDefaults.AgentPermissions;
+  Data.AgentName = FactoryDefaults.AgentName;
+  Data.AgentAllow = FactoryDefaults.AgentAllow;
+  Data.AgentDeny = FactoryDefaults.AgentDeny;
+  Data.AgentRecord = FactoryDefaults.AgentRecord;
+  Data.PortForwards = FactoryDefaults.PortForwards;
 }
 
 bool HttpForWebDAV()

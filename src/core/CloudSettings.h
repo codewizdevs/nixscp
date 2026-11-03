@@ -16,6 +16,8 @@ namespace CloudSettings
   // (CloudSync::ExportKey). Outside WinSCP's "Configuration" and "Sessions"
   // trees, values in hex: WinSCP ignores it. Never kept in nixscp.ini, never synced.
   inline const QString KeySection = QStringLiteral("NixSCP\\CloudSync");
+  // Top folder of a team's sites: "Team: <team name>/<site>" (core/TeamSync)
+  inline const QString TeamFolderPrefix = QStringLiteral("Team: ");
 
   // "Sessions\<munged workspace>/" for the workspace that AutoSaveWorkspace
   // rewrites on every exit; empty when nothing is auto-saved

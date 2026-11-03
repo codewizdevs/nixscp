@@ -2,6 +2,7 @@
 // forms/NonVisual.cpp (command handlers) and windows/TerminalManager.cpp
 // (tabs, local browser tabs). Actions, menus, toolbars and popups are built
 // in gui/CommanderActions.cpp.
+#include "gui/TunnelsDialog.h"
 #include "gui/CommanderWindow.h"
 #include "gui/Translator.h"
 #include "gui/HelpSystem.h"
@@ -42,6 +43,7 @@
 #include "core/Terminal.h"
 
 #include <QAction>
+#include <QToolButton>
 #include <QApplication>
 #include <QClipboard>
 #include <QCloseEvent>
@@ -1196,6 +1198,7 @@ void CommanderWindow::CreateStatusBar()
   StatusSecureLabel->setObjectName(QStringLiteral("SecurityStatusPanel"));
   StatusProtocolLabel->setObjectName(QStringLiteral("ProtocolStatusPanel"));
   StatusDurationLabel->setObjectName(QStringLiteral("DurationStatusPanel"));
+  statusBar()->addPermanentWidget(TunnelsUi::CreateIndicator(this));
   statusBar()->addPermanentWidget(StatusSecureLabel);
   statusBar()->addPermanentWidget(StatusProtocolLabel);
   statusBar()->addPermanentWidget(StatusDurationLabel);

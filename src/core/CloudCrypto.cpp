@@ -347,10 +347,16 @@ static QByteArray HeaderJson(const SnapshotHeader & Header)
     {QStringLiteral("user"), Header.User},
     {QStringLiteral("version"), Header.Version},
     {QStringLiteral("saved_at"), Header.SavedAt.toUTC().toString(Qt::ISODateWithMs)},
-    {QStringLiteral("kdf"), Kdf},
-    {QStringLiteral("dek_pw"), QString::fromLatin1(Header.DekPassword.toBase64())},
     {QStringLiteral("device"), Header.Device},
   };
+  if (Header.IsTeam())
+  {
+    // encrypted with the team key: no password wraps
+    Json.insert(QStringLiteral("key_version"), Header.KeyVersion);
+    return QJsonDocument(Json).toJson(QJsonDocument::Compact);
+  }
+  Json.insert(QStringLiteral("kdf"), Kdf);
+  Json.insert(QStringLiteral("dek_pw"), QString::fromLatin1(Header.DekPassword.toBase64()));
   if (!Header.DekRecovery.isEmpty())
   {
     Json.insert(QStringLiteral("dek_rec"), QString::fromLatin1(Header.DekRecovery.toBase64()));
@@ -398,7 +404,8 @@ bool ReadHeader(const QByteArray & Snapshot, SnapshotHeader & Header, QString * 
   }
   QJsonObject Obj = QJsonDocument::fromJson(Json).object();
   QJsonObject Kdf = Obj.value(QStringLiteral("kdf")).toObject();
-  if ((Obj.value(QStringLiteral("fmt")).toInt() != 1) || (Kdf.value(QStringLiteral("alg")).toString() != QStringLiteral("argon2id")))
+  bool Team = (Obj.value(QStringLiteral("slot")).toString() == QStringLiteral("team"));
+  if ((Obj.value(QStringLiteral("fmt")).toInt() != 1) || (!Team && (Kdf.value(QStringLiteral("alg")).toString() != QStringLiteral("argon2id"))))
   {
     SetError(Error, QStringLiteral("The sync snapshot was made by a newer version of NixSCP."));
     return false;
@@ -416,6 +423,7 @@ bool ReadHeader(const QByteArray & Snapshot, SnapshotHeader & Header, QString * 
   Header.DekPassword = QByteArray::fromBase64(Obj.value(QStringLiteral("dek_pw")).toString().toLatin1());
   Header.DekRecovery = QByteArray::fromBase64(Obj.value(QStringLiteral("dek_rec")).toString().toLatin1());
   Header.Device = Obj.value(QStringLiteral("device")).toString();
+  Header.KeyVersion = Obj.value(QStringLiteral("key_version")).toInteger();
   return true;
 }
 

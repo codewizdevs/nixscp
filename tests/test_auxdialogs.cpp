@@ -233,7 +233,8 @@ static void TestHelp()
     Names << (Action->isSeparator() ? QStringLiteral("-") : Action->objectName());
     Texts << Action->text();
   }
-  CHECK_EQ(Names.join(QLatin1Char(',')), QStringLiteral("TableOfContentsAction,-,HomepageAction,ForumPageAction,HistoryPageAction,-,DonatePageAction,-,AboutAction"));
+  CHECK_EQ(Names.join(QLatin1Char(',')), QStringLiteral("TableOfContentsAction,-,HomepageAction,IssuesPageAction,ForumPageAction,HistoryPageAction,-,AboutAction"));
+  CHECK(!Texts.join(QLatin1Char(',')).contains(QStringLiteral("Donate")));
   QAction * Contents = Menu->actions().value(0);
   CHECK_EQ(Contents->text(), QStringLiteral("&Contents"));
   CHECK(Contents->shortcut() == QKeySequence(Qt::Key_F1));
@@ -242,22 +243,23 @@ static void TestHelp()
   Menu->actions().value(2)->trigger();
   Menu->actions().value(3)->trigger();
   Menu->actions().value(4)->trigger();
-  Menu->actions().value(6)->trigger();
-  // NixSCP: Homepage is the author's site; "Send Feedback / Report Bug..." opens a
-  // mailto: link (handled by the mail client). Every URL goes through the
+  Menu->actions().value(5)->trigger();
+  // NixSCP: Homepage is nixscp.com, bugs go to GitHub, "Send Feedback..." opens a
+  // mailto: link (handled by the mail client), the history is the NixSCP releases.
+  // The documentation stays WinSCP's (same interface). Every URL goes through the
   // SetOpenUrlHandler test hook (not QDesktopServices).
   CHECK_EQ(Catcher.Urls.size(), 0);
   CHECK_EQ(HelpUrls.size(), 5);
   CHECK_EQ(HelpUrls.value(0).toString(), QStringLiteral("https://winscp.net/eng/docs/"));
-  CHECK_EQ(HelpUrls.value(1).toString(), QStringLiteral("https://codewizdev.com/"));
-  CHECK_EQ(HelpUrls.value(2).scheme(), QStringLiteral("mailto"));
-  CHECK_EQ(HelpUrls.value(3).toString(), QStringLiteral("https://winscp.net/eng/docs/history"));
-  CHECK_EQ(HelpUrls.value(4).toString(), QStringLiteral("https://winscp.net/eng/donate.php"));
+  CHECK_EQ(HelpUrls.value(1).toString(), QStringLiteral("https://nixscp.com/"));
+  CHECK_EQ(HelpUrls.value(2).toString(), QStringLiteral("https://github.com/codewizdevs/nixscp/issues"));
+  CHECK_EQ(HelpUrls.value(3).scheme(), QStringLiteral("mailto"));
+  CHECK_EQ(HelpUrls.value(4).toString(), QStringLiteral("https://github.com/codewizdevs/nixscp/releases"));
   HelpUrls.clear();
   CHECK_EQ(HelpSystem::ContactUrl().scheme(), QStringLiteral("mailto"));
   // About... opens the About dialog
   OnModal(IsA<AboutDialog>(), [](QWidget * W) { W->close(); });
-  Menu->actions().value(8)->trigger();
+  Menu->actions().value(7)->trigger();
 
   // dialog Help buttons and F1
   QDialog Dialog;

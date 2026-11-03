@@ -40,6 +40,11 @@ bool IsDeviceLocalSection(const QString & Section, const QString & AutoWorkspace
   {
     return true;
   }
+  // Team sites ("Team: <name>/..."): synced with the team (core/TeamSync), not personally
+  if (Section.startsWith(QStringLiteral("Sessions\\") + MungeStr(TeamFolderPrefix, false), Qt::CaseInsensitive))
+  {
+    return true;
+  }
   return !AutoWorkspacePrefix.isEmpty() && Section.startsWith(AutoWorkspacePrefix, Qt::CaseInsensitive);
 }
 
@@ -49,7 +54,7 @@ bool IsDeviceLocalKey(const QString & Key)
   {
     QStringLiteral("WindowGeometry"), QStringLiteral("WindowState"), QStringLiteral("WindowSize"),
     QStringLiteral("PanelSplitter"), QStringLiteral("Height"), QStringLiteral("HeightPixelsPerInch"),
-    QStringLiteral("LastLocalDirectory"), QStringLiteral("LastStoredSession"),
+    QStringLiteral("LastLocalDirectory"), QStringLiteral("LastStoredSession"), QStringLiteral("UpdateLastCheck"),
     QStringLiteral("OpenedStoredSessionFolders"),
   };
   return Keys.contains(Key, Qt::CaseInsensitive);

@@ -1,5 +1,10 @@
 #include "gui/CloudSyncUi.h"
+#include "gui/TeamsDialog.h"
+#include "gui/UnlockDialog.h"
 
+#include "core/TeamSync.h"
+#include "core/ConfigVault.h"
+#include "core/AgentAccess.h"
 #include "core/CloudSync.h"
 #include "core/Configuration.h"
 #include "core/IniStorage.h"
@@ -30,6 +35,9 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTimer>
+#include <QSaveFile>
+#include <QTextCursor>
+#include <QFontDatabase>
 #include <QToolButton>
 #include <QUrl>
 #include <QUrlQuery>
@@ -44,6 +52,8 @@ static const QString CloudWorkspace = QStringLiteral("NixSCP Cloud Session");
 // Open tabs are uploaded at most once a minute while they change
 static constexpr int SessionIntervalMs = 60 * 1000;
 static constexpr int LicenseFirstCheckMs = 30 * 1000;
+static constexpr int TeamsFirstSyncMs = 20 * 1000;
+static constexpr int TeamsIntervalMs = 3 * 60 * 1000;
 static constexpr int LicenseCheckIntervalMs = 24 * 60 * 60 * 1000;
 // Focusing the window checks the cloud when the last check is older
 static constexpr int FocusCheckSeconds = 60;
@@ -310,7 +320,7 @@ private:
   QLabel * FStatus;
   QCheckBox * FSyncSessions;
   QCheckBox * FRestoreSessions;
-  QCheckBox * FRememberKey;
+  QPushButton * FRemoveEncryption;
   int FShownPage = -1;
 
   static QLabel * Text(const QString & Html, QWidget * Parent)
@@ -341,7 +351,29 @@ private:
     Row->addWidget(Create);
     Row->addStretch();
     Layout->addLayout(Row);
+    // Signed out, the configuration stays encrypted with the NixSCP password until removed here
+    FRemoveEncryption = new QPushButton(QStringLiteral("Remove encryption from this computer..."), Page);
+    auto * RemoveRow = new QHBoxLayout();
+    RemoveRow->addWidget(FRemoveEncryption);
+    RemoveRow->addStretch();
+    Layout->addLayout(RemoveRow);
     Layout->addStretch();
+    connect(FRemoveEncryption, &QPushButton::clicked, this, [this]()
+    {
+      if (QMessageBox::question(this, QStringLiteral("Remove encryption"),
+            QStringLiteral("Store the configuration on this computer unencrypted?\n\nNixSCP will no longer ask for your NixSCP "
+              "password at startup, and saved site passwords are then only obfuscated, as in WinSCP. Signing in to NixSCP Pro "
+              "encrypts it again.")) != QMessageBox::Yes)
+      {
+        return;
+      }
+      ConfigVault::Disable();
+      if (!Configuration::Instance().Rewrite())
+      {
+        QMessageBox::warning(this, QStringLiteral("Remove encryption"), Configuration::Instance().LastSaveError());
+      }
+      Update();
+    });
     connect(FSignInButton, &QPushButton::clicked, this, [this]() { SignIn(); });
     connect(Create, &QPushButton::clicked, this, []()
     {
@@ -420,17 +452,16 @@ private:
     auto * OptionsLayout = new QVBoxLayout(OptionsBox);
     FSyncSessions = new QCheckBox(QStringLiteral("Sync open sessions (tabs)"), OptionsBox);
     FRestoreSessions = new QCheckBox(QStringLiteral("Reopen the last open sessions at startup"), OptionsBox);
-    FRememberKey = new QCheckBox(QStringLiteral("Remember the sync password"), OptionsBox);
-    FRememberKey->setToolTip(QStringLiteral(
-      "The data key is stored next to your configuration file, readable by you only, like your stored site passwords.\n"
-      "When off, NixSCP asks for the sync password after every start."));
+    auto * Protection = Text(QStringLiteral(
+      "Your sync password is your NixSCP password: it also encrypts the configuration on this computer "
+      "(sites, passwords and preferences), and NixSCP asks for it when it starts."), OptionsBox);
     OptionsLayout->addWidget(FSyncSessions);
     OptionsLayout->addWidget(FRestoreSessions);
-    OptionsLayout->addWidget(FRememberKey);
+    OptionsLayout->addWidget(Protection);
     Layout->addWidget(OptionsBox);
     auto * Row = new QHBoxLayout();
     auto * SyncNow = new QPushButton(QStringLiteral("Sync now"), Page);
-    auto * ChangePassword = new QPushButton(QStringLiteral("Change sync password..."), Page);
+    auto * ChangePassword = new QPushButton(QStringLiteral("Change NixSCP password..."), Page);
     auto * Manage = new QPushButton(QStringLiteral("Manage account"), Page);
     auto * SignOut = new QPushButton(QStringLiteral("Sign out"), Page);
     Row->addWidget(SyncNow);
@@ -443,7 +474,6 @@ private:
     CloudSync & Sync = CloudSync::Instance();
     connect(FSyncSessions, &QCheckBox::toggled, this, [&Sync](bool On) { Sync.SetSyncSessions(On); });
     connect(FRestoreSessions, &QCheckBox::toggled, this, [&Sync](bool On) { Sync.SetRestoreSessions(On); });
-    connect(FRememberKey, &QCheckBox::toggled, this, [&Sync](bool On) { Sync.SetRememberKey(On); });
     connect(SyncNow, &QPushButton::clicked, this, [&Sync]() { Sync.SyncNow(); });
     connect(ChangePassword, &QPushButton::clicked, this, [this]() { DoChangePassword(); });
     connect(Manage, &QPushButton::clicked, this, [&Sync]()
@@ -512,6 +542,7 @@ private:
     {
       case 0:
         FSignInButton->setEnabled((Sync.State() != CloudSync::csDisabled) && FSignIn.isNull());
+        FRemoveEncryption->setVisible(ConfigVault::Enabled());
         FSignedOutStatus->setText((Sync.State() == CloudSync::csDisabled) ? Sync.StatusText()
           : (FSignIn ? QStringLiteral("<i>Waiting for you to confirm in the browser...</i>")
                      : (Sync.LastError().isEmpty() ? QString() : Sync.LastError().toHtmlEscaped())));
@@ -522,10 +553,9 @@ private:
       default:
         FAccount->setText(QStringLiteral("Signed in as <b>%1</b>").arg(Sync.Email().toHtmlEscaped()));
         FStatus->setText(Sync.StatusText().toHtmlEscaped());
-        QSignalBlocker B1(FSyncSessions), B2(FRestoreSessions), B3(FRememberKey);
+        QSignalBlocker B1(FSyncSessions), B2(FRestoreSessions);
         FSyncSessions->setChecked(Sync.SyncSessions());
         FRestoreSessions->setChecked(Sync.RestoreSessions());
-        FRememberKey->setChecked(Sync.RememberKey());
         break;
     }
   }
@@ -820,6 +850,8 @@ static void FillMenu(QMenu * Menu, QWidget * Window)
     Now->setEnabled(Sync.State() != CloudSync::csSyncing);
   }
   Menu->addAction(QStringLiteral("Cloud Sync Settings..."), Window, [Window]() { ShowDialog(Window); });
+  Menu->addAction(QStringLiteral("Teams..."), Window, [Window]() { TeamsDialog::Execute(Window); });
+  Menu->addSeparator();
   Menu->addAction(QStringLiteral("Manage Account..."), Window, [Open]() { Open(QStringLiteral("/account")); });
   Menu->addSeparator();
   Menu->addAction(QStringLiteral("Sign Out"), Window, [Window, &Sync]()
@@ -849,6 +881,46 @@ bool ExportConfiguration(QWidget * Parent, const QString & FileName, QString * E
 {
   IniFile Out = Configuration::Instance().ExportData();
   CloudSync & Sync = CloudSync::Instance();
+  if (ConfigVault::Enabled())
+  {
+    // NixSCP Pro: an encrypted backup, or a plain file WinSCP can read
+    QMessageBox Box(QMessageBox::Question, QStringLiteral("Export Configuration"),
+      QStringLiteral("How do you want to export your configuration?"), QMessageBox::NoButton, Parent);
+    Box.setInformativeText(QStringLiteral(
+      "Encrypted backup: opens in NixSCP on any computer with your NixSCP password or recovery key. "
+      "Safe to keep anywhere, but WinSCP cannot read it.\n\n"
+      "Plain file: a WinSCP-compatible configuration that WinSCP and NixSCP can import. Your site passwords "
+      "are only obfuscated in it, so anyone who gets the file can read them."));
+    QPushButton * Encrypted = Box.addButton(QStringLiteral("Encrypted backup"), QMessageBox::AcceptRole);
+    QPushButton * Plain = Box.addButton(QStringLiteral("Plain file for WinSCP"), QMessageBox::AcceptRole);
+    QPushButton * Cancel = Box.addButton(QMessageBox::Cancel);
+    Box.setDefaultButton(Encrypted);
+    Box.setEscapeButton(Cancel);
+    Box.exec();
+    if (Box.clickedButton() == Encrypted)
+    {
+      QSaveFile File(FileName);
+      if (!File.open(QIODevice::WriteOnly) || (File.write(ConfigVault::SealExport(Out.SaveToData())) < 0) || !File.commit())
+      {
+        if (Error != nullptr)
+        {
+          *Error = QStringLiteral("Error writing to file \"%1\".").arg(FileName);
+        }
+        return false;
+      }
+      QFile::setPermissions(FileName, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+      return true;
+    }
+    if (Box.clickedButton() != Plain)
+    {
+      // cancelled: nothing written, no error
+      if (Error != nullptr)
+      {
+        Error->clear();
+      }
+      return false;
+    }
+  }
   if (Sync.HasKey())
   {
     QMessageBox Box(QMessageBox::Question, QStringLiteral("Export Configuration"),
@@ -884,7 +956,23 @@ bool ExportConfiguration(QWidget * Parent, const QString & FileName, QString * E
 bool ImportConfiguration(QWidget * Parent, const QString & FileName, QString * Error)
 {
   IniFile In;
-  if (!QFileInfo(FileName).isFile() || !In.Load(FileName))
+  QFile Raw(FileName);
+  QByteArray Data = Raw.open(QIODevice::ReadOnly) ? Raw.readAll() : QByteArray();
+  if (ConfigVault::IsSealed(Data))
+  {
+    // an encrypted NixSCP backup: this computer's key, or its own password
+    QByteArray Plaintext;
+    if (!UnlockDialog::OpenEncryptedBackup(Parent, FileName, Data, Plaintext))
+    {
+      if (Error != nullptr)
+      {
+        Error->clear();
+      }
+      return false;
+    }
+    In.LoadFromData(Plaintext);
+  }
+  else if (!QFileInfo(FileName).isFile() || !In.Load(FileName))
   {
     if (Error != nullptr)
     {
@@ -934,6 +1022,30 @@ public:
     FIndicator->setToolButtonStyle(Qt::ToolButtonTextOnly);
     Window->statusBar()->addPermanentWidget(FIndicator);
     connect(FIndicator, &QToolButton::clicked, Window, [Window]() { ShowDialog(Window); });
+    // NixSCP Teams: shortly after the start, then every few minutes
+    FTeamsTimer = new QTimer(this);
+    FTeamsTimer->setInterval(TeamsIntervalMs);
+    auto SyncTeams = []()
+    {
+      if (TeamSync::Instance().Available())
+      {
+        TeamSync::Instance().SyncAll();
+      }
+    };
+    connect(FTeamsTimer, &QTimer::timeout, this, SyncTeams);
+    FTeamsTimer->start();
+    QTimer::singleShot(TeamsFirstSyncMs, this, SyncTeams);
+    connect(&TeamSync::Instance(), &TeamSync::Notice, this, [this](const QString & Message)
+    {
+      if (FClosing)
+      {
+        return;
+      }
+      auto * Box = new QMessageBox(QMessageBox::Information, QStringLiteral("NixSCP Teams"), Message, QMessageBox::Ok, FWindow);
+      Box->setAttribute(Qt::WA_DeleteOnClose);
+      Box->setWindowModality(Qt::NonModal);
+      Box->show();
+    });
     // the license, also without uploads (e.g. when the beta ends): soon after
     // the start, then daily
     FLicenseTimer = new QTimer(this);
@@ -1003,6 +1115,7 @@ private:
   QToolButton * FIndicator;
   QTimer * FSessionTimer;
   QTimer * FLicenseTimer;
+  QTimer * FTeamsTimer;
   QByteArray FLastSessionPayload;
   bool FClosing = false;
 

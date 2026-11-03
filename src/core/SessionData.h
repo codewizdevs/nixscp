@@ -68,6 +68,14 @@ public:
   QString NameOverride;             // NameOverride: name of an ad-hoc session saved in a workspace
   int Color;                        // Color (BGR TColor, 0 = none)
   QString Note;                     // Note ("Note" page)
+  // NixSCP Agent Access (core/AgentAccess.h): AgentAccess::TMode, TPermission bits
+  int AgentAccess;                  // AgentAccess
+  int AgentPermissions;             // AgentPermissions
+  QString AgentName;                // AgentName: the name agents use (empty: the site name)
+  QString AgentAllow;               // AgentAllow: allowed command patterns, one per line (empty: all)
+  QString AgentDeny;                // AgentDeny: denied command patterns, one per line
+  bool AgentRecord;                 // AgentRecord: keep transcripts of agent requests
+  QString PortForwards;             // PortForwards: saved local port forwards ("name|local port|host|port" per line)
   bool Special;                     // Special (read only; never written, preserved raw): cannot be deleted/renamed
 
   // ---- Environment page ----

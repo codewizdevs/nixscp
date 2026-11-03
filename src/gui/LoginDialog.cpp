@@ -1,6 +1,7 @@
 // Port of WinSCP source/forms/Login.cpp, forms/ImportSessions.cpp,
 // forms/Cleanup.cpp and TSaveSessionDialog/DoSaveSession of forms/Custom.cpp
 #include "gui/LoginDialog.h"
+#include "gui/AgentAccessDialog.h"
 #include "core/Platform.h"
 #include "gui/CloudSyncUi.h"
 #include "gui/Translator.h"
@@ -455,6 +456,8 @@ void LoginDialog::CreateActions()
   PreferencesAction->setIcon(Icons::Get(QStringLiteral("preferences")));
   EditCancelAction = Action(QStringLiteral("Cancel"), [this]() { EditCancelActionExecute(); });
   SessionAdvancedAction = Action(QStringLiteral("A&dvanced..."), [this]() { SessionAdvancedActionExecute(false); });
+  // NixSCP Agent Access (gui/AgentAccessDialog.h)
+  AgentAccessAction = Action(QStringLiteral("A&gent Access..."), [this]() { AgentAccessActionExecute(); });
   PreferencesLoggingAction = Action(QStringLiteral("&Logging..."), [this]()
   {
     PreferencesDialog::Execute(this, QStringLiteral("Logging"));
@@ -724,7 +727,10 @@ void LoginDialog::CreateControls()
   SessionAdvancedPopupMenu->addSection(QStringLiteral("Global Preferences"));
   SessionAdvancedPopupMenu->addAction(PreferencesLoggingAction);
   AdvancedButton->setMenu(SessionAdvancedPopupMenu);
-  for (QPushButton * B : {EditCancelButton, EditButton})
+  AgentAccessButton = new QPushButton(AgentAccessAction->text());
+  AgentAccessButton->setToolTip(QStringLiteral("Let AI agents and other programs use this site without getting its password"));
+  connect(AgentAccessButton, &QPushButton::clicked, AgentAccessAction, &QAction::trigger);
+  for (QPushButton * B : {EditCancelButton, EditButton, AgentAccessButton})
   {
     B->setAutoDefault(false);
   }
@@ -733,6 +739,7 @@ void LoginDialog::CreateControls()
   SessionButtons->addWidget(EditCancelButton);
   SessionButtons->addWidget(EditButton);
   SessionButtons->addStretch();
+  SessionButtons->addWidget(AgentAccessButton);
   SessionButtons->addWidget(AdvancedButton);
   Grid->addLayout(SessionButtons, 7, 0, 1, 4);
 
@@ -1728,6 +1735,8 @@ void LoginDialog::UpdateActions()
     style()->standardIcon(QStyle::SP_DialogOkButton));
   SaveSessionAction->setEnabled(Editable);
   SessionAdvancedAction->setEnabled(Editable);
+  AgentAccessAction->setEnabled(Editable);
+  AgentAccessButton->setEnabled(Editable);
   SessionRawAction->setEnabled(Editable);
   SaveAsSessionAction->setEnabled(Editable);
   NewSessionFolderAction->setEnabled(!FEditing);
@@ -2368,6 +2377,22 @@ void LoginDialog::SetDefaultSessionActionExecute()
   }
 }
 
+void LoginDialog::AgentAccessActionExecute()
+{
+  if (!IsEditable())
+  {
+    return;
+  }
+  // as Advanced: the dialog works on the site being edited, kept by Save
+  ParseHostName();
+  SaveSession(FEditingData);
+  AgentAccessDialog Dialog(FEditingData, this);
+  if (Dialog.exec() == QDialog::Accepted)
+  {
+    LoadSession(FEditingData);
+  }
+}
+
 void LoginDialog::SessionAdvancedActionExecute(bool Raw)
 {
   if (!IsEditable())
@@ -2781,7 +2806,10 @@ void LoginDialog::ImportActionExecute()
   QString Error;
   if (!CloudSyncUi::ImportConfiguration(this, FileName, &Error))
   {
-    ShowErrorMessage(this, Error);
+    if (!Error.isEmpty())  // empty: cancelled
+    {
+      ShowErrorMessage(this, Error);
+    }
     return;
   }
   // Configuration::Import reloads everything (no restart needed)
@@ -2808,7 +2836,10 @@ void LoginDialog::ExportActionExecute()
   QString Error;
   if (!CloudSyncUi::ExportConfiguration(this, FileName, &Error))
   {
-    ShowErrorMessage(this, Error);
+    if (!Error.isEmpty())  // empty: cancelled
+    {
+      ShowErrorMessage(this, Error);
+    }
   }
 }
 

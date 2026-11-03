@@ -1,6 +1,7 @@
 // Site imports (OpenSSH, PuTTY, FileZilla, INI, known_hosts), PuTTY host key
 // conversion, Windows path remapping and the SessionData helpers used by the
 // Login dialog (URL parsing, raw settings, Default Settings inheritance)
+#include "core/AgentAccess.h"
 #include "core/IniStorage.h"
 #include "core/Security.h"
 #include "core/SessionData.h"
@@ -399,6 +400,94 @@ static void TestKnownHosts(const QString & Home)
   CHECK(List.Error == QStringLiteral("No host keys found in known_hosts."));
 }
 
+// Agent access settings: stored with the site, never set by a URL / raw settings
+static void TestAgentSettings()
+{
+  SessionData D;
+  D.Name = QStringLiteral("Clients/secret-client");
+  D.HostName = QStringLiteral("10.0.0.5");
+  D.FSProtocol = fsSFTP;
+  D.AgentAccess = AgentAccess::amAsk;
+  D.AgentPermissions = AgentAccess::apCommands;
+  D.AgentName = QStringLiteral("web-alias");
+  IniFile File;
+  IniStorage Storage(&File);
+  Storage.OpenSubKey(QStringLiteral("Site"), true);
+  D.Save(Storage, nullptr);
+  SessionData Back;
+  Back.Load(Storage);
+  CHECK((Back.AgentAccess == AgentAccess::amAsk) && (Back.AgentPermissions == AgentAccess::apCommands));
+  CHECK(Back.AgentName == QStringLiteral("web-alias"));
+  CHECK(AgentAccess::AgentSiteName(Back) == QStringLiteral("web-alias"));
+  // a link with raw settings cannot grant or rename agent access
+  SessionData Url;
+  Url.HostName = QStringLiteral("10.0.0.5");
+  Url.ApplyRawSettings({QStringLiteral("AgentAccess=1"), QStringLiteral("AgentPermissions=7"), QStringLiteral("AgentName=evil")});
+  CHECK((Url.AgentAccess == AgentAccess::amOff) && Url.AgentName.isEmpty());
+  // agents find sites by their agent name only; sites without one by their name
+  StoredSessionList Sites;
+  auto Aliased = std::make_shared<SessionData>(D);
+  Sites.Add(Aliased);
+  SessionData Plain = D;
+  Plain.Name = QStringLiteral("plain-site");
+  Plain.AgentName.clear();
+  Sites.Add(std::make_shared<SessionData>(Plain));
+  SessionData Off = Plain;
+  Off.Name = QStringLiteral("off-site");
+  Off.AgentAccess = AgentAccess::amOff;
+  Sites.Add(std::make_shared<SessionData>(Off));
+  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("web-alias")) == Aliased);
+  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("Clients/secret-client")) == nullptr);
+  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("plain-site")) != nullptr);
+  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("off-site")) == nullptr);
+}
+
+// Command rules of agent access: everything allowed by default; allowed and
+// denied patterns per simple command; no bypass by chaining or substitution
+static void TestAgentCommandRules()
+{
+  SessionData D;
+  CHECK(!AgentAccess::HasCommandRules(D));
+  CHECK(AgentAccess::CommandAllowed(D, QStringLiteral("rm -rf /tmp/x; reboot")));
+  D.AgentAllow = QStringLiteral("ls*\n# a comment\nuptime\n  \n");
+  CHECK(AgentAccess::HasCommandRules(D));
+  QString Reason;
+  CHECK(AgentAccess::CommandAllowed(D, QStringLiteral("ls -la /var/www")));
+  CHECK(AgentAccess::CommandAllowed(D, QStringLiteral("ls && uptime")));
+  CHECK(AgentAccess::CommandAllowed(D, QStringLiteral("ls   -la")));
+  CHECK(AgentAccess::CommandAllowed(D, QStringLiteral("ls 2>&1")));
+  CHECK(AgentAccess::CommandAllowed(D, QStringLiteral("ls > /dev/null")));
+  CHECK(AgentAccess::CommandAllowed(D, QStringLiteral("ls 'a;b' \"c|d\"")));
+  CHECK(!AgentAccess::CommandAllowed(D, QStringLiteral("ls; rm -rf /"), &Reason) && Reason.contains(QStringLiteral("rm -rf /")));
+  CHECK(!AgentAccess::CommandAllowed(D, QStringLiteral("ls || reboot")));
+  CHECK(!AgentAccess::CommandAllowed(D, QStringLiteral("ls & reboot")));
+  CHECK(!AgentAccess::CommandAllowed(D, QStringLiteral("ls | sh")));
+  CHECK(!AgentAccess::CommandAllowed(D, QStringLiteral("ls\nreboot")));
+  CHECK(!AgentAccess::CommandAllowed(D, QStringLiteral("ls $(reboot)"), &Reason) && Reason.contains(QStringLiteral("substitution")));
+  CHECK(!AgentAccess::CommandAllowed(D, QStringLiteral("ls \"`reboot`\"")));
+  CHECK(!AgentAccess::CommandAllowed(D, QStringLiteral("ls > /etc/passwd"), &Reason) && Reason.contains(QStringLiteral("file")));
+  CHECK(!AgentAccess::CommandAllowed(D, QStringLiteral("ls >> x")));
+  CHECK(!AgentAccess::CommandAllowed(D, QStringLiteral("cat /etc/hostname")));
+  // denied patterns only: everything else allowed
+  SessionData Deny;
+  Deny.AgentDeny = QStringLiteral("*rm -rf*\nreboot*\nshutdown*");
+  CHECK(AgentAccess::CommandAllowed(Deny, QStringLiteral("echo $(date) > /tmp/x")));
+  CHECK(!AgentAccess::CommandAllowed(Deny, QStringLiteral("cd /tmp && rm -rf build")));
+  CHECK(!AgentAccess::CommandAllowed(Deny, QStringLiteral("uptime; reboot")));
+  // the read-only preset
+  SessionData ReadOnly;
+  ReadOnly.AgentAllow = AgentAccess::ReadOnlyAllowPreset();
+  ReadOnly.AgentDeny = AgentAccess::ReadOnlyDenyPreset();
+  CHECK(AgentAccess::CommandAllowed(ReadOnly, QStringLiteral("systemctl status nginx --no-pager")));
+  CHECK(AgentAccess::CommandAllowed(ReadOnly, QStringLiteral("tail -n 100 /var/log/syslog | grep error")));
+  CHECK(AgentAccess::CommandAllowed(ReadOnly, QStringLiteral("df -h && free -m && uptime")));
+  CHECK(!AgentAccess::CommandAllowed(ReadOnly, QStringLiteral("systemctl restart nginx")));
+  CHECK(!AgentAccess::CommandAllowed(ReadOnly, QStringLiteral("find /var/www -name '*.tmp' -delete")));
+  CHECK(!AgentAccess::CommandAllowed(ReadOnly, QStringLiteral("find / -exec rm {} \\;")));
+  CHECK(!AgentAccess::CommandAllowed(ReadOnly, QStringLiteral("echo x > /etc/motd")));
+  CHECK(!AgentAccess::CommandAllowed(ReadOnly, QStringLiteral("rm -rf /")));
+}
+
 static void TestSessionData()
 {
   // URL / user@host typed into the Login dialog host box
@@ -583,6 +672,8 @@ int main()
   TestIni(Home);
   TestKnownHosts(Home);
   TestSessionData();
+  TestAgentSettings();
+  TestAgentCommandRules();
   if (Failures == 0)
   {
     std::printf("test_siteimport: all tests passed\n");

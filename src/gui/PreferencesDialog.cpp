@@ -2,6 +2,7 @@
 // source/forms/EditorPreferences.cpp + EditorPreferences.dfm, the master password
 // dialog of windows/UserInterface.cpp, locale handling of windows/GUIConfiguration.cpp
 #include "gui/PreferencesDialog.h"
+#include "gui/UpdateCheck.h"
 #include "gui/GuiCommandLine.h"
 #include "gui/CloudSyncUi.h"
 #include "gui/HelpSystem.h"
@@ -11,6 +12,7 @@
 #include "gui/EditorWindow.h"
 #include "gui/FileListModel.h"
 #include "gui/Translator.h"
+#include "core/ConfigVault.h"
 #include "core/Configuration.h"
 #include "core/CopyParamList.h"
 #include "core/FileMasks.h"
@@ -104,7 +106,8 @@ static QString PreferencesPageHelpKeyword(const QString & Caption)
     { QStringLiteral("Applications"), QStringLiteral("ui_pref_integration_app") },
     { QStringLiteral("Commands"), QStringLiteral("ui_pref_commands") },
     { QStringLiteral("Storage"), QStringLiteral("ui_pref_storage") },
-    { QStringLiteral("Updates"), QStringLiteral("ui_pref_updates") },
+    // NixSCP's own new version check (not WinSCP's updater): the download page
+    { QStringLiteral("Updates"), QStringLiteral("nixscp:download") },
   };
   return Keywords.value(Caption, QStringLiteral("ui_preferences"));
 }
@@ -522,7 +525,10 @@ void PreferencesDialog::ExportConfiguration(QWidget * Parent)
   QString Error;
   if (!CloudSyncUi::ExportConfiguration(Parent, FileName, &Error))
   {
-    QMessageBox::critical(Parent, QStringLiteral("Error"), Error);
+    if (!Error.isEmpty())  // empty: cancelled
+    {
+      QMessageBox::critical(Parent, QStringLiteral("Error"), Error);
+    }
   }
 }
 
@@ -547,7 +553,10 @@ bool PreferencesDialog::ImportConfiguration(QWidget * Parent)
   QString Error;
   if (!CloudSyncUi::ImportConfiguration(Parent, FileName, &Error))
   {
-    QMessageBox::critical(Parent, QStringLiteral("Error"), Error);
+    if (!Error.isEmpty())  // empty: cancelled
+    {
+      QMessageBox::critical(Parent, QStringLiteral("Error"), Error);
+    }
     return false;
   }
   return true;
@@ -632,12 +641,15 @@ struct PreferencesDialog::Private
   // Security
   QCheckBox * UseMasterPasswordCheck;
   QPushButton * SetMasterPasswordButton;
+  QLabel * VaultLabel;
   // Storage
   QGroupBox * StorageGroup;
   QRadioButton * AutomaticIniFileStorageButton, * CustomIniFileStorageButton;
   QLabel * AutomaticIniFileStorageLabel;
   QLineEdit * CustomIniFileStorageEdit;
   QPushButton * CustomIniFileStorageBrowse;
+  QCheckBox * CheckForUpdatesCheck;
+  QLabel * UpdateLastCheckLabel;
   QCheckBox * TemporaryDirectoryCleanupCheck, * ConfirmTemporaryDirectoryCleanupCheck,
     * TemporaryDirectoryAppendSessionCheck, * TemporaryDirectoryAppendPathCheck, * TemporaryDirectoryDeterministicCheck;
   bool MoveStorage = false;
@@ -1471,12 +1483,19 @@ PreferencesDialog::PreferencesDialog(QWidget * Parent) :
   {
     QWidget * Sheet = NewSheet(L);
     auto * M = new QGroupBox(QStringLiteral("Master password"));
-    auto * MRow = new QHBoxLayout(M);
+    auto * MV = new QVBoxLayout(M);
+    auto * MRow = new QHBoxLayout();
     d->UseMasterPasswordCheck = new QCheckBox(QStringLiteral("&Use master password"));
     d->SetMasterPasswordButton = new QPushButton(QStringLiteral("&Change master password..."));
     MRow->addWidget(d->UseMasterPasswordCheck);
     MRow->addStretch();
     MRow->addWidget(d->SetMasterPasswordButton);
+    MV->addLayout(MRow);
+    // NixSCP Pro: the NixSCP password encrypts the whole configuration instead
+    d->VaultLabel = new QLabel(QStringLiteral("The whole configuration is encrypted with your NixSCP password (NixSCP Pro), "
+      "which replaces the master password. Change it in Pro &gt; Cloud Sync Settings."));
+    d->VaultLabel->setWordWrap(true);
+    MV->addWidget(d->VaultLabel);
     L->addWidget(M);
     // takes effect immediately, as in WinSCP (TPreferencesDialog::UseMasterPasswordCheckClick)
     connect(d->UseMasterPasswordCheck, &QCheckBox::clicked, this, [this]() { UseMasterPasswordClicked(); });
@@ -1723,6 +1742,30 @@ PreferencesDialog::PreferencesDialog(QWidget * Parent) :
     // "Other" (random seed file): PuTTY's random seed is not used
     L->addStretch();
     AddPage(QStringLiteral("Storage"), Sheet, false);
+  }
+
+  // ---- Updates (NixSCP: a notice about new releases on GitHub, no self-update) ----
+  {
+    QWidget * Sheet = NewSheet(L);
+    auto * G = new QGroupBox(QStringLiteral("New versions"));
+    auto * V = new QVBoxLayout(G);
+    d->CheckForUpdatesCheck = new QCheckBox(QStringLiteral("&Check for a new version when NixSCP starts (at most once a day)"));
+    V->addWidget(d->CheckForUpdatesCheck);
+    auto * Note = new QLabel(QStringLiteral("NixSCP asks GitHub for the latest release and tells you when a newer one is "
+      "available. Nothing is downloaded or installed automatically."));
+    Note->setWordWrap(true);
+    V->addWidget(Note);
+    d->UpdateLastCheckLabel = new QLabel();
+    V->addWidget(d->UpdateLastCheckLabel);
+    auto * Row = new QHBoxLayout();
+    auto * CheckNow = new QPushButton(QStringLiteral("Check &now"));
+    Row->addWidget(CheckNow);
+    Row->addStretch();
+    V->addLayout(Row);
+    connect(CheckNow, &QPushButton::clicked, this, [this]() { UpdateCheck::CheckNow(this); });
+    L->addWidget(G);
+    L->addStretch();
+    AddPage(QStringLiteral("Updates"), Sheet, false);
   }
 
   // ---- Search results (not in the navigation tree) ----
@@ -2125,6 +2168,10 @@ void PreferencesDialog::LoadConfiguration()
   d->CustomIniFileStorageEdit->setText(
     C.CustomIniFileStorageName().isEmpty() ? C.DefaultIniFileExportPath() : C.CustomIniFileStorageName());
   d->StorageGroup->setEnabled(!C.IsNulStorage());
+  d->CheckForUpdatesCheck->setChecked(C.CheckForUpdates);
+  d->UpdateLastCheckLabel->setText(C.UpdateLastCheck.isValid() ?
+    QStringLiteral("Last check: %1").arg(QLocale().toString(C.UpdateLastCheck.toLocalTime(), QLocale::ShortFormat)) :
+    QStringLiteral("Not checked yet."));
   d->TemporaryDirectoryCleanupCheck->setChecked(C.TemporaryDirectoryCleanup);
   d->ConfirmTemporaryDirectoryCleanupCheck->setChecked(C.ConfirmTemporaryDirectoryCleanup);
   d->TemporaryDirectoryAppendSessionCheck->setChecked(C.TemporaryDirectoryAppendSession);
@@ -2346,6 +2393,7 @@ void PreferencesDialog::SaveConfiguration()
   C.SessionRememberPassword = d->SessionRememberPasswordCheck->isChecked();
 
   // Storage (the configuration file itself is switched by accept)
+  C.CheckForUpdates = d->CheckForUpdatesCheck->isChecked();
   C.TemporaryDirectoryCleanup = d->TemporaryDirectoryCleanupCheck->isChecked();
   C.ConfirmTemporaryDirectoryCleanup = d->ConfirmTemporaryDirectoryCleanupCheck->isChecked();
   C.TemporaryDirectoryAppendSession = d->TemporaryDirectoryAppendSessionCheck->isChecked();
@@ -2488,7 +2536,10 @@ void PreferencesDialog::UpdateControls()
   Q_UNUSED(LanguageItem);
   d->LanguageChangeLabel->setVisible(false);
   // Security
-  d->SetMasterPasswordButton->setEnabled(Security::UseMasterPassword());
+  bool Vault = ConfigVault::Enabled();
+  d->SetMasterPasswordButton->setEnabled(Security::UseMasterPassword() && !Vault);
+  d->UseMasterPasswordCheck->setEnabled(!Vault || Security::UseMasterPassword());
+  d->VaultLabel->setVisible(Vault);
   // Storage
   d->CustomIniFileStorageEdit->setEnabled(d->CustomIniFileStorageButton->isChecked());
   d->CustomIniFileStorageBrowse->setEnabled(d->CustomIniFileStorageButton->isChecked());

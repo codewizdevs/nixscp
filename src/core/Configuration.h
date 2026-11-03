@@ -29,6 +29,7 @@
 #include "core/CopyParam.h"
 
 #include <QByteArray>
+#include <QDateTime>
 #include <QList>
 #include <QObject>
 
@@ -74,6 +75,11 @@ struct ConfigurationData
   QByteArray WindowState;
   QByteArray PanelSplitter;
   QString LastLocalDirectory;
+  // New version check (gui/UpdateCheck): on startup, at most daily; the last
+  // check is per computer, a skipped version (e.g. "1.2.0") is not offered again
+  bool CheckForUpdates = true;
+  QDateTime UpdateLastCheck;
+  QString UpdateSkipVersion;
 
   // ---- Environment: confirmations / notifications ----
   // ConfirmOverwriting and ConfirmResume live in DefaultCopyParam()
@@ -284,6 +290,11 @@ public:
   QString ExpandedTemporaryDirectory() const;
 
   StoredSessionList & StoredSessions() { return FStoredSessions; }
+  // The file is encrypted (NixSCP Pro) and was not unlocked: loaded empty, never written
+  bool IsLocked() const { return FLocked; }
+  // Writes the whole file again, e.g. after the encryption was turned on or off
+  // or its password changed (Save writes only when something changed)
+  bool Rewrite();
   // Whole WinSCP.ini compatible file, for components keeping their own
   // sections (bookmarks, history...); saved by Save()
   IniFile & Ini() { return FIni; }
@@ -342,6 +353,7 @@ private:
   bool FLoaded = false;
   QString FLastSaveError;
   StoredSessionList FStoredSessions;
+  bool FLocked = false;
   CopyParam FCopyParam;
   // state last announced by Changed
   ConfigurationData FChangedData;

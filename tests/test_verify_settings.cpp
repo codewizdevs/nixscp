@@ -42,6 +42,7 @@ int main()
 #include <QAbstractButton>
 #include <QAbstractSpinBox>
 #include <QApplication>
+#include <QToolButton>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDir>
@@ -1305,6 +1306,81 @@ static void TestAddedOptions(const QString & Dir)
     }
     qunsetenv("AWS_ACCESS_KEY_ID");
     qunsetenv("AWS_SECRET_ACCESS_KEY");
+  }
+
+  // Login dialog: Agent Access... next to Advanced, its choice kept in the site
+  {
+    StoredSessionList Sites;
+    LoginDialog Dialog(Sites);
+    SessionData D;
+    D.FSProtocol = fsSFTP;
+    D.HostName = QStringLiteral("agent.verify.test");
+    D.UserName = QStringLiteral("deploy");
+    Dialog.SetInitialSession(D);
+    Dialog.show();
+    QApplication::processEvents();
+    QPushButton * Agent = FindByText<QPushButton>(&Dialog, QStringLiteral("A&gent Access..."));
+    QToolButton * Advanced = nullptr;
+    for (QToolButton * B : Dialog.findChildren<QToolButton *>())
+    {
+      if (B->text() == QStringLiteral("A&dvanced..."))
+      {
+        Advanced = B;
+      }
+    }
+    CHECK((Agent != nullptr) && (Advanced != nullptr));
+    if ((Agent != nullptr) && (Advanced != nullptr))
+    {
+      CHECK(Agent->isVisible() && Agent->isEnabled());
+      // directly left of Advanced
+      CHECK(Agent->mapTo(&Dialog, QPoint(0, 0)).x() < Advanced->mapTo(&Dialog, QPoint(0, 0)).x());
+      CHECK(qAbs(Agent->mapTo(&Dialog, QPoint(0, 0)).y() - Advanced->mapTo(&Dialog, QPoint(0, 0)).y()) < 10);
+      Screenshot(&Dialog, QStringLiteral("added_login_agent_button"));
+      // the next modal dialog (instead of the modal killer)
+      ModalHandler = [](QWidget * Modal) -> bool
+      {
+        if (!Modal->windowTitle().startsWith(QStringLiteral("Agent Access")))
+        {
+          return false;
+        }
+        ModalHandler = nullptr;
+        auto Combos = Modal->findChildren<QComboBox *>();
+        CHECK(Combos.size() == 1);
+        // the configuration is not encrypted here: turning access on is not possible yet
+        CHECK(!Combos.value(0)->isEnabled());
+        Combos.value(0)->setEnabled(true);
+        Combos.value(0)->setCurrentIndex(2);
+        QCheckBox * Files = FindByText<QCheckBox>(Modal, QStringLiteral("&Download files"));
+        CHECK(Files != nullptr);
+        if (Files != nullptr) Files->setChecked(false);
+        Screenshot(Modal, QStringLiteral("added_agent_access_dialog"));
+        qobject_cast<QDialog *>(Modal)->accept();
+        return true;
+      };
+      Agent->click();
+      QApplication::processEvents();
+      QAction * Login = nullptr;
+      for (QAction * A : Dialog.findChildren<QAction *>())
+      {
+        if (A->text() == QStringLiteral("Login"))
+        {
+          Login = A;
+        }
+      }
+      CHECK(Login != nullptr);
+      if (Login != nullptr)
+      {
+        Login->trigger();
+        QApplication::processEvents();
+        auto Opened = Dialog.SessionToOpen();
+        CHECK(Opened != nullptr);
+        if (Opened != nullptr)
+        {
+          CHECK_EQ(Opened->AgentAccess, 2);
+          CHECK_EQ(Opened->AgentPermissions & 0x03, 0x01);
+        }
+      }
+    }
   }
 
   // Advanced Site Settings: proxy Autodetect
