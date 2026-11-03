@@ -170,9 +170,12 @@ jobs:
           path: appimage/*.AppImage
           if-no-files-found: error
 
+  macos:
+    uses: ./.github/workflows/macos.yml
+
   release:
     name: Publish release
-    needs: [package, appimage]
+    needs: [package, appimage, macos]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -188,3 +191,4 @@ jobs:
             packages/*.deb
             packages/*.rpm
             packages/*.AppImage
+            packages/*.dmg

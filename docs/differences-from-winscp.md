@@ -11,6 +11,7 @@ the WinSCP project.
 |---|---|---|
 | Native Linux application | Qt 6, Wayland and X11, GNOME/KDE Plasma/XFCE, desktop Trash, `xdg-open`, your terminal for "Open in PuTTY", `sftp://` link handling, inotify for "Keep remote directory up to date" | Free |
 | Windows build | The same application for Windows 10 and 11 (installer and portable zip), for people who use NixSCP on both systems | Free |
+| macOS version | A universal app for Apple Silicon and Intel Macs (macOS 12 or newer); not signed/notarized yet, so the first start needs right-click › Open | Free |
 | [Agent Access](agent-access.md) | AI agents and other programs use saved SSH sites through NixSCP without getting passwords or keys: per-site permissions, approval, command rules, recordings, audit log; `nixscp --list/--connect/--get/--put/--tunnel` | Free |
 | [MCP server](mcp.md) | `nixscp --mcp` for MCP clients such as Claude Code | Free |
 | [Tunnels](tunnels.md) | Saved SSH local port forwards per site, started and stopped in Tunnels > Manage Tunnels... | Free |

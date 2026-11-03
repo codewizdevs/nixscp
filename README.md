@@ -12,7 +12,7 @@
 <p align="center">
   <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/codewizdevs/nixscp?label=release"></a>
   <img alt="License: GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-green">
-  <img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux-orange">
+  <img alt="Platform: Linux, Windows, macOS" src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-orange">
   <img alt="Qt 6" src="https://img.shields.io/badge/Qt-6-41cd52">
   <img alt="Desktops" src="https://img.shields.io/badge/desktop-GNOME%20%7C%20KDE%20%7C%20XFCE-lightgrey">
   <img alt="Languages" src="https://img.shields.io/badge/languages-55-blueviolet">
@@ -95,6 +95,7 @@ Download the package for your distribution from the [latest release](../../relea
 | Fedora 42 / 43 | `nixscp-<version>.fc42.x86_64.rpm` / `.fc43` |
 | Other distributions (Ubuntu 24.04+, Linux Mint, Arch, openSUSE…) | `NixSCP-<version>-x86_64.AppImage` |
 | Windows 10 / 11 (64-bit) | `NixSCP-<version>-setup.exe` (installer) or `NixSCP-<version>-windows-x64.zip` (portable) |
+| macOS 12 or newer (Apple Silicon and Intel) | `NixSCP-<version>-macos-universal.dmg` (not signed yet, see below) |
 
 ```bash
 sudo apt install ./nixscp_*_amd64.deb      # Ubuntu / Debian
@@ -105,6 +106,8 @@ chmod +x NixSCP-*-x86_64.AppImage && ./NixSCP-*-x86_64.AppImage   # any other di
 Release packages use your desktop icon theme. The AppImage bundles Qt, libssh and OpenSSL and runs on distributions with glibc 2.39 or newer. Building from source needs **libssh 0.11 or newer** and **OpenSSL 3.2 or newer**.
 
 On Windows, the installer can add `nixscp-cli` to `PATH`; the portable zip runs from any folder. Settings are stored in `%APPDATA%\NixSCP`.
+
+**macOS (new, not signed yet):** open the `.dmg` and drag NixSCP to Applications. The app is not yet signed with an Apple Developer ID or notarized (we are working on it), so macOS blocks the first start: right-click NixSCP › **Open** › **Open**, or System Settings › Privacy & Security › **Open Anyway** (or `xattr -dr com.apple.quarantine /Applications/NixSCP.app`). The source code it is built from is right here, and the build runs on GitHub Actions, so you can review both. Settings are stored in `~/Library/Application Support/NixSCP`. For Agent Access and scripts, link the command line tools: `sudo ln -sf /Applications/NixSCP.app/Contents/MacOS/NixSCP /usr/local/bin/nixscp` (and `nixscp-cli` likewise).
 
 ### Build from source
 
@@ -131,6 +134,10 @@ Build your own packages with `cd build && cpack -G DEB` (or `-DCPACK_GENERATOR=R
 ### Building for Windows
 
 The Windows version is cross-compiled on Linux with llvm-mingw, Qt for Windows (llvm-mingw build) and OpenSSL/libssh built for Windows; see `cmake/windows-llvm-mingw.cmake` for the expected `win-sdk/` layout. `packaging/build-windows.sh` builds the portable folder, the zip and (with NSIS) the installer into `bin/windows/`.
+
+### Building for macOS
+
+`packaging/build-macos.sh` builds the universal `NixSCP.app` and the `.dmg` on a Mac (Xcode command line tools, Qt for macOS, OpenSSL and libssh for both architectures); `.github/workflows/macos.yml` shows the whole setup.
 
 ### Building with WinSCP's original icons
 
@@ -196,7 +203,7 @@ Share site folders with colleagues, end-to-end encrypted: **Pro › Teams...**. 
 
 ## Status
 
-**Version 1.2.** NixSCP ports WinSCP's features, captions, defaults and shortcuts one-to-one where they make sense on Linux. Windows-only features without a sane Linux equivalent (registry storage, drive letters, Windows file attributes, shell extensions) are replaced by Linux equivalents or removed. Bug reports and feature requests are welcome in [Issues](../../issues).
+**Version 1.2.1** for Linux, Windows and (new) macOS. NixSCP ports WinSCP's features, captions, defaults and shortcuts one-to-one where they make sense on Linux. Windows-only features without a sane Linux equivalent (registry storage, drive letters, Windows file attributes, shell extensions) are replaced by Linux equivalents or removed. Bug reports and feature requests are welcome in [Issues](../../issues).
 
 ## FAQ
 
