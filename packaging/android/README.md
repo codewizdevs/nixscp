@@ -12,10 +12,9 @@ released.
 - Connecting with host key verification (the app's own `known_hosts`) and
   password / passphrase / keyboard-interactive prompts.
 - Remote files: browse, Open (with another app), Share, Download (to the
-  app's download folder), Upload (Android's file picker), Rename, Delete,
-  New folder; WinSCP's own questions (overwrite, reconnect...) as sheets.
-  Downloads go to the public Downloads/NixSCP folder (the Files app shows
-  them).
+  public Downloads/NixSCP folder, shown by the Files app), Upload
+  (Android's file picker), Rename, Delete, New folder; WinSCP's own
+  questions (overwrite, reconnect...) as sheets.
 - Transfers go on in the background (foreground service with a
   notification); a connection Android cut while the file picker was open is
   reconnected automatically.
