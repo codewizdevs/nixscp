@@ -19,6 +19,9 @@ public:
   // While a transfer runs: a foreground service (with a notification) keeps
   // Android from stopping the app and cutting its connection in the background
   Q_INVOKABLE void keepAlive(bool Busy, const QString & Text);
+  // Copies downloaded files into the public Downloads/NixSCP folder (shown by
+  // the Files app); the places they went, empty where it failed
+  Q_INVOKABLE QStringList publish(const QStringList & Paths);
 
 private:
   bool FKeptAlive = false;

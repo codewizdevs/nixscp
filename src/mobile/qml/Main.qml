@@ -75,8 +75,13 @@ ApplicationWindow {
             androidFiles.keepAlive(session.busy && transfer, session.status)
         }
         function onDownloaded(paths) {
-            app.toast(paths.length === 1 ? qsTr("Saved to %1").arg(paths[0])
-                                         : qsTr("%1 files saved to %2").arg(paths.length).arg(session.downloadFolder))
+            // into the public Downloads folder, where the Files app shows them
+            var places = androidFiles.publish(paths)
+            var saved = places.filter(function(p) { return p.length > 0 })
+            if (saved.length === 0)
+                app.toast(qsTr("Saved in NixSCP's own folder: %1").arg(paths[0]))
+            else
+                app.toast(saved.length === 1 ? qsTr("Saved to %1").arg(saved[0]) : qsTr("%1 files saved to Downloads/NixSCP").arg(saved.length))
         }
     }
 

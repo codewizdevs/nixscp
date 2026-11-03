@@ -1,6 +1,7 @@
 #include "mobile/AndroidFiles.h"
 
 #include <QDesktopServices>
+#include <QFile>
 #include <QFileInfo>
 #include <QMimeDatabase>
 #include <QUrl>
@@ -115,6 +116,31 @@ void AndroidFiles::keepAlive(bool Busy, const QString & Text)
   Q_UNUSED(Busy);
   Q_UNUSED(Text);
 #endif
+}
+
+QStringList AndroidFiles::publish(const QStringList & Paths)
+{
+  QStringList Result;
+#ifdef Q_OS_ANDROID
+  QJniObject Ctx = Context();
+  for (const QString & Path : Paths)
+  {
+    QJniObject Where = QJniObject::callStaticObjectMethod("com/nixscp/android/PublicDownloads", "save",
+      "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", Ctx.object(),
+      QJniObject::fromString(Path).object<jstring>(), QJniObject::fromString(MimeType(Path)).object<jstring>());
+    QJniEnvironment Env;
+    Env.checkAndClearExceptions();
+    QString Place = Where.isValid() ? Where.toString() : QString();
+    if (!Place.isEmpty())
+    {
+      QFile::remove(Path);   // not kept twice
+    }
+    Result.append(Place);
+  }
+#else
+  Result = Paths;
+#endif
+  return Result;
 }
 
 bool AndroidFiles::share(const QStringList & Paths)

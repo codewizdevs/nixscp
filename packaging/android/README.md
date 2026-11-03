@@ -14,6 +14,8 @@ released.
 - Remote files: browse, Open (with another app), Share, Download (to the
   app's download folder), Upload (Android's file picker), Rename, Delete,
   New folder; WinSCP's own questions (overwrite, reconnect...) as sheets.
+  Downloads go to the public Downloads/NixSCP folder (the Files app shows
+  them).
 - Transfers go on in the background (foreground service with a
   notification); a connection Android cut while the file picker was open is
   reconnected automatically.
@@ -21,7 +23,7 @@ released.
 
 Not yet: NixSCP Pro sign-in and sync (needs an app-link sign-in on the
 server), the encrypted configuration, Teams, a built-in text editor,
-copying downloads to the public Downloads folder, tablets' two-panel layout.
+tablets' two-panel layout.
 
 ## Build
 
