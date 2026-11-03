@@ -10,7 +10,12 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network)
+if(ANDROID)
+  # Android: the core and the touch interface only (src/mobile)
+  find_package(Qt6 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2 Svg)
+else()
+  find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network)
+endif()
 
 if(WIN32)
   # Icon and version resource of an executable (packaging/windows/nixscp.rc.in)
@@ -25,10 +30,24 @@ if(WIN32)
   add_compile_options("SHELL:-include ${CMAKE_SOURCE_DIR}/src/core/WinPrelude.h")
   add_compile_definitions(UNICODE _UNICODE)
 endif()
-find_package(PkgConfig REQUIRED)
-# libssh 0.11+: pipelined SFTP uses the sftp_aio API
-pkg_check_modules(LIBSSH REQUIRED IMPORTED_TARGET libssh>=0.11)
-pkg_check_modules(LIBCRYPTO REQUIRED IMPORTED_TARGET libcrypto>=3.2)
+if(ANDROID)
+  # OpenSSL and libssh built by packaging/android/build-deps.sh
+  set(NIXSCP_ANDROID_DEPS "${CMAKE_SOURCE_DIR}/android-sdk/deps/${ANDROID_ABI}" CACHE PATH "OpenSSL and libssh for Android")
+  foreach(DEP LIBSSH:ssh LIBCRYPTO:crypto)
+    string(REPLACE ":" ";" DEP ${DEP})
+    list(GET DEP 0 TARGET_NAME)
+    list(GET DEP 1 LIB_NAME)
+    add_library(PkgConfig::${TARGET_NAME} SHARED IMPORTED)
+    set_target_properties(PkgConfig::${TARGET_NAME} PROPERTIES
+      IMPORTED_LOCATION "${NIXSCP_ANDROID_DEPS}/lib/lib${LIB_NAME}.so"
+      INTERFACE_INCLUDE_DIRECTORIES "${NIXSCP_ANDROID_DEPS}/include")
+  endforeach()
+else()
+  find_package(PkgConfig REQUIRED)
+  # libssh 0.11+: pipelined SFTP uses the sftp_aio API
+  pkg_check_modules(LIBSSH REQUIRED IMPORTED_TARGET libssh>=0.11)
+  pkg_check_modules(LIBCRYPTO REQUIRED IMPORTED_TARGET libcrypto>=3.2)
+endif()
 
 # Sources are globbed so parallel work can add files without touching this file
 file(GLOB CORE_SOURCES CONFIGURE_DEPENDS src/core/*.cpp src/core/*.h)
@@ -49,6 +68,11 @@ add_library(nixscpcore STATIC ${CORE_SOURCES})
 target_include_directories(nixscpcore PUBLIC src)
 target_link_libraries(nixscpcore PUBLIC Qt6::Core Qt6::Network PkgConfig::LIBSSH PkgConfig::LIBCRYPTO)
 target_compile_options(nixscpcore PRIVATE -Wall -Wextra)
+
+if(ANDROID)
+  add_subdirectory(src/mobile)
+  return()
+endif()
 
 # GUI sources, compiled once: linked into the application and the GUI tests
 add_library(nixscpgui OBJECT ${GUI_SOURCES} ${RESOURCE_FILES})

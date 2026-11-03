@@ -18,3 +18,4 @@ CMakeLists.txt.user
 .env.*
 __pycache__/
 *.pyc
+android-sdk/

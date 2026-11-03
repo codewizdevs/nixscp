@@ -639,6 +639,9 @@ int main(int argc, char ** argv)
   QDir().mkpath(ConfigHome);
   qputenv("XDG_DATA_HOME", DataHome.toUtf8());
   qputenv("XDG_CONFIG_HOME", ConfigHome.toUtf8());
+  // nor the system's applications (an installed NixSCP declares sftp:// itself)
+  qputenv("XDG_DATA_DIRS", (DataHome + QStringLiteral("/system")).toUtf8());
+  qputenv("XDG_CONFIG_DIRS", (ConfigHome + QStringLiteral("/system")).toUtf8());
   for (const char * Name : {"XDG_CURRENT_DESKTOP", "DESKTOP_SESSION", "KDE_FULL_SESSION", "GNOME_DESKTOP_SESSION_ID", "XDG_SESSION_DESKTOP"})
   {
     qunsetenv(Name);

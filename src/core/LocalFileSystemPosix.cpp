@@ -175,8 +175,12 @@ bool CopyFileData(const QString & Source, const QString & Target, qint64 Size, b
     Progress(Size);
     return (::close(Out.Release()) == 0);
   }
+#endif
+#if defined(Q_OS_LINUX) && !defined(Q_OS_ANDROID)
+  // (Android's bionic has copy_file_range only from API 34)
   bool UseCopyFileRange = true;
-#else
+#endif
+#ifndef Q_OS_LINUX
   // macOS: plain read/write (clonefile() needs the target not to exist yet)
   Q_UNUSED(Reflink);
   Q_UNUSED(Size);
@@ -191,7 +195,7 @@ bool CopyFileData(const QString & Source, const QString & Target, qint64 Size, b
       return false;
     }
     ssize_t Count;
-#ifdef Q_OS_LINUX
+#if defined(Q_OS_LINUX) && !defined(Q_OS_ANDROID)
     if (UseCopyFileRange)
     {
       Count = copy_file_range(In.Get(), nullptr, Out.Get(), nullptr, 8 * 1024 * 1024, 0);

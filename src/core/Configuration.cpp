@@ -188,7 +188,8 @@ Configuration & Configuration::Instance()
 }
 
 // ~/.config/nixscp on Linux; %APPDATA%\NixSCP (roaming, as WinSCP.ini) on
-// Windows; ~/Library/Application Support/NixSCP on macOS
+// Windows; ~/Library/Application Support/NixSCP on macOS; the app's private
+// storage on Android
 static QString ConfigurationDirectory()
 {
 #ifdef Q_OS_WIN
@@ -199,6 +200,9 @@ static QString ConfigurationDirectory()
   }
 #elif defined(Q_OS_MACOS)
   return QDir::homePath() + QStringLiteral("/Library/Application Support/NixSCP");
+#elif defined(Q_OS_ANDROID)
+  // the app's private storage
+  return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
 #endif
   return QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + QStringLiteral("/nixscp");
 }
