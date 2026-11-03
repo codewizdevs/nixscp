@@ -33,7 +33,12 @@ QString SocketName()
   {
     return RuntimeDir + QStringLiteral("/nixscp-agent.sock");
   }
+#ifdef Q_OS_MACOS
+  // $TMPDIR is private to the user there; socket paths are limited to 104 bytes
+  return QDir::tempPath() + QStringLiteral("/nixscp-agent.sock");
+#else
   return QDir::tempPath() + QStringLiteral("/nixscp-agent-") + Platform::UserKey() + QStringLiteral(".sock");
+#endif
 #endif
 }
 

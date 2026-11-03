@@ -425,6 +425,15 @@ static void TestSwitches(const QString & Scratch)
 
 static void TestUrlHandler(const QString & Scratch)
 {
+#ifdef Q_OS_MACOS
+  // not available on macOS yet: refused, nothing written
+  Q_UNUSED(Scratch);
+  QString MacError;
+  CHECK(!RegisterForDefaultProtocols(&MacError) && MacError.contains(QStringLiteral("macOS")));
+  CHECK(!UnregisterForProtocols(&MacError));
+  CHECK(!QFileInfo::exists(UrlHandlerDesktopFileName()));
+  return;
+#endif
 #ifdef _WIN32
   // HKCU\\Software\\Classes\\<scheme>, as WinSCP
   Q_UNUSED(Scratch);

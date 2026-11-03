@@ -96,13 +96,31 @@ namespace Net
   using Socket = int;
   using PollFd = pollfd;
   inline constexpr Socket Invalid = -1;
+#ifdef Q_OS_MACOS
+  inline constexpr int NoSignal = 0;      // SO_NOSIGPIPE, set by Open; SIGPIPE is ignored too
+#else
   inline constexpr int NoSignal = MSG_NOSIGNAL;
+#endif
   inline constexpr int ShutWrite = SHUT_WR;
 
   inline void Startup()
   {
   }
+#ifdef Q_OS_MACOS
+  inline Socket Open(int Family, int Type, int Protocol)
+  {
+    Socket S = ::socket(Family, Type, Protocol);
+    if (S >= 0)
+    {
+      fcntl(S, F_SETFD, FD_CLOEXEC);
+      int On = 1;
+      setsockopt(S, SOL_SOCKET, SO_NOSIGPIPE, &On, sizeof(On));
+    }
+    return S;
+  }
+#else
   inline Socket Open(int Family, int Type, int Protocol) { return ::socket(Family, Type | SOCK_CLOEXEC, Protocol); }
+#endif
   inline int Close(Socket S) { return ::close(S); }
   inline int LastError() { return errno; }
   inline bool Interrupted(int Error) { return Error == EINTR; }

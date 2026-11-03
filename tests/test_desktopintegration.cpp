@@ -309,6 +309,20 @@ static void TestTerminalCommand(const QString & Scratch)
   QFile::setPermissions(Bin + QStringLiteral("/gnome-terminal"), QFileDevice::ReadOwner | QFileDevice::ExeOwner);
   qputenv("PATH", Bin.toUtf8());
   QStringList Args{QStringLiteral("-e"), QStringLiteral("ssh"), QStringLiteral("host")};
+#ifdef Q_OS_MACOS
+  // Terminal.app opens a self-removing .command script running the command line
+  Args = QStringList{QStringLiteral("-e"), QStringLiteral("ssh"), QStringLiteral("it's host")};
+  CHECK(DesktopIntegration::ResolveTerminalProgram(QStringLiteral("x-terminal-emulator"), Args) == QStringLiteral("open"));
+  CHECK((Args.size() == 3) && (Args.value(0) == QStringLiteral("-a")) && (Args.value(1) == QStringLiteral("Terminal")));
+  {
+    QFile Script(Args.value(2));
+    CHECK(Args.value(2).endsWith(QStringLiteral(".command")) && Script.open(QIODevice::ReadOnly));
+    QByteArray Content = Script.readAll();
+    CHECK(Content.contains("rm -f \"$0\"\nclear\nexec 'ssh' 'it'\\''s host'\n"));
+    CHECK((Script.permissions() & (QFileDevice::ReadGroup | QFileDevice::ReadOther)) == 0);
+    Script.remove();
+  }
+#else
   CHECK(DesktopIntegration::ResolveTerminalProgram(QStringLiteral("x-terminal-emulator"), Args) == QStringLiteral("gnome-terminal"));
   CHECK(Args == (QStringList{QStringLiteral("--"), QStringLiteral("ssh"), QStringLiteral("host")}));
   WriteFile(Bin + QStringLiteral("/xfce4-terminal"), "#!/bin/sh\n");
@@ -317,6 +331,7 @@ static void TestTerminalCommand(const QString & Scratch)
   Args = QStringList{QStringLiteral("-e"), QStringLiteral("ssh")};
   CHECK(DesktopIntegration::ResolveTerminalProgram(QStringLiteral("x-terminal-emulator"), Args) == QStringLiteral("xfce4-terminal"));
   CHECK(Args.value(0) == QStringLiteral("-x"));
+#endif
   Args = QStringList{QStringLiteral("-e"), QStringLiteral("ssh")};
   CHECK(DesktopIntegration::ResolveTerminalProgram(QStringLiteral("myterm"), Args) == QStringLiteral("myterm"));
   qputenv("PATH", OldPath);
@@ -339,6 +354,16 @@ static void TestExploreAndPlaces(const QString & Scratch)
   Calls.clear();
   RunnerResult = true;
   DesktopIntegration::ExploreDirectory(Scratch);
+#ifdef Q_OS_MACOS
+  // Finder: open (the folder), open -R (the item selected)
+  CHECK(Calls.size() == 1);
+  CHECK(Calls.value(0).Program == QStringLiteral("open"));
+  CHECK(Calls.value(0).Arguments == QStringList{Scratch});
+  Calls.clear();
+  DesktopIntegration::ExploreFile(Scratch + QStringLiteral("/file.txt"));
+  CHECK(Calls.size() == 1);
+  CHECK(Calls.value(0).Arguments == (QStringList{QStringLiteral("-R"), Scratch + QStringLiteral("/file.txt")}));
+#else
   CHECK(Calls.size() == 1);
   CHECK(Calls.value(0).Program == QStringLiteral("gdbus"));
   CHECK(Calls.value(0).Arguments.contains(QStringLiteral("org.freedesktop.FileManager1.ShowFolders")));
@@ -351,6 +376,7 @@ static void TestExploreAndPlaces(const QString & Scratch)
   CHECK(Calls.value(0).Arguments.contains(QStringLiteral("org.freedesktop.FileManager1.ShowItems")));
   CHECK(Calls.value(1).Program == QStringLiteral("xdg-open"));
   CHECK(Calls.value(1).Arguments == QStringList{Scratch});
+#endif
   RunnerResult = true;
 
   // GTK bookmarks

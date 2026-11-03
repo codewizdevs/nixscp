@@ -154,6 +154,25 @@ static void ShowInFileManager(const QString & Method, const QString & Path, cons
       }
     }
   };
+#ifdef Q_OS_MACOS
+  // Finder: "open -R" reveals (selects) the item, "open" shows the folder
+  Q_UNUSED(Uri);
+  Q_UNUSED(OpenFallback);
+  QStringList Arguments{Path};
+  if (Method == QStringLiteral("ShowItems"))
+  {
+    Arguments.prepend(QStringLiteral("-R"));
+  }
+  if (Runner())
+  {
+    Runner()(QStringLiteral("open"), Arguments);
+  }
+  else
+  {
+    QProcess::startDetached(QStringLiteral("open"), Arguments);
+  }
+  return;
+#endif
 #ifdef NIXSCP_HAVE_QTDBUS
   if (!Runner())
   {
@@ -948,6 +967,36 @@ QString ApplyTerminalEmulator(const TerminalEmulator & Emulator, QStringList & A
 
 QString ResolveTerminalProgram(const QString & Program, QStringList & Arguments)
 {
+#ifdef Q_OS_MACOS
+  if (Program == QStringLiteral("x-terminal-emulator"))
+  {
+    // Terminal.app opens a private .command script that removes itself,
+    // clears the window and runs the command line (no typed-in command, no
+    // permission to control Terminal needed)
+    if (!Arguments.isEmpty() && (Arguments.first() == QStringLiteral("-e")))
+    {
+      Arguments.removeFirst();
+    }
+    QString Line;
+    for (const QString & Arg : std::as_const(Arguments))
+    {
+      QString Quoted = Arg;
+      Quoted.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
+      Line += QStringLiteral(" '") + Quoted + QLatin1Char('\'');
+    }
+    QTemporaryFile Script(QDir::tempPath() + QStringLiteral("/nixscp-terminal-XXXXXX.command"));
+    Script.setAutoRemove(false);
+    if (Script.open())
+    {
+      Script.write(("#!/bin/sh\nrm -f \"$0\"\nclear\nexec" + Line + "\n").toUtf8());
+      Script.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+      Script.close();
+      Arguments = QStringList{QStringLiteral("-a"), QStringLiteral("Terminal"), Script.fileName()};
+      return QStringLiteral("open");
+    }
+    return Program;
+  }
+#endif
   if ((Program != QStringLiteral("x-terminal-emulator")) || !QStandardPaths::findExecutable(Program).isEmpty())
   {
     return Program;

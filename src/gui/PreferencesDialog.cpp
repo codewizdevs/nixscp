@@ -1626,6 +1626,15 @@ PreferencesDialog::PreferencesDialog(QWidget * Parent) :
     UrlMenu->addAction(QStringLiteral("Unregister"), this, [this]() { RegisterAsUrlHandler(false); })
       ->setObjectName(QStringLiteral("UnregisterForDefaultProtocolsItem"));
     UrlButton->setMenu(UrlMenu);
+#ifdef Q_OS_MACOS
+    // freedesktop.org desktop entries; the macOS ways (Dock, URL schemes of
+    // the app bundle) are not implemented yet
+    for (QPushButton * B : {DesktopIconButton, UrlButton})
+    {
+      B->setEnabled(false);
+      B->setToolTip(QStringLiteral("Not available on macOS yet"));
+    }
+#endif
     for (QPushButton * B : {DesktopIconButton, UrlButton})
     {
       auto * Row = new QHBoxLayout();

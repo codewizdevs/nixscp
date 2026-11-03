@@ -484,7 +484,11 @@ static void TestConfiguration()
   // Editors
   CHECK(C.EditorFor(QStringLiteral("readme.txt")) == QStringLiteral("gedit !.!"));
   CHECK(C.EditorFor(QStringLiteral("/var/log/syslog.log")) == QStringLiteral("gedit !.!"));
+#ifdef Q_OS_MACOS
+  CHECK(C.EditorFor(QStringLiteral("index.html")) == QStringLiteral("open !.!"));
+#else
   CHECK(C.EditorFor(QStringLiteral("index.html")) == QStringLiteral("xdg-open !.!"));
+#endif
   CHECK(C.EditorFor(QStringLiteral("main.c")).isEmpty());
   CHECK(C.EditorPreferencesFor(QStringLiteral("a.txt"))->ExternalEditorText);
   CHECK(Configuration::FormatEditorCommand(QStringLiteral("gedit !.!"), QStringLiteral("/tmp/a b.txt")) == QStringLiteral("gedit \"/tmp/a b.txt\""));

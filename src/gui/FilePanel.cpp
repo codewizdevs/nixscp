@@ -303,7 +303,7 @@ bool LocalDirectoryProvider::ReadDirectory(const QString & Path, QString & Canon
       (File.IsDirectory ? RemoteFile::Directory : (S_ISREG(St->st_mode) ? RemoteFile::File : RemoteFile::Other));
     File.Size = File.IsDirectory ? 0 : static_cast<qint64>(St->st_size);
     File.Modification = QDateTime::fromMSecsSinceEpoch(
-      static_cast<qint64>(St->st_mtim.tv_sec) * 1000 + St->st_mtim.tv_nsec / 1000000);
+      static_cast<qint64>(St->NIXSCP_ST_MTIM.tv_sec) * 1000 + St->NIXSCP_ST_MTIM.tv_nsec / 1000000);
     File.Permissions = St->st_mode & 07777;
     File.IsHidden = (Name[0] == '.');
     File.Owner = UserNameOf(St->st_uid);
@@ -2723,21 +2723,32 @@ struct FilePanel::Private : public QObject, public PanelViewHandler
       Watcher = new QFileSystemWatcher(this);
       connect(Watcher, &QFileSystemWatcher::directoryChanged, this, [this](const QString & Path)
       {
-        if ((Path == Directory) && !WatchTimer->isActive())
+        // the parent (macOS): only when the directory itself has gone
+        bool Vanished = (Path != Directory) && !QFileInfo(Directory).isDir();
+        if (((Path == Directory) || Vanished) && !WatchTimer->isActive())
         {
           // Debounced; a big directory is not re-read more often than it takes to read it
           WatchTimer->start(std::max<qint64>(300, 2 * LastLoadMs));
         }
       });
     }
-    const QStringList Watched = Watcher->directories();
-    if ((Watched.size() != 1) || (Watched.first() != Directory))
+    QStringList Wanted{Directory};
+#ifdef Q_OS_MACOS
+    // FSEvents/kqueue do not report the removal of the watched directory
+    // itself: its parent shows it
+    if (!IsRootPath(Directory))
+    {
+      Wanted.append(ParentOf(Directory));
+    }
+#endif
+    QStringList Watched = Watcher->directories();
+    if (QSet<QString>(Watched.begin(), Watched.end()) != QSet<QString>(Wanted.begin(), Wanted.end()))
     {
       if (!Watched.isEmpty())
       {
         Watcher->removePaths(Watched);
       }
-      Watcher->addPath(Directory);
+      Watcher->addPaths(Wanted);
     }
   }
 
@@ -3522,6 +3533,9 @@ void FilePanel::Refresh()
   {
     Private::LoadRequest Request;
     Request.Kind = Private::lkRefresh;
+    // a local directory that has gone: on to the nearest readable parent, as
+    // the automatic refresh does
+    Request.Silent = !FRemote && !QFileInfo(d->Directory).isDir();
     d->Load(d->Directory, Request);
   }
 }

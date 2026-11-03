@@ -346,7 +346,8 @@ static void TestScpShellQuoting(const QString & Dir)
   for (const QString & Name : Names)
   {
     QString Output = RunShell(QStringLiteral("printf %s ") + ShellQuoteStr(Name), Dir);
-    CHECK_MSG(Output == Name, Name);
+    // macOS passes process arguments decomposed (NFD): the same text
+    CHECK_MSG(Output.normalized(QString::NormalizationForm_C) == Name.normalized(QString::NormalizationForm_C), Name);
     CHECK_MSG(!QFileInfo::exists(QDir(Dir).filePath(Mark)), Name);
     QFile::remove(QDir(Dir).filePath(Mark));
   }

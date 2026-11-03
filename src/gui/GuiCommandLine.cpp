@@ -165,7 +165,8 @@ namespace
 
   QString CliExecutable()
   {
-    QString Self = QFileInfo(QStringLiteral("/proc/self/exe")).canonicalFilePath();
+    // the folder of this program (Contents/MacOS in the macOS app bundle)
+    QString Self = QFileInfo(QCoreApplication::applicationFilePath()).canonicalFilePath();
     if (!Self.isEmpty())
     {
       QString Candidate = QFileInfo(Self).absolutePath() + QStringLiteral("/nixscp-cli");
@@ -990,6 +991,14 @@ static QString UrlHandlerCommand()
 
 bool GuiCommandLine::RegisterForDefaultProtocols(QString * Error)
 {
+#ifdef Q_OS_MACOS
+  // needs CFBundleURLTypes and the open URL event; not implemented yet
+  if (Error != nullptr)
+  {
+    *Error = QStringLiteral("Handling URL addresses is not available on macOS yet.");
+  }
+  return false;
+#endif
 #ifdef Q_OS_WIN
   QSettings Classes(ClassesKey, QSettings::NativeFormat);
   for (const QString & Scheme : UrlSchemes())
@@ -1050,6 +1059,13 @@ bool GuiCommandLine::RegisterForDefaultProtocols(QString * Error)
 
 bool GuiCommandLine::UnregisterForProtocols(QString * Error)
 {
+#ifdef Q_OS_MACOS
+  if (Error != nullptr)
+  {
+    *Error = QStringLiteral("Handling URL addresses is not available on macOS yet.");
+  }
+  return false;
+#endif
 #ifdef Q_OS_WIN
   // only the schemes that are still ours
   QSettings Classes(ClassesKey, QSettings::NativeFormat);

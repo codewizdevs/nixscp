@@ -629,6 +629,14 @@ private:
       return false;
     }
     return Credentials.uid == getuid();
+#elif defined(Q_OS_MACOS)
+    uid_t Uid = 0;
+    gid_t Gid = 0;
+    if (getpeereid(static_cast<int>(Socket->socketDescriptor()), &Uid, &Gid) != 0)
+    {
+      return false;
+    }
+    return Uid == getuid();
 #else
     // Windows: the pipe's ACL (UserAccessOption) admits the current user only
     Q_UNUSED(Socket);

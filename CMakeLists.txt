@@ -63,10 +63,18 @@ if(WIN32)
   # A GUI program (no console window), with icon and version information
   set_target_properties(nixscp PROPERTIES WIN32_EXECUTABLE ON)
   nixscp_windows_resources(nixscp "NixSCP")
+elseif(APPLE)
+  # NixSCP.app (packaging/build-macos.sh adds nixscp-cli, the icon and Qt)
+  set_target_properties(nixscp PROPERTIES
+    MACOSX_BUNDLE ON
+    OUTPUT_NAME NixSCP
+    MACOSX_BUNDLE_INFO_PLIST ${CMAKE_SOURCE_DIR}/packaging/macos/Info.plist.in
+    MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION}
+    MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION})
 endif()
 target_compile_definitions(nixscp PRIVATE PROJECT_VERSION="${PROJECT_VERSION}")
 target_compile_options(nixscp PRIVATE -Wall -Wextra)
-install(TARGETS nixscp RUNTIME DESTINATION bin)
+install(TARGETS nixscp RUNTIME DESTINATION bin BUNDLE DESTINATION .)
 
 # Console scripting client (winscp.com)
 if(CLI_SOURCES)
@@ -96,6 +104,9 @@ elseif(WIN32)
   # editors, the Linux desktop) throughout, many against local test servers
   list(FILTER TEST_SOURCES EXCLUDE REGEX
     "test_(localfileops|findfiles|protocolsettings|scp|ftp|operations|serverops|sshlayer|sftp|webdav|syncex|desktopintegration|filepanel|propertiesdialog|editormanager|verify_gui|verify_desktop)\\.cpp$")
+elseif(APPLE)
+  # Linux desktop specifics (freedesktop.org icon themes, terminals, Trash, D-Bus)
+  list(FILTER TEST_SOURCES EXCLUDE REGEX "test_verify_desktop\\.cpp$")
 endif()
 foreach(TEST_SOURCE ${TEST_SOURCES})
   get_filename_component(TEST_NAME ${TEST_SOURCE} NAME_WE)

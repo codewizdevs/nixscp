@@ -132,16 +132,16 @@ int main(int argc, char ** argv)
     CHECK(R.Processed == 2);
     CHECK(UI.Queries.isEmpty());
     CHECK(ReadFile(Dst + QStringLiteral("/big.bin")) == Big);
-    CHECK(LStat(Dst + QStringLiteral("/big.bin")).st_mtim.tv_sec == 1000000000);
+    CHECK(LStat(Dst + QStringLiteral("/big.bin")).st_mtime == 1000000000);
     CHECK(ReadFile(Dst + QStringLiteral("/sub/a.txt")) == "hello");
-    CHECK(LStat(Dst + QStringLiteral("/sub/a.txt")).st_mtim.tv_sec == 1100000000);
+    CHECK(LStat(Dst + QStringLiteral("/sub/a.txt")).st_mtime == 1100000000);
     CHECK((LStat(Dst + QStringLiteral("/sub/deep/run.sh")).st_mode & 07777) == 0750);
     CHECK(S_ISLNK(LStat(Dst + QStringLiteral("/sub/link")).st_mode));
     CHECK(QFileInfo(Dst + QStringLiteral("/sub/link")).symLinkTarget().endsWith(QStringLiteral("/sub/a.txt")));
-    CHECK(LStat(Dst + QStringLiteral("/sub/link")).st_mtim.tv_sec == 1200000000);
+    CHECK(LStat(Dst + QStringLiteral("/sub/link")).st_mtime == 1200000000);
     CHECK(S_ISLNK(LStat(Dst + QStringLiteral("/sub/dangling")).st_mode));
-    CHECK(LStat(Dst + QStringLiteral("/sub/deep")).st_mtim.tv_sec == 1300000000);
-    CHECK(LStat(Dst + QStringLiteral("/sub")).st_mtim.tv_sec == 1400000000);
+    CHECK(LStat(Dst + QStringLiteral("/sub/deep")).st_mtime == 1300000000);
+    CHECK(LStat(Dst + QStringLiteral("/sub")).st_mtime == 1400000000);
     FileOperationProgress::Snapshot S = Progress.Get();
     CHECK(S.TotalSize == Big.size() + 5 + 10);
     CHECK(S.TotalTransferred == S.TotalSize);
@@ -307,7 +307,7 @@ int main(int argc, char ** argv)
       LocalOperationResult R = LocalFileOperations::Execute(P, nullptr, nullptr);
       CHECK(R.Ok);
       CHECK(ReadFile(Dst + QStringLiteral("/tree/x/y.txt")) == "yyy");
-      CHECK(LStat(Dst + QStringLiteral("/tree/x/y.txt")).st_mtim.tv_sec == 1500000000);
+      CHECK(LStat(Dst + QStringLiteral("/tree/x/y.txt")).st_mtime == 1500000000);
       CHECK(S_ISLNK(LStat(Dst + QStringLiteral("/tree/l")).st_mode));
       CHECK(!Exists(Shm.path() + QStringLiteral("/tree")));
     }

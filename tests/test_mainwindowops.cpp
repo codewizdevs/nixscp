@@ -541,6 +541,21 @@ static QString XdgQuery(const QString & Scheme)
 static void TestUrlRegistration(QWidget * Parent, const QString & DataHome, const QString & ConfigHome)
 {
   std::printf("[register to handle URL addresses]\n");
+#ifdef Q_OS_MACOS
+  // not available on macOS yet: the button is disabled
+  QTimer::singleShot(200, []()
+  {
+    auto * Dialog = qobject_cast<PreferencesDialog *>(QApplication::activeModalWidget());
+    if (Dialog == nullptr) return;
+    auto * Button = Dialog->findChild<QPushButton *>(QStringLiteral("RegisterAsUrlHandlersButton"));
+    CHECK((Button != nullptr) && !Button->isEnabled());
+    Dialog->reject();
+  });
+  PreferencesDialog::Execute(Parent, QStringLiteral("Integration"));
+  Q_UNUSED(DataHome);
+  Q_UNUSED(ConfigHome);
+  return;
+#endif
   QString DesktopFile = DataHome + QStringLiteral("/applications/nixscp-url-handler.desktop");
   for (bool Register : {true, false})
   {

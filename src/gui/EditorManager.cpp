@@ -50,6 +50,9 @@
 
 #ifdef Q_OS_WIN
 #include <QWinEventNotifier>
+#elif defined(Q_OS_MACOS)
+#include <sys/event.h>
+#include <unistd.h>
 #else
 #include <sys/syscall.h>
 #ifndef SYS_pidfd_open
@@ -1075,6 +1078,8 @@ void EditorManager::CustomExecuteFile(EditedFile * File, ExecuteFileBy By, const
 #ifdef Q_OS_WIN
     // Opens the file with its associated program (and exits at once)
     Command = QStringLiteral("explorer.exe !.!");
+#elif defined(Q_OS_MACOS)
+    Command = QStringLiteral("open !.!");
 #else
     Command = QStringLiteral("xdg-open !.!");
 #endif
@@ -1086,7 +1091,8 @@ void EditorManager::CustomExecuteFile(EditedFile * File, ExecuteFileBy By, const
   static const QStringList Launchers = {
     QStringLiteral("xdg-open"), QStringLiteral("gio"), QStringLiteral("kde-open"), QStringLiteral("kde-open5"),
     QStringLiteral("kioclient"), QStringLiteral("kioclient5"), QStringLiteral("exo-open"), QStringLiteral("gnome-open"),
-    QStringLiteral("explorer.exe"), QStringLiteral("explorer"), QStringLiteral("cmd.exe"), QStringLiteral("cmd") };
+    QStringLiteral("explorer.exe"), QStringLiteral("explorer"), QStringLiteral("cmd.exe"), QStringLiteral("cmd"),
+    QStringLiteral("open") };
   if (!Args.isEmpty() && Launchers.contains(QFileInfo(Args.first()).fileName()) && (By == efExternalEditor))
   {
     Track = false;
@@ -1159,10 +1165,25 @@ void EditorManager::TrackProcess(EditedFile * File)
     });
   }
 #else
-  int Fd = static_cast<int>(::syscall(SYS_pidfd_open, static_cast<pid_t>(File->Pid), 0));
+#ifdef Q_OS_MACOS
+  // a kqueue with the process's exit event: readable when it exits
+  int Fd = kqueue();
   if (Fd >= 0)
   {
-    // the pidfd becomes readable when the process exits
+    struct kevent Change;
+    EV_SET(&Change, static_cast<uintptr_t>(File->Pid), EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, nullptr);
+    if (kevent(Fd, &Change, 1, nullptr, 0, nullptr) != 0)
+    {
+      ::close(Fd);
+      Fd = -1;
+    }
+  }
+#else
+  int Fd = static_cast<int>(::syscall(SYS_pidfd_open, static_cast<pid_t>(File->Pid), 0));
+#endif
+  if (Fd >= 0)
+  {
+    // the pidfd (kqueue on macOS) becomes readable when the process exits
     File->PidFd = Fd;
     File->PidNotifier = new QSocketNotifier(Fd, QSocketNotifier::Read, this);
     connect(File->PidNotifier, &QSocketNotifier::activated, this, [this, Id]()

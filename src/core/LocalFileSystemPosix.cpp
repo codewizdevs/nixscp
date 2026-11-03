@@ -1,6 +1,7 @@
-// Local file system primitives for Linux (see LocalFileSystem.h)
+// Local file system primitives for Linux and macOS (see LocalFileSystem.h)
 #include "core/LocalFileSystem.h"
 #include "core/FileSystem.h"
+#include "core/Platform.h"
 
 #ifndef Q_OS_WIN
 
@@ -15,7 +16,9 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <grp.h>
+#ifdef Q_OS_LINUX
 #include <linux/fs.h>
+#endif
 #include <pwd.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -72,10 +75,10 @@ static void Convert(const struct stat & St, Stat & Result)
   else if (S_ISLNK(St.st_mode)) Result.Type = Stat::Symlink;
   else Result.Type = Stat::Special;
   Result.Size = St.st_size;
-  Result.ModifiedSec = St.st_mtim.tv_sec;
-  Result.ModifiedNsec = St.st_mtim.tv_nsec;
-  Result.AccessedSec = St.st_atim.tv_sec;
-  Result.AccessedNsec = St.st_atim.tv_nsec;
+  Result.ModifiedSec = St.NIXSCP_ST_MTIM.tv_sec;
+  Result.ModifiedNsec = St.NIXSCP_ST_MTIM.tv_nsec;
+  Result.AccessedSec = St.NIXSCP_ST_ATIM.tv_sec;
+  Result.AccessedNsec = St.NIXSCP_ST_ATIM.tv_nsec;
   Result.Device = static_cast<quint64>(St.st_dev);
   Result.Inode = static_cast<quint64>(St.st_ino);
   Result.Mode = St.st_mode & 07777;
@@ -165,6 +168,7 @@ bool CopyFileData(const QString & Source, const QString & Target, qint64 Size, b
     return false;
   }
   Step = csCopy;
+#ifdef Q_OS_LINUX
   // Copy-on-write clone (btrfs, xfs, bcachefs; same file system only)
   if (Reflink && (Size > 0) && (ioctl(Out.Get(), FICLONE, In.Get()) == 0))
   {
@@ -172,6 +176,11 @@ bool CopyFileData(const QString & Source, const QString & Target, qint64 Size, b
     return (::close(Out.Release()) == 0);
   }
   bool UseCopyFileRange = true;
+#else
+  // macOS: plain read/write (clonefile() needs the target not to exist yet)
+  Q_UNUSED(Reflink);
+  Q_UNUSED(Size);
+#endif
   qint64 Copied = 0;
   std::vector<char> Buffer;
   for (;;)
@@ -182,6 +191,7 @@ bool CopyFileData(const QString & Source, const QString & Target, qint64 Size, b
       return false;
     }
     ssize_t Count;
+#ifdef Q_OS_LINUX
     if (UseCopyFileRange)
     {
       Count = copy_file_range(In.Get(), nullptr, Out.Get(), nullptr, 8 * 1024 * 1024, 0);
@@ -194,6 +204,7 @@ bool CopyFileData(const QString & Source, const QString & Target, qint64 Size, b
       }
     }
     else
+#endif
     {
       if (Buffer.empty())
       {

@@ -33,9 +33,14 @@
 
 #ifndef Q_OS_WIN
 #include <fcntl.h>
-#include <sys/inotify.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+// Watching local directories: inotify on Linux; QFileSystemWatcher elsewhere
+// (ReadDirectoryChangesW on Windows, FSEvents/kqueue on macOS)
+#ifdef Q_OS_LINUX
+#define NIXSCP_INOTIFY 1
+#include <sys/inotify.h>
 #endif
 
 //---------------------------------------------------------------------------
@@ -2059,7 +2064,7 @@ QString InotifyErrorMessage(int Error)
   return Message;
 }
 
-#ifndef Q_OS_WIN
+#ifdef NIXSCP_INOTIFY
 static const uint32_t WatchMask =
   IN_CLOSE_WRITE | IN_MODIFY | IN_ATTRIB | IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO |
   IN_DELETE_SELF | IN_MOVE_SELF | IN_DONT_FOLLOW;
@@ -2179,7 +2184,7 @@ bool SynchronizeController::AddDirectory(const QString & Directory, bool Recurse
     }
     FDirectoriesLimit = MaxDirectories;
   }
-#ifdef Q_OS_WIN
+#ifndef NIXSCP_INOTIFY
   if (!AlreadyWatched)
   {
     if (!FWatcher->addPath(Directory))
@@ -2224,7 +2229,7 @@ bool SynchronizeController::AddDirectory(const QString & Directory, bool Recurse
 
 void SynchronizeController::RemoveWatches()
 {
-#ifdef Q_OS_WIN
+#ifndef NIXSCP_INOTIFY
   if ((FWatcher != nullptr) && !FWatcher->directories().isEmpty())
   {
     FWatcher->removePaths(FWatcher->directories());
@@ -2245,7 +2250,7 @@ void SynchronizeController::RemoveWatches()
 void SynchronizeController::Rescan()
 {
   // DiscMon AddDirectory + Open (initially) / directories change (later)
-#ifdef Q_OS_WIN
+#ifndef NIXSCP_INOTIFY
   bool Initial = (FWatcher == nullptr);
 #else
   bool Initial = (FInotify < 0);
@@ -2257,7 +2262,7 @@ void SynchronizeController::Rescan()
     {
       emit Log(slScan, QStringLiteral("Scanning '%1' for subdirectories...").arg(FParams.LocalDirectory), QString());
     }
-#ifdef Q_OS_WIN
+#ifndef NIXSCP_INOTIFY
     FWatcher = new QFileSystemWatcher(this);
     connect(FWatcher, &QFileSystemWatcher::directoryChanged, this, &SynchronizeController::WatchedDirectoryChanged);
   }
@@ -2304,7 +2309,7 @@ void SynchronizeController::Rescan()
   }
 }
 
-#ifdef Q_OS_WIN
+#ifndef NIXSCP_INOTIFY
 // QFileSystemWatcher: "something changed in Directory" (files or subdirectories)
 void SynchronizeController::WatchedDirectoryChanged(const QString & Directory)
 {
@@ -2677,7 +2682,7 @@ void SynchronizeController::Stop()
     FStatus.reset();
   }
   RemoveWatches();
-#ifdef Q_OS_WIN
+#ifndef NIXSCP_INOTIFY
   delete FWatcher;
   FWatcher = nullptr;
 #else

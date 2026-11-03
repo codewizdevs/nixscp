@@ -613,6 +613,18 @@ static void TestPanel(const QString & Root)
     CHECK(WaitFor([&]() { return !Climb.IsLoading() && (Climb.CurrentDirectory() == QFileInfo(Leaf).canonicalFilePath()); }));
     QFile::setPermissions(Locked, QFileDevice::WriteOwner | QFileDevice::ExeOwner);
     QDir().rmdir(Leaf);
+#ifdef Q_OS_MACOS
+    // FSEvents may not report the removal while the parent is unreadable:
+    // then the next refresh (Ctrl+R) climbs
+    if (!WaitFor([&]() { return Climb.CurrentDirectory() == QFileInfo(Top).canonicalFilePath(); }, 3000))
+    {
+      std::printf("INFO climb: no change noticed, in '%s' (loading %d); refreshing\n",
+        qPrintable(Climb.CurrentDirectory()), Climb.IsLoading() ? 1 : 0);
+      Climb.Refresh();
+      WaitFor([&]() { return !Climb.IsLoading(); }, 5000);
+      std::printf("INFO climb: after refresh in '%s'\n", qPrintable(Climb.CurrentDirectory()));
+    }
+#endif
     CHECK(WaitFor([&]() { return !Climb.IsLoading() && (Climb.CurrentDirectory() == QFileInfo(Top).canonicalFilePath()); }, 5000));
     Pump(300);
     CHECK(!Climb.IsLoading());

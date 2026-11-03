@@ -187,13 +187,29 @@ Configuration & Configuration::Instance()
   return Instance;
 }
 
+// ~/.config/nixscp on Linux; %APPDATA%\NixSCP (roaming, as WinSCP.ini) on
+// Windows; ~/Library/Application Support/NixSCP on macOS
+static QString ConfigurationDirectory()
+{
+#ifdef Q_OS_WIN
+  QString AppData = qEnvironmentVariable("APPDATA");
+  if (!AppData.isEmpty())
+  {
+    return QDir::fromNativeSeparators(AppData) + QStringLiteral("/NixSCP");
+  }
+#elif defined(Q_OS_MACOS)
+  return QDir::homePath() + QStringLiteral("/Library/Application Support/NixSCP");
+#endif
+  return QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + QStringLiteral("/nixscp");
+}
+
 Configuration::Configuration()
 {
-  QString ConfigRoot = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
-  QString Dir = ConfigRoot + QStringLiteral("/nixscp");
+  QString Dir = ConfigurationDirectory();
+#ifdef Q_OS_LINUX
   // One-time migration from the project's former name (LinSCP): settings,
   // sites and the override file move over on the first start of NixSCP
-  QString OldDir = ConfigRoot + QStringLiteral("/linscp");
+  QString OldDir = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + QStringLiteral("/linscp");
   if (!QFileInfo::exists(Dir) && QFileInfo(OldDir).isDir())
   {
     QDir().mkpath(Dir);
@@ -201,6 +217,7 @@ Configuration::Configuration()
     QFile::copy(OldDir + QStringLiteral("/override.ini"), Dir + QStringLiteral("/override.ini"));
     QFile::setPermissions(Dir + QStringLiteral("/nixscp.ini"), QFileDevice::ReadOwner | QFileDevice::WriteOwner);
   }
+#endif
   QDir().mkpath(Dir);
   // TConfiguration::LoadCustomIniFileStorageName ("WinSCP 2 Override" key)
   IniFile Override;
@@ -215,18 +232,6 @@ Configuration::Configuration()
   FIniFileName = !FCustomIniFileName.isEmpty() ? ExpandPath(FCustomIniFileName) : AutomaticIniFileName();
 }
 
-// ~/.config/nixscp on Linux; %APPDATA%\NixSCP (roaming, as WinSCP.ini) on Windows
-static QString ConfigurationDirectory()
-{
-#ifdef Q_OS_WIN
-  QString AppData = qEnvironmentVariable("APPDATA");
-  if (!AppData.isEmpty())
-  {
-    return QDir::fromNativeSeparators(AppData) + QStringLiteral("/NixSCP");
-  }
-#endif
-  return QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + QStringLiteral("/nixscp");
-}
 
 QString Configuration::OverrideFileName()
 {
@@ -391,7 +396,11 @@ QString Configuration::EditorFor(const QString & FileName) const
     case edExternal:
       return Editor->ExternalEditor.trimmed().isEmpty() ? QString() : Editor->ExternalEditor.trimmed();
     case edOpen:
+#ifdef Q_OS_MACOS
+      return QStringLiteral("open !.!");
+#else
       return QStringLiteral("xdg-open !.!");
+#endif
     default:
       return QString();
   }

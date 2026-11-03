@@ -143,7 +143,7 @@ QString Describe(const PortForward * Tunnel, const QString & Site)
 void SetupMenu(QMenu * Menu, QAction * Manage)
 {
   Menu->setToolTipsVisible(true);
-  QObject::connect(Menu, &QMenu::aboutToShow, Menu, [Menu, Manage]()
+  auto Fill = [Menu, Manage]()
   {
     Menu->clear();
     Menu->addAction(Manage);
@@ -192,7 +192,10 @@ void SetupMenu(QMenu * Menu, QAction * Manage)
     QAction * StopAll = Menu->addAction(QStringLiteral("&Stop All Tunnels"));
     StopAll->setEnabled(!Manager.Tunnels().isEmpty());
     QObject::connect(StopAll, &QAction::triggered, Menu, []() { TunnelManager::Instance().StopAll(); });
-  });
+  };
+  QObject::connect(Menu, &QMenu::aboutToShow, Menu, Fill);
+  // filled at once too: the macOS menu bar leaves out menus that are empty
+  Fill();
 }
 
 QToolButton * CreateIndicator(QWidget * Window)

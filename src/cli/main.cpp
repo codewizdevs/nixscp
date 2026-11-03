@@ -45,6 +45,8 @@
 #include <QRegularExpression>
 #include <QStringDecoder>
 
+#include <csignal>
+
 #ifndef PROJECT_VERSION
 #define PROJECT_VERSION "0.0.0"
 #endif
@@ -897,6 +899,10 @@ static void ApplyRawConfig(Configuration & Config, const QStringList & RawConfig
 
 int main(int argc, char * argv[])
 {
+#ifdef Q_OS_MACOS
+  // a closed connection is an error result, not a signal (no MSG_NOSIGNAL there)
+  signal(SIGPIPE, SIG_IGN);
+#endif
   QCoreApplication App(argc, argv);
   QCoreApplication::setApplicationName(QStringLiteral("nixscp"));
   QCoreApplication::setApplicationVersion(QStringLiteral(PROJECT_VERSION));

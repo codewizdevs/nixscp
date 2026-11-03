@@ -38,6 +38,13 @@
 #include <cstring>
 #include <thread>
 
+// a closed peer is an error result, not SIGPIPE (macOS: SO_NOSIGPIPE / ignored signal)
+#ifdef MSG_NOSIGNAL
+static const int NoSigPipe = MSG_NOSIGNAL;
+#else
+static const int NoSigPipe = 0;
+#endif
+
 static int Failures = 0;
 
 #define CHECK(Cond) \
@@ -107,7 +114,7 @@ static bool SendAll(int S, const QByteArray & Data)
   qsizetype Done = 0;
   while (Done < Data.size())
   {
-    ssize_t N = ::send(S, Data.constData() + Done, static_cast<size_t>(Data.size() - Done), MSG_NOSIGNAL);
+    ssize_t N = ::send(S, Data.constData() + Done, static_cast<size_t>(Data.size() - Done), NoSigPipe);
     if (N <= 0)
     {
       return false;

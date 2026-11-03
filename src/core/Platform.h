@@ -1,9 +1,19 @@
-// Operating system services that differ between Linux and Windows. Everything
-// else in NixSCP uses Qt or these functions, so the same code builds for both.
+// Operating system services that differ between Linux, Windows and macOS.
+// Everything else in NixSCP uses Qt or these functions, so the same code
+// builds for all of them.
 #pragma once
 
 #include <QString>
 #include <QtGlobal>
+
+// Time fields of struct stat: st_mtim (POSIX 2008) is st_mtimespec on macOS
+#ifdef Q_OS_MACOS
+#define NIXSCP_ST_MTIM st_mtimespec
+#define NIXSCP_ST_ATIM st_atimespec
+#else
+#define NIXSCP_ST_MTIM st_mtim
+#define NIXSCP_ST_ATIM st_atim
+#endif
 
 class QProcess;
 

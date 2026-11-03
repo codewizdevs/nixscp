@@ -35,7 +35,9 @@
 #include <QDir>
 #include <QFile>
 #include <QProxyStyle>
+#include <QStyleFactory>
 #include <QTimer>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -98,15 +100,23 @@ static bool OpenInNewWindow()
 }
 
 // Keyboard accelerators (Alt+letter in menus and dialogs) keep working, but
-// their underlines are not drawn
+// their underlines are not drawn. The session tabs start at the left, also
+// on macOS (whose style centers tab bars)
 class NoShortcutUnderlineStyle : public QProxyStyle
 {
 public:
+  explicit NoShortcutUnderlineStyle(QStyle * Base = nullptr) : QProxyStyle(Base) {}
+
   int styleHint(StyleHint Hint, const QStyleOption * Option, const QWidget * Widget, QStyleHintReturn * Return) const override
   {
     if (Hint == QStyle::SH_UnderlineShortcut)
     {
       return 0;
+    }
+    if ((Hint == QStyle::SH_TabBar_Alignment) && (Widget != nullptr) &&
+        (Widget->objectName() == QStringLiteral("SessionsPageControl")))
+    {
+      return Qt::AlignLeft;
     }
     return QProxyStyle::styleHint(Hint, Option, Widget, Return);
   }
@@ -114,6 +124,10 @@ public:
 
 int main(int argc, char * argv[])
 {
+#ifdef Q_OS_MACOS
+  // a closed connection is an error result, not a signal (no MSG_NOSIGNAL there)
+  signal(SIGPIPE, SIG_IGN);
+#endif
   if (const char * AskPassFile = getenv("NIXSCP_ASKPASS_FILE"))
   {
     if (getenv("SSH_ASKPASS") != nullptr)
@@ -148,7 +162,16 @@ int main(int argc, char * argv[])
   ssh_init();
   QApplication App(argc, argv);
   QApplication::setApplicationName(QStringLiteral("NixSCP"));
+#ifdef Q_OS_MACOS
+  // Fusion (following the light/dark appearance): the macOS style draws the
+  // menu buttons of the toolbars and dialogs oddly (arrows below / outside
+  // the buttons, other button shapes). NIXSCP_MACOS_STYLE=native keeps it.
+  QStyle * BaseStyle = (qEnvironmentVariable("NIXSCP_MACOS_STYLE") == QStringLiteral("native")) ?
+    nullptr : QStyleFactory::create(QStringLiteral("Fusion"));
+  App.setStyle(new NoShortcutUnderlineStyle(BaseStyle));
+#else
   App.setStyle(new NoShortcutUnderlineStyle());
+#endif
   QApplication::setApplicationVersion(QStringLiteral(PROJECT_VERSION));
   QApplication::setOrganizationName(QStringLiteral("NixSCP"));
   QApplication::setDesktopFileName(QStringLiteral("nixscp"));
