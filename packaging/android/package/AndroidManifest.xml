@@ -14,6 +14,10 @@
         android:largeScreens="true"
         android:normalScreens="true"
         android:smallScreens="true" />
+    <!-- TransferService: transfers go on while NixSCP is in the background -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Open: which apps can view a file (package visibility, Android 11+) -->
     <queries>
         <intent>
@@ -41,6 +45,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
+          <!-- keep Qt's event loop running in the background: transfer callbacks
+               (and stopping TransferService) happen there -->
+          <meta-data
+                android:name="android.app.background_running"
+                android:value="true" />
+
           <meta-data
                 android:name="android.app.lib_name"
                 android:value="-- %%INSERT_APP_LIB_NAME%% --" />
@@ -49,6 +59,10 @@
                 android:name="android.app.arguments"
                 android:value="-- %%INSERT_APP_ARGUMENTS%% --" />
         </activity>
+        <service
+            android:name="com.nixscp.android.TransferService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

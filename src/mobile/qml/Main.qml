@@ -69,6 +69,11 @@ ApplicationWindow {
             if (share ? !androidFiles.share([path]) : !androidFiles.open(path))
                 app.toast(share ? qsTr("This file cannot be shared.") : qsTr("No app on this phone opens this kind of file."))
         }
+        function onStatusChanged() {
+            // transfers go on in the background (foreground service)
+            var transfer = /^(Downloading|Uploading|Opening)/.test(session.status)
+            androidFiles.keepAlive(session.busy && transfer, session.status)
+        }
         function onDownloaded(paths) {
             app.toast(paths.length === 1 ? qsTr("Saved to %1").arg(paths[0])
                                          : qsTr("%1 files saved to %2").arg(paths.length).arg(session.downloadFolder))
@@ -310,7 +315,8 @@ ApplicationWindow {
         x: (parent.width - width) / 2
         y: parent.height - height - 48
         width: Math.min(parent.width - 32, 480)
-        closePolicy: Popup.CloseOnPressOutside
+        // a message only: taps elsewhere reach the page (not swallowed to close it)
+        closePolicy: Popup.NoAutoClose
         background: Rectangle { radius: 8; color: "#323232" }
         Label { id: toastLabel; width: parent.width; wrapMode: Text.Wrap; color: "white" }
         Timer { id: toastTimer; interval: 3500; onTriggered: toastPopup.close() }

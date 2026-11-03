@@ -16,4 +16,11 @@ public:
   // false: no app can open it
   Q_INVOKABLE bool open(const QString & Path);
   Q_INVOKABLE bool share(const QStringList & Paths);
+  // While a transfer runs: a foreground service (with a notification) keeps
+  // Android from stopping the app and cutting its connection in the background
+  Q_INVOKABLE void keepAlive(bool Busy, const QString & Text);
+
+private:
+  bool FKeptAlive = false;
+  bool FAskedNotifications = false;
 };

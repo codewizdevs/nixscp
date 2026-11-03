@@ -82,6 +82,41 @@ bool AndroidFiles::open(const QString & Path)
 #endif
 }
 
+void AndroidFiles::keepAlive(bool Busy, const QString & Text)
+{
+#ifdef Q_OS_ANDROID
+  QJniObject Ctx = Context();
+  if (Busy)
+  {
+    if (!FAskedNotifications && (QNativeInterface::QAndroidApplication::sdkVersion() >= 33))
+    {
+      // the transfer notification (Android 13+ asks once)
+      FAskedNotifications = true;
+      QJniEnvironment Env;
+      jclass StringClass = Env->FindClass("java/lang/String");
+      jobjectArray Permissions = Env->NewObjectArray(1, StringClass, QJniObject::fromString(
+        QStringLiteral("android.permission.POST_NOTIFICATIONS")).object<jstring>());
+      Ctx.callMethod<void>("requestPermissions", "([Ljava/lang/String;I)V", Permissions, jint(1));
+      Env.checkAndClearExceptions();
+    }
+    QJniObject::callStaticMethod<void>("com/nixscp/android/TransferService", "start",
+      "(Landroid/content/Context;Ljava/lang/String;)V", Ctx.object(), QJniObject::fromString(Text).object<jstring>());
+    FKeptAlive = true;
+  }
+  else if (FKeptAlive)
+  {
+    QJniObject::callStaticMethod<void>("com/nixscp/android/TransferService", "stop",
+      "(Landroid/content/Context;)V", Ctx.object());
+    FKeptAlive = false;
+  }
+  QJniEnvironment Env;
+  Env.checkAndClearExceptions();
+#else
+  Q_UNUSED(Busy);
+  Q_UNUSED(Text);
+#endif
+}
+
 bool AndroidFiles::share(const QStringList & Paths)
 {
 #ifdef Q_OS_ANDROID
