@@ -30,6 +30,7 @@ int main()
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFontMetrics>
 #include <QHeaderView>
 #include <QKeyEvent>
 #include <QLineEdit>
@@ -42,6 +43,7 @@ int main()
 
 #include <cstdio>
 #include <functional>
+#include <typeinfo>
 #include <unistd.h>
 
 static int Failures = 0;
@@ -105,6 +107,75 @@ static void DoubleClick(QTreeView * View, int Row)
   QApplication::sendEvent(View->viewport(), &Double);
   QMouseEvent Release(QEvent::MouseButtonRelease, Pos, Global, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
   QApplication::sendEvent(View->viewport(), &Release);
+}
+
+// The path label (a class private to FilePanel.cpp)
+static QWidget * FindPathLabel(QWidget * Panel)
+{
+  for (QWidget * Widget : Panel->findChildren<QWidget *>())
+  {
+    if (QByteArray(typeid(*Widget).name()).contains("PathLabel"))
+    {
+      return Widget;
+    }
+  }
+  return nullptr;
+}
+
+// Left click on the path label at X (no hover: the mask "*.*" is not shown)
+static void ClickLabel(QWidget * Label, int X)
+{
+  QPoint Pos(X, Label->height() / 2);
+  QMouseEvent Press(QEvent::MouseButtonPress, Pos, Label->mapToGlobal(Pos), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+  QApplication::sendEvent(Label, &Press);
+  QMouseEvent Release(QEvent::MouseButtonRelease, Pos, Label->mapToGlobal(Pos), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+  QApplication::sendEvent(Label, &Release);
+}
+
+// TScpCommanderForm::DoPathLabelPathClick: a click on the last component
+// (the current directory) opens the Open directory dialog, a click on another
+// component goes there
+static void TestPathLabel(const QString & Root)
+{
+  QString Dir = Root + QStringLiteral("/label/sub");
+  QDir().mkpath(Dir);
+  LocalDirectoryProvider Provider;
+  FilePanel Panel(false);
+  Panel.resize(2000, 300);
+  Panel.show();
+  Panel.SetProvider(&Provider);
+  Panel.ChangeDirectory(Dir);
+  CHECK(WaitFor([&]() { return !Panel.IsLoading() && (Panel.CurrentDirectory() == QFileInfo(Dir).canonicalFilePath()); }));
+  QWidget * Label = FindPathLabel(&Panel);
+  CHECK(Label != nullptr);
+  if (Label == nullptr) return;
+  int Opened = 0;
+  QObject::connect(&Panel, &FilePanel::PathLabelDoubleClicked, [&Opened]() { Opened++; });
+
+  // the components as the label lays them out: "/", "tmp/", ..., "sub/"
+  QString Current = Panel.CurrentDirectory();
+  QStringList Names = Current.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+  QFontMetrics Metrics(Label->font());
+  int Left = 4 + Metrics.horizontalAdvance(QStringLiteral("/"));
+  for (int Index = 0; Index < Names.size() - 1; Index++)
+  {
+    Left += Metrics.horizontalAdvance(Names.at(Index) + QLatin1Char('/'));
+  }
+  int ParentMiddle = Left - Metrics.horizontalAdvance(Names.at(Names.size() - 2) + QLatin1Char('/')) / 2;
+  int LastMiddle = Left + Metrics.horizontalAdvance(Names.last() + QLatin1Char('/')) / 2;
+
+  ClickLabel(Label, LastMiddle);
+  CHECK_EQ(Opened, 1);
+  CHECK_EQ(Panel.CurrentDirectory(), Current);
+
+  ClickLabel(Label, ParentMiddle);
+  CHECK_EQ(Opened, 1);
+  CHECK(WaitFor([&]() { return !Panel.IsLoading() && (Panel.CurrentDirectory() == QFileInfo(Current).path()); }));
+
+  // the empty space after the path does nothing
+  ClickLabel(Label, Label->width() - 10);
+  CHECK_EQ(Opened, 1);
+  Panel.SetProvider(nullptr);
 }
 
 static void WriteFile(const QString & Path, qint64 Size)
@@ -825,6 +896,7 @@ int main(int argc, char ** argv)
   TestModel();
   TestLocalListing(Root.path());
   TestPanel(Root.path());
+  TestPathLabel(Root.path());
   TestRemotePanel(Root.path());
 
   std::printf("%d checks, %d failures\n", Checks, Failures);

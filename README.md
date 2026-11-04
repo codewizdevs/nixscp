@@ -212,7 +212,7 @@ Share site folders with colleagues, end-to-end encrypted: **Pro › Teams...**. 
 
 ## Status
 
-**Version 1.2.1** for Linux, Windows, macOS and (new) Android. NixSCP ports WinSCP's features, captions, defaults and shortcuts one-to-one where they make sense on Linux and macOS. Windows-only features without a sane equivalent there (registry storage, drive letters, Windows file attributes, shell extensions) are replaced by native equivalents or removed. The macOS app is not signed by Apple yet; signing is in progress. Bug reports and feature requests are welcome in [Issues](../../issues).
+**Version 1.2.2** for Linux, Windows, macOS and (new) Android. NixSCP ports WinSCP's features, captions, defaults and shortcuts one-to-one where they make sense on Linux and macOS. Windows-only features without a sane equivalent there (registry storage, drive letters, Windows file attributes, shell extensions) are replaced by native equivalents or removed. The macOS app is not signed by Apple yet; signing is in progress. Bug reports and feature requests are welcome in [Issues](../../issues).
 
 ## FAQ
 

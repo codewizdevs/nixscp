@@ -1001,6 +1001,8 @@ public:
   }
 
   std::function<void(const QString & Path)> OnPathClick;
+  // the current directory (the last component) was clicked
+  std::function<void()> OnCurrentPathClick;
   std::function<void()> OnMaskClick;
   std::function<void()> OnClick;
   std::function<void()> OnDoubleClick;
@@ -1244,7 +1246,13 @@ protected:
     {
       if (OnMaskClick) OnMaskClick();
     }
-    else if (!S.Path.isEmpty() && (S.Path != FPath))
+    else if (S.Path == FPath)
+    {
+      // TScpCommanderForm::DoPathLabelPathClick: the current directory opens
+      // the Open directory dialog
+      if (OnCurrentPathClick) OnCurrentPathClick();
+    }
+    else if (!S.Path.isEmpty())
     {
       if (OnPathClick) OnPathClick(S.Path);
     }
@@ -3225,6 +3233,7 @@ FilePanel::FilePanel(bool Remote, QWidget * Parent) :
   // Path label (TPathLabel), colored for the active panel
   d->Label = new PathLabel(d->PanelPage);
   d->Label->OnPathClick = [this](const QString & Path) { ChangeDirectory(Path); };
+  d->Label->OnCurrentPathClick = [this]() { emit PathLabelDoubleClicked(); };
   d->Label->OnMaskClick = [this]() { emit FilterRequested(); };
   d->Label->OnClick = [this]() { d->View->setFocus(); };
   d->Label->OnDoubleClick = [this]() { emit PathLabelDoubleClicked(); };

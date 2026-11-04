@@ -245,7 +245,8 @@ signals:
   void ContextMenuRequested(const QPoint & GlobalPos, bool OnItem);
   // Right click on the path label (LocalPanelPopup/RemotePanelPopup)
   void PanelMenuRequested(const QPoint & GlobalPos);
-  void PathLabelDoubleClicked();                 // PathLabelDblClick (Open Directory/Bookmark)
+  // PathLabelDblClick and a click of the current directory (Open directory)
+  void PathLabelDoubleClicked();
   void NewSessionRequested();
   void LoadFailed(const QString & Error, const QString & MoreMessages);
   void SelectionChanged();
