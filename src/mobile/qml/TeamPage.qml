@@ -1,9 +1,11 @@
-// One team: its members (role, remove), invites (create, share the code,
-// revoke) and the site folders shared into it; rename, delete or leave.
-// Owners and admins manage it; members use its sites.
+// One team: what it shares (share single sites or folders, stop sharing),
+// its members (role, remove) and invites (create, share the code, revoke);
+// rename, delete or leave. Owners and admins manage it; members use its sites.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
+// IconImage: icons in the theme's text colour
+import QtQuick.Controls.impl
 import QtQuick.Layouts
 
 Page {
@@ -12,11 +14,13 @@ Page {
     property var team: ({})
     property var memberList: []
     property var inviteList: []
+    property var sharedList: []
     readonly property bool canEdit: team.canEdit === true
     readonly property bool owner: team.role === "owner"
 
     Component.onCompleted: load()
     function load() {
+        page.sharedList = teams.sharedSites(team.uuid)
         teams.members(team.uuid)
         if (canEdit) teams.invites(team.uuid)
     }
@@ -29,7 +33,9 @@ Page {
             else if (op === "invites") page.inviteList = data
             else if (op === "invite") { codeDialog.code = data; codeDialog.open(); teams.invites(page.team.uuid) }
             else if (op === "revoke" || op === "role" || op === "removeMember") page.load()
-            else if (op === "share") app.toast(qsTr("The folder is now shared with the team."))
+            else if (op === "share") { app.toast(qsTr("The folder is now shared with the team.")); page.sharedList = teams.sharedSites(page.team.uuid) }
+            else if (op === "shareSite") { app.toast(qsTr("The site is now shared with the team.")); page.sharedList = teams.sharedSites(page.team.uuid) }
+            else if (op === "unshare") { app.toast(qsTr("No longer shared.")); page.sharedList = teams.sharedSites(page.team.uuid) }
             else if (op === "rename") app.toast(qsTr("Renamed."))
             else if (op === "delete" || op === "leave") page.StackView.view.pop()
         }
@@ -38,6 +44,7 @@ Page {
             var list = teams.teams
             for (var i = 0; i < list.length; i++)
                 if (list[i].uuid === page.team.uuid) page.team = list[i]
+            page.sharedList = teams.sharedSites(page.team.uuid)
         }
     }
 
@@ -97,8 +104,8 @@ Page {
                 text: qsTr("A member was removed: the team key is being renewed by the next sync of an owner or admin.")
             }
 
-            // ---- sites ----
-            Heading { text: qsTr("Sites") }
+            // ---- shared sites ----
+            Heading { text: qsTr("Shared sites (%1)").arg(page.sharedList.length) }
             Label {
                 Layout.fillWidth: true
                 Layout.leftMargin: 16
@@ -106,26 +113,72 @@ Page {
                 wrapMode: Text.Wrap
                 opacity: 0.7
                 font.pixelSize: 13
-                text: qsTr("The team's sites are in the folder \"Team: %1\" of the site list.").arg(page.team.name || "")
+                text: (page.sharedList.length === 0
+                       ? (page.canEdit ? qsTr("Nothing is shared yet. Share single sites or a whole folder; every member gets them.")
+                                       : qsTr("Nothing is shared with this team yet."))
+                       : qsTr("In the folder \"Team: %1\" of the site list.").arg(page.team.name || ""))
                       + (page.canEdit ? "" : " " + qsTr("Only owners and admins change them."))
             }
-            Button {
-                Layout.leftMargin: 16
+            Repeater {
+                model: page.sharedList
+                delegate: ItemDelegate {
+                    required property string modelData
+                    Layout.fillWidth: true
+                    contentItem: RowLayout {
+                        spacing: 12
+                        IconImage { source: "icons/server.svg"; sourceSize: Qt.size(22, 22); color: Material.foreground; opacity: 0.7 }
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 0
+                            Label { text: modelData.split("/").pop(); elide: Text.ElideRight; Layout.fillWidth: true }
+                            Label {
+                                visible: modelData.indexOf("/") > 0
+                                text: modelData.substring(0, modelData.lastIndexOf("/"))
+                                font.pixelSize: 12; opacity: 0.6; elide: Text.ElideRight; Layout.fillWidth: true
+                            }
+                        }
+                        ToolButton {
+                            visible: page.canEdit
+                            icon.source: "icons/more.svg"
+                            Accessible.name: qsTr("More")
+                            onClicked: { unshareMenu.site = modelData; unshareMenu.popup() }
+                        }
+                    }
+                    onPressAndHold: if (page.canEdit) { unshareMenu.site = modelData; unshareMenu.popup() }
+                }
+            }
+            Menu {
+                id: unshareMenu
+                property string site
+                topMargin: insets.top + 4
+                bottomMargin: insets.bottom + 4
+                MenuItem { text: qsTr("Stop sharing, keep my copy"); onTriggered: { unshareDialog.site = unshareMenu.site; unshareDialog.keep = true; unshareDialog.open() } }
+                MenuItem { text: qsTr("Stop sharing and delete"); onTriggered: { unshareDialog.site = unshareMenu.site; unshareDialog.keep = false; unshareDialog.open() } }
+            }
+            RowLayout {
+                Layout.leftMargin: 8
                 visible: page.canEdit
-                flat: true
-                text: qsTr("Share a folder of your sites…")
-                onClicked: { folderMenu.folders = teams.localFolders(); folderMenu.popup() }
-                Menu {
-                    id: folderMenu
-                    topMargin: insets.top + 4
-                    bottomMargin: insets.bottom + 4
-                    property var folders: []
-                    Repeater {
-                        model: folderMenu.folders
-                        delegate: MenuItem {
-                            required property string modelData
-                            text: modelData
-                            onTriggered: { shareDialog.folder = modelData; shareDialog.open() }
+                Button {
+                    flat: true
+                    text: qsTr("Share a site…")
+                    onClicked: { sitePicker.sites = teams.localSites(); sitePicker.open() }
+                }
+                Button {
+                    flat: true
+                    text: qsTr("Share a folder…")
+                    onClicked: { folderMenu.folders = teams.localFolders(); folderMenu.popup() }
+                    Menu {
+                        id: folderMenu
+                        topMargin: insets.top + 4
+                        bottomMargin: insets.bottom + 4
+                        property var folders: []
+                        Repeater {
+                            model: folderMenu.folders
+                            delegate: MenuItem {
+                                required property string modelData
+                                text: modelData
+                                onTriggered: { shareDialog.folder = modelData; shareDialog.open() }
+                            }
                         }
                     }
                 }
@@ -252,6 +305,65 @@ Page {
             text: qsTr("Its sites (with their passwords) move into \"Team: %1\" and every member gets them.").arg(page.team.name)
         }
         onAccepted: teams.shareFolder(page.team.uuid, folder)
+    }
+
+    // pick one of your own sites to share
+    Dialog {
+        id: sitePicker
+        property var sites: []
+        property string filter: ""
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 32, 440)
+        height: Math.min(parent.height - insets.top - insets.bottom - 32, 560)
+        modal: true
+        title: qsTr("Share a site")
+        standardButtons: Dialog.Cancel
+        onOpened: { siteFilter.text = ""; keepCopy.checked = true }
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: 4
+            TextField {
+                id: siteFilter
+                Layout.fillWidth: true
+                placeholderText: qsTr("Search your sites")
+                inputMethodHints: Qt.ImhNoPredictiveText
+                onTextChanged: sitePicker.filter = text.toLowerCase()
+            }
+            CheckBox { id: keepCopy; text: qsTr("Keep my own copy as well"); checked: true }
+            ListView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                model: sitePicker.sites.filter(function(s) { return sitePicker.filter.length === 0 || s.toLowerCase().indexOf(sitePicker.filter) >= 0 })
+                delegate: ItemDelegate {
+                    required property string modelData
+                    width: ListView.view.width
+                    text: modelData
+                    onClicked: {
+                        teams.shareSite(page.team.uuid, modelData, "", !keepCopy.checked)
+                        sitePicker.close()
+                    }
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: unshareDialog
+        property string site
+        property bool keep: true
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 32, 440)
+        modal: true
+        title: qsTr("Stop sharing \"%1\"?").arg(site.split("/").pop())
+        standardButtons: Dialog.Cancel | Dialog.Yes
+        Label {
+            width: unshareDialog.availableWidth
+            wrapMode: Text.Wrap
+            text: (unshareDialog.keep ? qsTr("It moves back to your own sites.") : qsTr("It is deleted."))
+                  + " " + qsTr("The members lose it at their next sync. They could have copied its password while it was shared.")
+        }
+        onAccepted: teams.unshare(page.team.uuid, [site], keep)
     }
 
     Dialog {

@@ -1,6 +1,7 @@
 // Port of WinSCP source/forms/NonVisual.{cpp,dfm}: the action list
 // (captions, 'Short|Long' hints, Commander shortcuts) and the menu builders
 #include "gui/AgentAccessDialog.h"
+#include "gui/TeamsDialog.h"
 #include "gui/TunnelsDialog.h"
 #include "gui/CloudSyncUi.h"
 #include "gui/CommanderActions.h"
@@ -1214,6 +1215,9 @@ void CommanderWindow::CreateMenus()
 
   // NixSCP: saved SSH tunnels, started and stopped from here
   TunnelsUi::SetupMenu(menuBar()->addMenu(QStringLiteral("T&unnels")), FA->Get(QStringLiteral("TunnelsAction")));
+
+  // NixSCP Teams: shared sites (gui/TeamsDialog)
+  TeamsDialog::SetupMenu(menuBar()->addMenu(QStringLiteral("Tea&ms")), this, [this]() { return CurrentSiteName(); });
 
   // Help: Contents (F1), Homepage, Report a Bug, Send Feedback, History, About
   QMenu * Help = menuBar()->addMenu(QStringLiteral("&Help"));

@@ -225,7 +225,7 @@ static void TestStructure(CommanderWindow & Window)
   // ScpCommander.dfm MenuToolbar; a local browser tab says Left/Right.
   // NixSCP Pro adds its menu after Help ("Cloud Sync" when signed out).
   QStringList Titles = MenuTitles(Bar);
-  CHECK_MSG(Titles == QStringList({"&Left", "&Mark", "&Files", "&Commands", "&Tabs", "&Options", "&Right", "T&unnels", "&Help", "Cloud Sync"}),
+  CHECK_MSG(Titles == QStringList({"&Left", "&Mark", "&Files", "&Commands", "&Tabs", "&Options", "&Right", "T&unnels", "Tea&ms", "&Help", "Cloud Sync"}),
     Titles.join(QStringLiteral("|")));
   QStringList Files = MenuItems(TopMenu(Bar, QStringLiteral("&Files")));
   CHECK_MSG(StartsWith(Files, QStringList({"&New", "-", "&Open", "&Edit", "Edit &Link...", "-"})), Files.join(QStringLiteral("|")));

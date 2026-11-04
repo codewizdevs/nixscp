@@ -6,6 +6,7 @@
 
 #include <QObject>
 #include <QVariantList>
+#include <QVariantMap>
 
 class TeamsModel : public QObject
 {
@@ -41,11 +42,25 @@ public:
   Q_INVOKABLE void removeMember(const QString & Uuid, const QString & User);
   // the folders of the site list that are not team folders
   Q_INVOKABLE QStringList localFolders() const;
+  // the sites of the site list that are not in a team (stored names)
+  Q_INVOKABLE QStringList localSites() const;
+  // the team's shared sites, relative to its folder ("sub/site")
+  Q_INVOKABLE QStringList sharedSites(const QString & Uuid) const;
+  // shares a site of the site list (stored name); Move: it leaves the
+  // personal sites, otherwise a copy is shared
+  Q_INVOKABLE void shareSite(const QString & Uuid, const QString & Site, const QString & Subfolder, bool Move);
+  // stops sharing (names relative to the team's folder, "sub/" for a
+  // folder); KeepCopy: they move to the personal sites
+  Q_INVOKABLE void unshare(const QString & Uuid, const QStringList & Names, bool KeepCopy);
+  // the team of a stored site name: {uuid, name, relative, canEdit}, or empty
+  Q_INVOKABLE QVariantMap siteTeam(const QString & Site) const;
 
 signals:
   void changed();
   void busyChanged();
   void finished(const QString & op, bool ok, const QString & error, const QVariant & data);
+  // a sync brought changes of a team's sites
+  void sitesReceived(const QString & team, int added, int removed, int changed);
 
 private:
   int FBusy = 0;

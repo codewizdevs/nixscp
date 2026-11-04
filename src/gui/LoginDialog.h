@@ -135,6 +135,7 @@ private:
   QPushButton * EditButton;
   QToolButton * AdvancedButton;
   QPushButton * AgentAccessButton;
+  QPushButton * TeamButton;
   QGroupBox * NoteGroup;
   QPlainTextEdit * NoteMemo;
   QPushButton * LoginButton;
@@ -164,6 +165,9 @@ private:
   QAction * EditCancelAction;
   QAction * SessionAdvancedAction;
   QAction * AgentAccessAction;
+  // NixSCP Teams: share the selected site or folder, or stop sharing it
+  QAction * ShareWithTeamAction;
+  QAction * StopSharingAction;
   QAction * PreferencesLoggingAction;
   QAction * CloneToNewSiteAction;
   QAction * PasteUrlAction;
@@ -270,6 +274,11 @@ private:
   void ResetNewSessionActionExecute();
   void SetDefaultSessionActionExecute();
   void AgentAccessActionExecute();
+  void ShareWithTeamActionExecute();
+  void StopSharingActionExecute();
+  // The team of the selected node (site or folder), with its name relative
+  // to the team's folder ("sub/" for a folder); false when not in a team
+  bool SelectedTeamItem(QString & TeamUuid, QString & Relative) const;
   void SessionAdvancedActionExecute(bool Raw);
   void ImportSessionsActionExecute();
   void ImportActionExecute();

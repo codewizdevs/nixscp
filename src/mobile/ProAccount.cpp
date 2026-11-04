@@ -25,7 +25,7 @@ ProAccount::ProAccount(AndroidFiles * Files, QObject * Parent) : QObject(Parent)
   // the license daily, teams every few minutes (as desktop)
   FLicenseTimer.setInterval(24 * 60 * 60 * 1000);
   connect(&FLicenseTimer, &QTimer::timeout, this, []() { Sync().CheckLicense(); });
-  FTeamsTimer.setInterval(3 * 60 * 1000);
+  FTeamsTimer.setInterval(60 * 1000);
   connect(&FTeamsTimer, &QTimer::timeout, this, []()
   {
     if (TeamSync::Instance().Available())
@@ -70,6 +70,14 @@ void ProAccount::Start()
   });
   connect(&TeamSync::Instance(), &TeamSync::Changed, this, &ProAccount::sitesChanged);
   connect(&TeamSync::Instance(), &TeamSync::Notice, this, &ProAccount::notice);
+  connect(&TeamSync::Instance(), &TeamSync::SitesReceived, this, [this](const QString & Team, int Added, int Removed, int Changed)
+  {
+    QStringList Parts;
+    if (Added > 0) Parts.append(tr("%n added", nullptr, Added));
+    if (Changed > 0) Parts.append(tr("%n changed", nullptr, Changed));
+    if (Removed > 0) Parts.append(tr("%n removed", nullptr, Removed));
+    emit notice(tr("Team \"%1\": sites %2.").arg(Team, Parts.join(QStringLiteral(", "))));
+  });
   FLicenseTimer.start();
   FTeamsTimer.start();
   QTimer::singleShot(30 * 1000, this, []() { Sync().CheckLicense(); });

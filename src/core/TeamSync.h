@@ -62,6 +62,15 @@ public:
   void Leave(const QString & Uuid, const Done & Callback);
   // Moves the sites of a local folder into the team (as a subfolder) and pushes
   void ShareFolder(const QString & Uuid, const QString & Folder, const Done & Callback);
+  // The team's shared sites, relative to its folder ("sub/site"), sorted
+  QStringList SharedSites(const QString & Uuid) const;
+  // Shares personal sites (stored names) with the team: they move (Move) or
+  // are copied into its folder, under Subfolder when given; pushes
+  void ShareSites(const QString & Uuid, const QStringList & Names, const QString & Subfolder, bool Move, const Done & Callback);
+  // Stops sharing team sites (names relative to the team's folder; "sub/"
+  // = everything in a subfolder): the members lose them at their next sync.
+  // KeepCopy: they move to this person's own sites; otherwise deleted. Pushes.
+  void Unshare(const QString & Uuid, const QStringList & Names, bool KeepCopy, const Done & Callback);
   // Creates an invite; Callback gets the code to hand over ("<id>-<secret>")
   void CreateInvite(const QString & Uuid, const QString & Role, int Days,
     const std::function<void(bool Ok, const QString & Error, const QString & Code)> & Callback);
@@ -80,6 +89,8 @@ signals:
   void Changed();
   // Something the user should know (removed from a team, changes reverted...)
   void Notice(const QString & Message);
+  // A sync brought changes of a team's sites (from another person or computer)
+  void SitesReceived(const QString & TeamName, int Added, int Removed, int Changed);
 
 private:
   TeamSync() = default;

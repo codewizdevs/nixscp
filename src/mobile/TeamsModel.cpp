@@ -19,6 +19,7 @@ TeamsModel::TeamsModel(QObject * Parent) : QObject(Parent)
 void TeamsModel::Start()
 {
   connect(&Teams(), &TeamSync::Changed, this, &TeamsModel::changed);
+  connect(&Teams(), &TeamSync::SitesReceived, this, &TeamsModel::sitesReceived);
 }
 
 QVariantList TeamsModel::teams() const
@@ -115,4 +116,50 @@ QStringList TeamsModel::localFolders() const
   QStringList Result(Folders.begin(), Folders.end());
   Result.sort(Qt::CaseInsensitive);
   return Result;
+}
+
+QStringList TeamsModel::localSites() const
+{
+  QStringList Result;
+  for (const auto & Data : Configuration::Instance().StoredSessions().Sessions())
+  {
+    if (!Data->IsWorkspace && !Data->Name.startsWith(CloudSettings::TeamFolderPrefix))
+    {
+      Result.append(Data->Name);
+    }
+  }
+  std::sort(Result.begin(), Result.end(), [](const QString & A, const QString & B)
+  {
+    return StoredSessionList::CompareLogicalText(A, B) < 0;
+  });
+  return Result;
+}
+
+QStringList TeamsModel::sharedSites(const QString & Uuid) const
+{
+  return Teams().SharedSites(Uuid);
+}
+
+void TeamsModel::shareSite(const QString & Uuid, const QString & Site, const QString & Subfolder, bool Move)
+{
+  Teams().ShareSites(Uuid, {Site}, Subfolder, Move, Done(QStringLiteral("shareSite")));
+}
+
+void TeamsModel::unshare(const QString & Uuid, const QStringList & Names, bool KeepCopy)
+{
+  Teams().Unshare(Uuid, Names, KeepCopy, Done(QStringLiteral("unshare")));
+}
+
+QVariantMap TeamsModel::siteTeam(const QString & Site) const
+{
+  for (const TeamSync::Team & T : Teams().Teams())
+  {
+    QString Prefix = TeamSync::FolderName(T.Name) + QLatin1Char('/');
+    if (Site.startsWith(Prefix))
+    {
+      return QVariantMap{{QStringLiteral("uuid"), T.Uuid}, {QStringLiteral("name"), T.Name},
+        {QStringLiteral("relative"), Site.mid(Prefix.size())}, {QStringLiteral("canEdit"), T.CanEdit()}};
+    }
+  }
+  return QVariantMap();
 }

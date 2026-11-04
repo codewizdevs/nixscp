@@ -80,6 +80,8 @@ public:
   CommanderActions * Actions() const { return FA; }
   // The connected tabs with their current directories (workspace / cloud session)
   QList<SessionData> WorkspaceTabs() const;
+  // The stored site of the current tab (empty for an ad-hoc session or a local tab)
+  QString CurrentSiteName() const;
   EditorManager * Editors() const { return FEditorManager; }
 
 public slots:

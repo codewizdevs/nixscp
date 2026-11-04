@@ -41,6 +41,8 @@ int main()
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSpinBox>
+#include <QListWidget>
+#include <QTabWidget>
 #include <QTableWidget>
 #include <QTcpServer>
 #include <QTemporaryDir>
@@ -472,14 +474,18 @@ static void TestTeams()
     SignIn = SignIn || Label->text().contains(QStringLiteral("Sign in to NixSCP Pro"));
   }
   CHECK(SignIn);
-  for (const QString & Caption : {QStringLiteral("New Team..."), QStringLiteral("Join with Code..."), QStringLiteral("Sync Now"),
-         QStringLiteral("Add Folder..."), QStringLiteral("Invite..."), QStringLiteral("Members..."), QStringLiteral("Rename..."),
-         QStringLiteral("Leave"), QStringLiteral("Delete")})
+  for (const QString & Caption : {QStringLiteral("New Team..."), QStringLiteral("Join with Code..."), QStringLiteral("Sync Now")})
   {
     QAbstractButton * B = Button(&Dialog, Caption);
     CHECK((B != nullptr) && !B->isEnabled());
   }
-  CHECK(Dialog.findChild<QTableWidget *>()->rowCount() == 0);
+  // no team: the team details (shared sites, members, invites) are hidden
+  QListWidget * Teams = Dialog.findChild<QListWidget *>();
+  CHECK((Teams != nullptr) && (Teams->count() == 0));
+  QTabWidget * Tabs = Dialog.findChild<QTabWidget *>();
+  CHECK((Tabs != nullptr) && !Tabs->isVisible());
+  // a team's shared sites, members and invites are tabs of the dialog
+  CHECK((Tabs != nullptr) && (Tabs->count() == 3) && Tabs->tabText(0).startsWith(QStringLiteral("Shared Sites")));
   Dialog.close();
 }
 

@@ -1,5 +1,4 @@
 #include "gui/CloudSyncUi.h"
-#include "gui/TeamsDialog.h"
 #include "gui/UnlockDialog.h"
 
 #include "core/TeamSync.h"
@@ -53,7 +52,7 @@ static const QString CloudWorkspace = QStringLiteral("NixSCP Cloud Session");
 static constexpr int SessionIntervalMs = 60 * 1000;
 static constexpr int LicenseFirstCheckMs = 30 * 1000;
 static constexpr int TeamsFirstSyncMs = 20 * 1000;
-static constexpr int TeamsIntervalMs = 3 * 60 * 1000;
+static constexpr int TeamsIntervalMs = 60 * 1000;
 static constexpr int LicenseCheckIntervalMs = 24 * 60 * 60 * 1000;
 // Focusing the window checks the cloud when the last check is older
 static constexpr int FocusCheckSeconds = 60;
@@ -850,7 +849,6 @@ static void FillMenu(QMenu * Menu, QWidget * Window)
     Now->setEnabled(Sync.State() != CloudSync::csSyncing);
   }
   Menu->addAction(QStringLiteral("Cloud Sync Settings..."), Window, [Window]() { ShowDialog(Window); });
-  Menu->addAction(QStringLiteral("Teams..."), Window, [Window]() { TeamsDialog::Execute(Window); });
   Menu->addSeparator();
   Menu->addAction(QStringLiteral("Manage Account..."), Window, [Open]() { Open(QStringLiteral("/account")); });
   Menu->addSeparator();
@@ -1022,7 +1020,7 @@ public:
     FIndicator->setToolButtonStyle(Qt::ToolButtonTextOnly);
     Window->statusBar()->addPermanentWidget(FIndicator);
     connect(FIndicator, &QToolButton::clicked, Window, [Window]() { ShowDialog(Window); });
-    // NixSCP Teams: shortly after the start, then every few minutes
+    // NixSCP Teams: shortly after the start, then every minute
     FTeamsTimer = new QTimer(this);
     FTeamsTimer->setInterval(TeamsIntervalMs);
     auto SyncTeams = []()
@@ -1045,6 +1043,15 @@ public:
       Box->setAttribute(Qt::WA_DeleteOnClose);
       Box->setWindowModality(Qt::NonModal);
       Box->show();
+    });
+    connect(&TeamSync::Instance(), &TeamSync::SitesReceived, this,
+      [this](const QString & TeamName, int Added, int Removed, int Changed)
+    {
+      QStringList Parts;
+      if (Added > 0) Parts.append(QStringLiteral("%1 added").arg(Added));
+      if (Changed > 0) Parts.append(QStringLiteral("%1 changed").arg(Changed));
+      if (Removed > 0) Parts.append(QStringLiteral("%1 removed").arg(Removed));
+      FWindow->statusBar()->showMessage(QStringLiteral("Team \"%1\": sites %2.").arg(TeamName, Parts.join(QStringLiteral(", "))), 10000);
     });
     // the license, also without uploads (e.g. when the beta ends): soon after
     // the start, then daily

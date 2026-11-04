@@ -3612,6 +3612,17 @@ void CommanderWindow::closeEvent(QCloseEvent * Event)
 //---------------------------------------------------------------------------
 // Workspaces (forms/CustomScpExplorer.cpp SaveWorkspace / TTerminalManager)
 
+QString CommanderWindow::CurrentSiteName() const
+{
+  SessionTab * Tab = CurrentTab();
+  if ((Tab == nullptr) || Tab->LocalBrowser || (Tab->Term == nullptr))
+  {
+    return QString();
+  }
+  QString Name = Tab->Data.Name;
+  return (Configuration::Instance().StoredSessions().FindByName(Name) != nullptr) ? Name : QString();
+}
+
 QList<SessionData> CommanderWindow::WorkspaceTabs() const
 {
   QList<SessionData> Result;

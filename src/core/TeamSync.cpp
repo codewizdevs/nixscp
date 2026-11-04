@@ -12,6 +12,7 @@
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSet>
 #include <QUrl>
 
 namespace
@@ -207,6 +208,13 @@ void TeamSync::SaveSites()
   emit FConfig->StoredSessionsChanged();
 }
 
+// What tells a changed site apart for the people using it
+static QString Summary(const SessionData & Data)
+{
+  return QStringList{Data.HostName, Data.UserName, QString::number(Data.PortNumber), Data.Password,
+    Data.RemoteDirectory, Data.PublicKeyFile}.join(QLatin1Char('\n'));
+}
+
 void TeamSync::Apply(Team & T, const QByteArray & Content)
 {
   QString Folder = FolderName(T.Name);
@@ -219,6 +227,12 @@ void TeamSync::Apply(Team & T, const QByteArray & Content)
     {
       Own.insert(Data->Name, *Data);
     }
+  }
+  // what the people using the sites see change
+  QHash<QString, QString> Before;
+  for (auto It = Own.cbegin(); It != Own.cend(); ++It)
+  {
+    Before.insert(It.key(), Summary(It.value()));
   }
   RemoveLocal(Folder);
   State & S = FStates[T.Uuid];
@@ -247,7 +261,39 @@ void TeamSync::Apply(Team & T, const QByteArray & Content)
     }
     Sites.Add(Copy);
   }
+  int Added = 0;
+  int Changed = 0;
+  QSet<QString> After;
+  for (const auto & Data : Sites.Sessions())
+  {
+    if (Data->Name.startsWith(Folder + QLatin1Char('/')))
+    {
+      After.insert(Data->Name);
+      auto It = Before.constFind(Data->Name);
+      if (It == Before.cend())
+      {
+        Added++;
+      }
+      else if (*It != Summary(*Data))
+      {
+        Changed++;
+      }
+    }
+  }
+  int Removed = 0;
+  for (auto It = Before.cbegin(); It != Before.cend(); ++It)
+  {
+    if (!After.contains(It.key()))
+    {
+      Removed++;
+    }
+  }
   SaveSites();
+  // not for the first sync of a team (its sites arrive), nor after a rename
+  if ((Added + Removed + Changed > 0) && (S.Base > 0) && (S.Folder.isEmpty() || (S.Folder == Folder)))
+  {
+    emit SitesReceived(T.Name, Added, Removed, Changed);
+  }
   S.Folder = Folder;
   S.Hash = CloudSettings::Hash(LocalContent(T));
 }
@@ -741,6 +787,125 @@ void TeamSync::ShareFolder(const QString & Uuid, const QString & Folder, const D
   QString Leaf = Folder.section(QLatin1Char('/'), -1);
   QString Target = FolderName(T->Name) + QLatin1Char('/') + Leaf;
   FConfig->StoredSessions().RenameFolder(Folder, Target);
+  SaveSites();
+  SyncAll(Callback);
+}
+
+QStringList TeamSync::SharedSites(const QString & Uuid) const
+{
+  QStringList Result;
+  const Team * T = Find(Uuid);
+  if (T == nullptr)
+  {
+    return Result;
+  }
+  QString Prefix = FolderName(T->Name) + QLatin1Char('/');
+  for (const auto & Data : FConfig->StoredSessions().Sessions())
+  {
+    if (Data->Name.startsWith(Prefix) && !Data->IsWorkspace)
+    {
+      Result.append(Data->Name.mid(Prefix.size()));
+    }
+  }
+  std::sort(Result.begin(), Result.end(), [](const QString & A, const QString & B)
+  {
+    return StoredSessionList::CompareLogicalText(A, B) < 0;
+  });
+  return Result;
+}
+
+void TeamSync::ShareSites(const QString & Uuid, const QStringList & Names, const QString & Subfolder, bool Move, const Done & Callback)
+{
+  const Team * T = Find(Uuid);
+  if ((T == nullptr) || !T->CanEdit() || T->Key.isEmpty())
+  {
+    Callback(false, QStringLiteral("Only owners and admins can add sites to a team."));
+    return;
+  }
+  QString Target = FolderName(T->Name);
+  QString Sub = Subfolder.trimmed();
+  while (Sub.startsWith(QLatin1Char('/'))) Sub.remove(0, 1);
+  while (Sub.endsWith(QLatin1Char('/'))) Sub.chop(1);
+  if (!Sub.isEmpty())
+  {
+    Target += QLatin1Char('/') + Sub;
+  }
+  StoredSessionList & Sites = FConfig->StoredSessions();
+  int Count = 0;
+  for (const QString & Name : Names)
+  {
+    std::shared_ptr<SessionData> Data = Sites.FindByName(Name);
+    if ((Data == nullptr) || Data->IsWorkspace || Name.startsWith(CloudSettings::TeamFolderPrefix))
+    {
+      continue;
+    }
+    auto Copy = std::make_shared<SessionData>(*Data);
+    Copy->Name = Target + QLatin1Char('/') + Name.section(QLatin1Char('/'), -1);
+    Copy->MakeUniqueIn(Sites);
+    if (Move)
+    {
+      Sites.Remove(Name);
+    }
+    Sites.Add(Copy);
+    Count++;
+  }
+  if (Count == 0)
+  {
+    Callback(false, QStringLiteral("There is no site to share (sites of a team or workspaces cannot be shared)."));
+    return;
+  }
+  SaveSites();
+  SyncAll(Callback);
+}
+
+void TeamSync::Unshare(const QString & Uuid, const QStringList & Names, bool KeepCopy, const Done & Callback)
+{
+  const Team * T = Find(Uuid);
+  if ((T == nullptr) || !T->CanEdit() || T->Key.isEmpty())
+  {
+    Callback(false, QStringLiteral("Only owners and admins can stop sharing a team's sites."));
+    return;
+  }
+  QString Prefix = FolderName(T->Name) + QLatin1Char('/');
+  StoredSessionList & Sites = FConfig->StoredSessions();
+  QStringList Selected;
+  for (const auto & Data : Sites.Sessions())
+  {
+    if (!Data->Name.startsWith(Prefix))
+    {
+      continue;
+    }
+    QString Relative = Data->Name.mid(Prefix.size());
+    for (const QString & Name : Names)
+    {
+      if ((Relative == Name) || (Name.endsWith(QLatin1Char('/')) && Relative.startsWith(Name)))
+      {
+        Selected.append(Data->Name);
+        break;
+      }
+    }
+  }
+  if (Selected.isEmpty())
+  {
+    Callback(false, QStringLiteral("The selected sites are not shared in this team."));
+    return;
+  }
+  for (const QString & Name : Selected)
+  {
+    std::shared_ptr<SessionData> Data = Sites.FindByName(Name);
+    if (KeepCopy)
+    {
+      auto Copy = std::make_shared<SessionData>(*Data);
+      Copy->Name = Name.mid(Prefix.size());
+      Sites.Remove(Name);
+      Copy->MakeUniqueIn(Sites);
+      Sites.Add(Copy);
+    }
+    else
+    {
+      Sites.Remove(Name);
+    }
+  }
   SaveSites();
   SyncAll(Callback);
 }

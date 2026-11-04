@@ -191,6 +191,95 @@ Page {
                 font.pixelSize: 12
                 text: qsTr("Use / for folders, e.g. Clients/web1.")
             }
+
+            // ---- NixSCP Teams: share this site, or stop sharing it ----
+            Label {
+                visible: page.original.length > 0 && teams.available
+                Layout.topMargin: 12
+                text: qsTr("Team")
+                font.bold: true
+            }
+            Label {
+                visible: page.original.length > 0 && teams.available
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                opacity: 0.7
+                font.pixelSize: 13
+                text: page.siteTeam.uuid ? qsTr("Shared with the team \"%1\".").arg(page.siteTeam.name)
+                                         : qsTr("Share this site, with its stored password, with your colleagues in a team.")
+            }
+            Button {
+                visible: page.original.length > 0 && teams.available && !page.siteTeam.uuid
+                flat: true
+                text: qsTr("Share with a team…")
+                onClicked: {
+                    var list = teams.teams.filter(function(t) { return t.canEdit && t.keyReady })
+                    if (list.length === 0) { app.toast(qsTr("Create a team first (NixSCP Pro, Teams).")); return }
+                    teamMenu.teamList = list
+                    teamMenu.popup()
+                }
+                Menu {
+                    id: teamMenu
+                    property var teamList: []
+                    topMargin: insets.top + 4
+                    bottomMargin: insets.bottom + 4
+                    Repeater {
+                        model: teamMenu.teamList
+                        delegate: MenuItem {
+                            required property var modelData
+                            text: modelData.name
+                            onTriggered: { shareSiteDialog.team = modelData; shareSiteDialog.open() }
+                        }
+                    }
+                }
+            }
+            Button {
+                visible: page.original.length > 0 && teams.available && !!page.siteTeam.uuid && page.siteTeam.canEdit === true
+                flat: true
+                text: qsTr("Stop sharing…")
+                onClicked: stopMenu.popup()
+                Menu {
+                    id: stopMenu
+                    topMargin: insets.top + 4
+                    bottomMargin: insets.bottom + 4
+                    MenuItem { text: qsTr("Stop sharing, keep my copy"); onTriggered: teams.unshare(page.siteTeam.uuid, [page.siteTeam.relative], true) }
+                    MenuItem { text: qsTr("Stop sharing and delete"); onTriggered: teams.unshare(page.siteTeam.uuid, [page.siteTeam.relative], false) }
+                }
+            }
+        }
+    }
+
+    // the team of the site being edited ({} when it is not shared)
+    readonly property var siteTeam: original.length > 0 && teams.teams ? teams.siteTeam(original) : ({})
+
+    Dialog {
+        id: shareSiteDialog
+        property var team: ({})
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 32, 440)
+        modal: true
+        title: qsTr("Share with \"%1\"?").arg(team.name || "")
+        standardButtons: Dialog.Cancel | Dialog.Yes
+        onOpened: shareKeep.checked = true
+        ColumnLayout {
+            width: shareSiteDialog.availableWidth
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                text: qsTr("Every member of the team gets this site with its stored password.")
+            }
+            CheckBox { id: shareKeep; text: qsTr("Keep my own copy as well") }
+        }
+        onAccepted: teams.shareSite(team.uuid, page.original, "", !shareKeep.checked)
+    }
+
+    Connections {
+        target: teams
+        function onFinished(op, ok, error, data) {
+            if (op !== "shareSite" && op !== "unshare") return
+            if (!ok) { if (error) app.toast(error); return }
+            app.toast(op === "shareSite" ? qsTr("Shared with the team.") : qsTr("No longer shared."))
+            page.StackView.view.pop()
         }
     }
 

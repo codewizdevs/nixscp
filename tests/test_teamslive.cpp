@@ -1,7 +1,8 @@
 // NixSCP Teams against a real NixSCP cloud server (core/TeamSync): two
 // accounts on separate "computers" (configuration folders, processes): Alice
 // creates a team and shares a site folder, invites Bob with a code, Bob joins
-// and gets the sites (members' local changes are reverted), Alice adds a site,
+// and gets the sites (members' local changes are reverted), Alice adds a site
+// and shares single sites (copied and moved), stops sharing them again,
 // removes Bob (the key is renewed, Bob loses the sites), and deletes the team.
 //
 // Skipped unless NIXSCP_TEST_CLOUD_COOKIE and NIXSCP_TEST_CLOUD_COOKIE2 are
@@ -209,6 +210,16 @@ static int RunStep(const QString & Dir, const QString & Step, const QString & Sh
     CHECK(Teams.Find(Uuid)->MemberCount == 2);
     AddSite(TeamFolder + QStringLiteral("/Shared/db1"), QStringLiteral("db1-password"));
     CHECK(Wait([&](const auto & D) { Teams.SyncAll(D); }));
+    // a single site, copied into a subfolder: the personal one stays
+    CHECK(Wait([&](const auto & D) { Teams.ShareSites(Uuid, {QStringLiteral("Private/mine")}, QStringLiteral("Ops"), false, D); }));
+    CHECK(Site(TeamFolder + QStringLiteral("/Ops/mine")) != nullptr);
+    CHECK(Site(QStringLiteral("Private/mine")) != nullptr);
+    // a single site, moved to the team's top level
+    AddSite(QStringLiteral("Temp/gone"), QStringLiteral("gone-password"));
+    CHECK(Wait([&](const auto & D) { Teams.ShareSites(Uuid, {QStringLiteral("Temp/gone")}, QString(), true, D); }));
+    CHECK(Site(TeamFolder + QStringLiteral("/gone")) != nullptr);
+    CHECK(Site(QStringLiteral("Temp/gone")) == nullptr);
+    CHECK(Teams.SharedSites(Uuid) == QStringList({QStringLiteral("gone"), QStringLiteral("Ops/mine"), QStringLiteral("Shared/db1"), QStringLiteral("Shared/web1")}));
     // Bob's agent access setting did not come to Alice
     CHECK(Site(TeamFolder + QStringLiteral("/Shared/web1"))->AgentAccess == 0);
   }
@@ -217,11 +228,43 @@ static int RunStep(const QString & Dir, const QString & Step, const QString & Sh
     // the open site lists (Login dialog) are told to reload
     int Reloads = 0;
     QObject::connect(&Configuration::Instance(), &Configuration::StoredSessionsChanged, [&Reloads]() { Reloads++; });
+    int Added = 0;
+    QObject::connect(&Teams, &TeamSync::SitesReceived, [&Added](const QString &, int A, int, int) { Added += A; });
     CHECK(Wait([&](const auto & D) { Teams.SyncAll(D); }));
     CHECK(Reloads > 0);
+    CHECK(Added == 3);
+    CHECK(Site(TeamFolder + QStringLiteral("/Ops/mine")) != nullptr);
+    CHECK(Site(TeamFolder + QStringLiteral("/gone")) != nullptr);
+    // members cannot stop sharing
+    CHECK(!Wait([&](const auto & D) { Teams.Unshare(TeamUuid(), {QStringLiteral("gone")}, true, D); }));
     auto Db1 = Site(TeamFolder + QStringLiteral("/Shared/db1"));
     CHECK((Db1 != nullptr) && (Db1->Password == QStringLiteral("db1-password")));
     CHECK(Site(TeamFolder + QStringLiteral("/Shared/web1"))->AgentAccess == 1);
+  }
+  else if (Step == QStringLiteral("alice-unshare"))
+  {
+    CHECK(Wait([&](const auto & D) { Teams.SyncAll(D); }));
+    QString Uuid = TeamUuid();
+    // stop sharing, keeping a personal copy
+    CHECK(Wait([&](const auto & D) { Teams.Unshare(Uuid, {QStringLiteral("gone")}, true, D); }));
+    CHECK(Site(TeamFolder + QStringLiteral("/gone")) == nullptr);
+    CHECK((Site(QStringLiteral("gone")) != nullptr) && (Site(QStringLiteral("gone"))->Password == QStringLiteral("gone-password")));
+    // a whole subfolder, deleted
+    CHECK(Wait([&](const auto & D) { Teams.Unshare(Uuid, {QStringLiteral("Ops/")}, false, D); }));
+    CHECK(Site(TeamFolder + QStringLiteral("/Ops/mine")) == nullptr);
+    CHECK(Site(QStringLiteral("Ops/mine")) == nullptr);
+    CHECK(Teams.SharedSites(Uuid) == QStringList({QStringLiteral("Shared/db1"), QStringLiteral("Shared/web1")}));
+  }
+  else if (Step == QStringLiteral("bob-unshared"))
+  {
+    int Removed = 0;
+    QObject::connect(&Teams, &TeamSync::SitesReceived, [&Removed](const QString &, int, int R, int) { Removed += R; });
+    CHECK(Wait([&](const auto & D) { Teams.SyncAll(D); }));
+    CHECK(Removed == 2);
+    CHECK(Site(TeamFolder + QStringLiteral("/gone")) == nullptr);
+    CHECK(Site(TeamFolder + QStringLiteral("/Ops/mine")) == nullptr);
+    CHECK(Site(QStringLiteral("gone")) == nullptr);
+    CHECK(Site(TeamFolder + QStringLiteral("/Shared/web1")) != nullptr);
   }
   else if (Step == QStringLiteral("alice-remove"))
   {
@@ -281,6 +324,7 @@ int main(int argc, char ** argv)
   const QList<QPair<QString, QString>> Steps{
     {Alice.path(), QStringLiteral("alice-setup")}, {Bob.path(), QStringLiteral("bob-setup")},
     {Alice.path(), QStringLiteral("alice-add")}, {Bob.path(), QStringLiteral("bob-pull")},
+    {Alice.path(), QStringLiteral("alice-unshare")}, {Bob.path(), QStringLiteral("bob-unshared")},
     {Alice.path(), QStringLiteral("alice-remove")}, {Bob.path(), QStringLiteral("bob-removed")},
     {Alice.path(), QStringLiteral("alice-delete")}};
   for (const auto & Step : Steps)

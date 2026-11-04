@@ -1,6 +1,9 @@
 // Port of WinSCP source/forms/Login.cpp, forms/ImportSessions.cpp,
 // forms/Cleanup.cpp and TSaveSessionDialog/DoSaveSession of forms/Custom.cpp
 #include "gui/LoginDialog.h"
+#include "core/CloudSettings.h"
+#include "gui/TeamsDialog.h"
+#include "core/TeamSync.h"
 #include "gui/AgentAccessDialog.h"
 #include "core/Platform.h"
 #include "gui/CloudSyncUi.h"
@@ -385,9 +388,14 @@ LoginDialog::LoginDialog(StoredSessionList & Sessions, QWidget * Parent) :
   connect(QGuiApplication::clipboard(), &QClipboard::dataChanged, this, [this]() { UpdateClipboardUrl(); });
   ResetNewSiteData();
   LoadSessions();
+  // NixSCP Teams: sites shared since the last sync show up right away
+  if (TeamSync::Instance().Available())
+  {
+    TeamSync::Instance().SyncAll();
+  }
   connect(&Configuration::Instance(), &Configuration::StoredSessionsChanged, this, [this]()
   {
-    // another instance saved the sites
+    // another instance saved the sites, or a team's sites changed
     if (!FEditing && !FRenaming)
     {
       ReloadSessions(SessionNodePath(Selected()) + (IsFolderNode(Selected()) ? QStringLiteral("/") : QString()));
@@ -458,6 +466,8 @@ void LoginDialog::CreateActions()
   SessionAdvancedAction = Action(QStringLiteral("A&dvanced..."), [this]() { SessionAdvancedActionExecute(false); });
   // NixSCP Agent Access (gui/AgentAccessDialog.h)
   AgentAccessAction = Action(QStringLiteral("A&gent Access..."), [this]() { AgentAccessActionExecute(); });
+  ShareWithTeamAction = Action(QStringLiteral("S&hare with Team..."), [this]() { ShareWithTeamActionExecute(); });
+  StopSharingAction = Action(QStringLiteral("Stop S&haring with Team..."), [this]() { StopSharingActionExecute(); });
   PreferencesLoggingAction = Action(QStringLiteral("&Logging..."), [this]()
   {
     PreferencesDialog::Execute(this, QStringLiteral("Logging"));
@@ -730,7 +740,14 @@ void LoginDialog::CreateControls()
   AgentAccessButton = new QPushButton(AgentAccessAction->text());
   AgentAccessButton->setToolTip(QStringLiteral("Let AI agents and other programs use this site without getting its password"));
   connect(AgentAccessButton, &QPushButton::clicked, AgentAccessAction, &QAction::trigger);
-  for (QPushButton * B : {EditCancelButton, EditButton, AgentAccessButton})
+  // NixSCP Teams: share the site with a team, or stop sharing it
+  TeamButton = new QPushButton(ShareWithTeamAction->text());
+  connect(TeamButton, &QPushButton::clicked, this, [this]()
+  {
+    QString Uuid, Relative;
+    if (SelectedTeamItem(Uuid, Relative)) StopSharingActionExecute(); else ShareWithTeamActionExecute();
+  });
+  for (QPushButton * B : {EditCancelButton, EditButton, AgentAccessButton, TeamButton})
   {
     B->setAutoDefault(false);
   }
@@ -739,6 +756,7 @@ void LoginDialog::CreateControls()
   SessionButtons->addWidget(EditCancelButton);
   SessionButtons->addWidget(EditButton);
   SessionButtons->addStretch();
+  SessionButtons->addWidget(TeamButton);
   SessionButtons->addWidget(AgentAccessButton);
   SessionButtons->addWidget(AdvancedButton);
   Grid->addLayout(SessionButtons, 7, 0, 1, 4);
@@ -1737,6 +1755,26 @@ void LoginDialog::UpdateActions()
   SessionAdvancedAction->setEnabled(Editable);
   AgentAccessAction->setEnabled(Editable);
   AgentAccessButton->setEnabled(Editable);
+  {
+    // NixSCP Teams
+    bool Teams = TeamSync::Instance().Available();
+    QString TeamUuid, Relative;
+    bool InTeam = SelectedTeamItem(TeamUuid, Relative);
+    const TeamSync::Team * T = InTeam ? TeamSync::Instance().Find(TeamUuid) : nullptr;
+    bool Shareable = Teams && !InTeam && !Special && !FEditing &&
+      ((SiteSelected && (Session != nullptr)) || (IsFolderNode(Node) && HasNodeAnySession(Node)));
+    bool Stoppable = Teams && InTeam && (T != nullptr) && T->CanEdit() && !FEditing;
+    ShareWithTeamAction->setVisible(Teams && !InTeam);
+    ShareWithTeamAction->setEnabled(Shareable);
+    StopSharingAction->setVisible(Teams && InTeam);
+    StopSharingAction->setEnabled(Stoppable);
+    TeamButton->setVisible(Teams && SiteSelected && (Session != nullptr) && !Special);
+    TeamButton->setText(InTeam ? ((T != nullptr) && T->CanEdit() ? QStringLiteral("Stop S&haring...") : QStringLiteral("Shared by Team"))
+                               : ShareWithTeamAction->text());
+    TeamButton->setEnabled(InTeam ? Stoppable : Shareable);
+    TeamButton->setToolTip(InTeam ? QStringLiteral("Shared in the team \"%1\"").arg((T != nullptr) ? T->Name : QString())
+                                  : QStringLiteral("Share this site, with its stored password, with your colleagues in a NixSCP team"));
+  }
   SessionRawAction->setEnabled(Editable);
   SaveAsSessionAction->setEnabled(Editable);
   NewSessionFolderAction->setEnabled(!FEditing);
@@ -2374,6 +2412,93 @@ void LoginDialog::SetDefaultSessionActionExecute()
     FSessions.SetDefaultSettings(Data);
     Configuration::Instance().Save();
     Default();
+  }
+}
+
+bool LoginDialog::SelectedTeamItem(QString & TeamUuid, QString & Relative) const
+{
+  QTreeWidgetItem * Node = Selected();
+  QString Path = SessionNodePath(Node);
+  if (Path.isEmpty() || !Path.startsWith(CloudSettings::TeamFolderPrefix))
+  {
+    return false;
+  }
+  if (IsFolderNode(Node))
+  {
+    // the team's folder itself: everything; a subfolder: "sub/"
+    for (const TeamSync::Team & T : TeamSync::Instance().Teams())
+    {
+      QString Folder = TeamSync::FolderName(T.Name);
+      if (Path == Folder)
+      {
+        TeamUuid = T.Uuid;
+        Relative = QString();
+        return true;
+      }
+      if (Path.startsWith(Folder + QLatin1Char('/')))
+      {
+        TeamUuid = T.Uuid;
+        Relative = Path.mid(Folder.size() + 1) + QLatin1Char('/');
+        return true;
+      }
+    }
+    return false;
+  }
+  return TeamsDialog::TeamSite(Path, TeamUuid, Relative);
+}
+
+void LoginDialog::ShareWithTeamActionExecute()
+{
+  UpdateActions();
+  if (!ShareWithTeamAction->isEnabled())
+  {
+    return;
+  }
+  QTreeWidgetItem * Node = Selected();
+  QString Path = SessionNodePath(Node);
+  QStringList Names;
+  QString Subfolder;
+  if (IsFolderNode(Node))
+  {
+    for (const auto & Data : FSessions.Sessions())
+    {
+      if (Data->Name.startsWith(Path + QLatin1Char('/')) && !Data->IsWorkspace)
+      {
+        Names.append(Data->Name);
+      }
+    }
+    Subfolder = Path.section(QLatin1Char('/'), -1);
+  }
+  else
+  {
+    Names.append(Path);
+  }
+  if (!Names.isEmpty() && TeamsDialog::ShareSites(this, Names, Subfolder))
+  {
+    ReloadSessions(QString());
+  }
+}
+
+void LoginDialog::StopSharingActionExecute()
+{
+  QString TeamUuid, Relative;
+  if (!SelectedTeamItem(TeamUuid, Relative))
+  {
+    return;
+  }
+  QStringList Names;
+  if (Relative.isEmpty())
+  {
+    // the whole team folder: everything shared
+    Names = TeamSync::Instance().SharedSites(TeamUuid);
+  }
+  else
+  {
+    Names.append(Relative);
+  }
+  if (TeamsDialog::StopSharing(this, TeamUuid, Names))
+  {
+    ReloadSessions(QString());
   }
 }
 
@@ -3028,6 +3153,12 @@ QMenu * LoginDialog::GetSelectedNodePopupMenu()
     Menu->addAction(SetDefaultSessionAction);
     Menu->addSeparator();
     Menu->addAction(NewSessionFolderAction);
+    if (ShareWithTeamAction->isVisible() || StopSharingAction->isVisible())
+    {
+      Menu->addSection(QStringLiteral("Team"));
+      Menu->addAction(ShareWithTeamAction);
+      Menu->addAction(StopSharingAction);
+    }
     Menu->addSection(QStringLiteral("Site Shell Icon"));
     Menu->addAction(DesktopIconAction);
     AddSearch();
@@ -3045,6 +3176,12 @@ QMenu * LoginDialog::GetSelectedNodePopupMenu()
     Menu->addAction(RenameSessionAction);
     Menu->addSeparator();
     Menu->addAction(NewSessionFolderAction);
+    if (ShareWithTeamAction->isVisible() || StopSharingAction->isVisible())
+    {
+      Menu->addSection(QStringLiteral("Team"));
+      Menu->addAction(ShareWithTeamAction);
+      Menu->addAction(StopSharingAction);
+    }
     Menu->addSection(QStringLiteral("Site Folder Shell Icon"));
     Menu->addAction(DesktopIconAction);
     AddSearch();

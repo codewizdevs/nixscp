@@ -10,14 +10,20 @@ signed in with [cloud sync](cloud-sync.md) unlocked on their computer.
 
 ## Quick start
 
-1. **Pro > Teams...** > **New Team...**, and give it a name. You are its owner.
-2. Put the sites you want to share into a site folder (Login dialog: **New Folder**), then select the team and click
-   **Add Folder...**. The folder's sites move into the team and appear in the site tree under
-   **Team: &lt;team name&gt;**.
-3. Click **Invite...**, choose the role and how long the code is valid, and click **Create Code**. Send the code
-   privately (chat, in person).
-4. The colleague opens **Pro > Teams... > Join with Code...** and enters the code. The team's sites appear in their
-   site tree.
+1. **Teams > New Team...** (on Android: menu > Teams), and give it a name. You are its owner.
+2. Share sites with it, in any of these ways:
+   - In the Login dialog, select a site and click **Share with Team...** (next to Agent Access), or right-click a site
+     or a folder > **Share with Team...**.
+   - In the main window, **Teams > Share Current Site with Team...** shares the site of the current tab.
+   - In **Teams > Manage Teams...**, select the team and use **Share Sites...** (tick any of your sites) or
+     **Share Folder...**.
+
+   Shared sites appear in the site tree under **Team: &lt;team name&gt;**. When you share single sites you can keep
+   your own copy as well; otherwise the site moves into the team's folder.
+3. On the **Members** tab, click **Invite...**, choose the role and how long the code is valid, and click
+   **Create Code**. Send the code privately (chat, in person).
+4. The colleague chooses **Teams > Join Team with Code...** and enters the code. The team's sites appear in their site
+   tree right away.
 
 ## Roles
 
@@ -25,7 +31,7 @@ signed in with [cloud sync](cloud-sync.md) unlocked on their computer.
 |---|---|---|---|
 | Use the team's sites | Yes | Yes | Yes |
 | Edit the team's sites (changes are shared) | Yes | Yes | No: local changes are reverted |
-| Add folders to the team | Yes | Yes | No |
+| Share sites and folders with the team, stop sharing them | Yes | Yes | No |
 | Invite members | Yes | Yes | No |
 | Invite admins | Yes | No | No |
 | See and revoke pending invites | Yes | Yes | No |
@@ -36,28 +42,46 @@ signed in with [cloud sync](cloud-sync.md) unlocked on their computer.
 | Leave the team | No (delete it instead) | Yes | Yes |
 | Delete the team | Yes | No | No |
 
-Each team has exactly one owner, who cannot leave or be removed. **Members...** shows everyone's e-mail address,
-role and join date; owners and admins also see the pending invites there.
+Each team has exactly one owner, who cannot leave or be removed. The **Members** tab shows everyone's e-mail
+address, role and join date; owners and admins also see the pending invites on the **Invites** tab.
 
-## The Teams window
+## The Teams menu and window
 
-| Button | What it does |
+The main window's **Teams** menu has:
+
+| Item | What it does |
 |---|---|
-| New Team... | Creates a team with you as owner. |
-| Join with Code... | Joins a team with an invite code. |
-| Sync Now | Syncs all teams now (otherwise 20 seconds after NixSCP starts and every 3 minutes). |
-| Add Folder... | Moves the sites of one of your site folders into the selected team. |
-| Invite... | Creates an invite code. |
-| Members... | Members and roles; Make Admin, Make Member, Remove; pending invites and Revoke Invite. |
-| Rename... | Renames the team (the `Team: <name>` folder follows on every computer). |
-| Leave | Leaves the team; its sites are removed from this computer. |
-| Delete | Deletes the team for everyone: all members lose its sites and its synced data is deleted. Cannot be undone. |
+| Manage Teams... | Opens the Teams window. |
+| Share Current Site with Team... / Stop Sharing Current Site... | For the stored site of the current tab. |
+| Your teams | Each team with your role and how many sites it shares; opens it in the Teams window. |
+| New Team..., Join Team with Code... | Creates a team, or joins one with an invite code. |
+| Sync Teams Now | Syncs all teams now (otherwise 20 seconds after NixSCP starts, every minute, and when the Login dialog opens). |
 
-The **Status** column shows `Synced`, `Renewing the team key...`, or `Waiting for the team key from an admin`.
+The **Teams window** lists your teams on the left. For the selected team:
+
+| Part | What it does |
+|---|---|
+| Shared Sites | Everything the team shares, as a tree. **Share Sites...** (tick any of your sites), **Share Folder...**, **Stop Sharing...** for the selected sites or folders. |
+| Members | Everyone in the team with role and join date; **Invite...**, **Make Admin**, **Make Member**, **Remove...**. |
+| Invites | Pending invite codes (owners and admins); **New Invite...**, **Revoke**. |
+| Team menu | **Rename...**; **Delete Team...** (owner) or **Leave Team...** (everyone else). |
+
+## Stop sharing
+
+Owners and admins can stop sharing any site or folder of a team: in the Teams window (**Stop Sharing...**), in the
+Login dialog (select a team site > **Stop Sharing...**, or right-click > **Stop Sharing with Team...**), or from the
+**Teams** menu for the current site. Choose:
+
+- **Stop Sharing, Keep My Copy**: the site moves back to your own sites (with its password).
+- **Stop Sharing and Delete**: the site is deleted.
+
+Either way the members lose it at their next sync (within about a minute while NixSCP runs). They could have copied
+the stored passwords while it was shared, so change the passwords that matter.
 
 ## Team sites
 
-- A team's sites live in the site folder **`Team: <team name>`** (with subfolders as you added them). They work
+- A team's sites live in the site folder **`Team: <team name>`** (with subfolders as you added them). New, changed and
+  removed team sites show up in the open Login dialog right away, with a note in the status bar. They work
   like any other site.
 - **Owners and admins** edit them in the Login dialog as usual; NixSCP uploads the changes to the team. If two admins
   change the team's sites at the same time, the version that reached the cloud first wins, and the other admin is
