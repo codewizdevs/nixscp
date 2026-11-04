@@ -1,8 +1,9 @@
 # NixSCP for Android
 
-A phone companion built on the same core as the desktop app (`src/core`), with
-a touch interface in Qt Quick (`src/mobile`). Status: **prototype**, not
-released.
+A phone and tablet companion built on the same core as the desktop app
+(`src/core`), with a touch interface in Qt Quick (`src/mobile`). Released as
+an APK on GitHub (`NixSCP-<version>-android-arm64.apk`, Android 9+, 64-bit
+ARM); not on Google Play yet.
 
 ## What works
 
@@ -103,8 +104,9 @@ $QT_ANDROID_X86_64/bin/qt-cmake -S . -B builds/android-x86_64 -G Ninja -DCMAKE_B
 cmake --build builds/android-x86_64 --target apk
 # -> builds/android-x86_64/src/mobile/android-build/nixscp-mobile.apk
 
-# phones (arm64), release: use $QT_ANDROID_ARM64 and -DCMAKE_BUILD_TYPE=Release,
-# then zipalign + apksigner (a debug key for testing; the release key later)
+# phones (arm64), release, signed with the release key (kept outside the repository):
+NIXSCP_ANDROID_KEYSTORE=/path/to/nixscp-release.jks NIXSCP_ANDROID_KEYSTORE_PASS=... packaging/build-android.sh
+# -> bin/NixSCP-<version>-android-arm64.apk (the version code follows the version: 1.2.1 = 10201)
 ```
 
 On Android the CMake project builds only the core and `src/mobile` (no desktop
@@ -123,6 +125,6 @@ adb install -r bin/android/NixSCP-1.2.1-android-x86_64-emulator.apk
 NixSCP then appears in the app drawer. From the emulator, `10.0.2.2` is this
 computer (e.g. an SSH server listening on 127.0.0.1 here).
 
-On a phone: allow installing from unknown sources and open
-`bin/android/NixSCP-1.2.1-android-arm64-test.apk` (signed with the local debug
-key, for testing only).
+On a phone: download the release APK and open it, allowing installs from
+that source when Android asks. A build signed with another key (a debug
+build) cannot update it: uninstall first.
