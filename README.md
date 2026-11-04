@@ -2,17 +2,17 @@
   <img src="docs/screenshots/nixscp-icon.png" width="128" alt="NixSCP icon">
 </p>
 
-<h1 align="center">NixSCP — WinSCP for Linux and macOS</h1>
+<h1 align="center">NixSCP — WinSCP for Linux, macOS and Android</h1>
 
 <p align="center">
-  <b>A native SFTP, SCP, FTP/FTPS, WebDAV and Amazon S3 client for Linux, macOS and Windows, with the familiar WinSCP interface.</b><br>
-  Same Commander layout, same shortcuts, same settings file — your WinSCP sites, passwords and preferences move over in one click.
+  <b>A native SFTP, SCP, FTP/FTPS, WebDAV and Amazon S3 client for Linux, macOS, Windows and Android, with the familiar WinSCP interface.</b><br>
+  Same Commander layout, same shortcuts, same settings file — your WinSCP sites, passwords and preferences move over in one click, to your desktop and your phone.
 </p>
 
 <p align="center">
   <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/codewizdevs/nixscp?label=release"></a>
   <img alt="License: GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-green">
-  <img alt="Platform: Linux, Windows, macOS" src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS%20%7C%20Android-orange">
+  <img alt="Platform: Linux, Windows, macOS, Android" src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS%20%7C%20Android-orange">
   <img alt="Qt 6" src="https://img.shields.io/badge/Qt-6-41cd52">
   <img alt="Desktops" src="https://img.shields.io/badge/desktop-GNOME%20%7C%20KDE%20%7C%20XFCE-lightgrey">
   <img alt="Languages" src="https://img.shields.io/badge/languages-55-blueviolet">
@@ -20,7 +20,7 @@
 
 ---
 
-**NixSCP** is a free, open-source **WinSCP alternative for Linux and macOS**, also available for Windows — not a Wine wrapper, but a native C++/Qt 6 rewrite of WinSCP's code base. If you moved from Windows to Ubuntu, Fedora, Debian, Linux Mint, Arch, openSUSE or a Mac and miss WinSCP, NixSCP gives you the same two-panel file manager for secure file transfer, with the same keyboard shortcuts (F5 Copy, F6 Move, F7 New folder, F8 Delete…), dialogs and behaviour — and it reads and writes WinSCP's own configuration format.
+**NixSCP** is a free, open-source **WinSCP alternative for Linux and macOS**, also available for Windows and as an app for Android phones and tablets — not a Wine wrapper, but a native C++/Qt 6 rewrite of WinSCP's code base. If you moved from Windows to Ubuntu, Fedora, Debian, Linux Mint, Arch, openSUSE or a Mac and miss WinSCP, NixSCP gives you the same two-panel file manager for secure file transfer, with the same keyboard shortcuts (F5 Copy, F6 Move, F7 New folder, F8 Delete…), dialogs and behaviour — and it reads and writes WinSCP's own configuration format.
 
 ## Documentation
 
