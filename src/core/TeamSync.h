@@ -113,5 +113,8 @@ private:
   void Push(const QString & Uuid, const Done & Callback);
   void Apply(Team & T, const QByteArray & Content);
   void RemoveLocal(const QString & Folder);
+  // Saves the configuration after a change of team sites and tells the
+  // open site lists (Login dialog) to reload them
+  void SaveSites();
   void Finish(bool Ok, const QString & Error);
 };

@@ -200,6 +200,13 @@ void TeamSync::RemoveLocal(const QString & Folder)
   }
 }
 
+void TeamSync::SaveSites()
+{
+  FConfig->Save();
+  // Save() signals only changes of another instance
+  emit FConfig->StoredSessionsChanged();
+}
+
 void TeamSync::Apply(Team & T, const QByteArray & Content)
 {
   QString Folder = FolderName(T.Name);
@@ -240,7 +247,7 @@ void TeamSync::Apply(Team & T, const QByteArray & Content)
     }
     Sites.Add(Copy);
   }
-  FConfig->Save();
+  SaveSites();
   S.Folder = Folder;
   S.Hash = CloudSettings::Hash(LocalContent(T));
 }
@@ -383,7 +390,7 @@ void TeamSync::FetchTeams(const Done & Callback)
       {
         QString Folder = It->Folder;
         RemoveLocal(Folder);
-        FConfig->Save();
+        SaveSites();
         emit Notice(QStringLiteral("You are no longer a member of the team \"%1\"; its sites were removed from this computer.")
           .arg(Folder.mid(CloudSettings::TeamFolderPrefix.size())));
         It = FStates.erase(It);
@@ -681,7 +688,7 @@ void TeamSync::Rename(const QString & Uuid, const QString & Name, const Done & C
       QString From = FolderName(FTeams[Uuid].Name);
       QString To = FolderName(Name);
       FConfig->StoredSessions().RenameFolder(From, To);
-      FConfig->Save();
+      SaveSites();
       FTeams[Uuid].Name = Name.trimmed();
       FStates[Uuid].Folder = To;
     }
@@ -699,7 +706,7 @@ void TeamSync::DeleteTeam(const QString & Uuid, const Done & Callback)
       return;
     }
     RemoveLocal(FStates.value(Uuid).Folder);
-    FConfig->Save();
+    SaveSites();
     FStates.remove(Uuid);
     FTeams.remove(Uuid);
     SyncAll(Callback);
@@ -716,7 +723,7 @@ void TeamSync::Leave(const QString & Uuid, const Done & Callback)
       return;
     }
     RemoveLocal(FStates.value(Uuid).Folder);
-    FConfig->Save();
+    SaveSites();
     FStates.remove(Uuid);
     FTeams.remove(Uuid);
     SyncAll(Callback);
@@ -734,7 +741,7 @@ void TeamSync::ShareFolder(const QString & Uuid, const QString & Folder, const D
   QString Leaf = Folder.section(QLatin1Char('/'), -1);
   QString Target = FolderName(T->Name) + QLatin1Char('/') + Leaf;
   FConfig->StoredSessions().RenameFolder(Folder, Target);
-  FConfig->Save();
+  SaveSites();
   SyncAll(Callback);
 }
 

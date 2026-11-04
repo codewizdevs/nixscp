@@ -214,7 +214,11 @@ static int RunStep(const QString & Dir, const QString & Step, const QString & Sh
   }
   else if (Step == QStringLiteral("bob-pull"))
   {
+    // the open site lists (Login dialog) are told to reload
+    int Reloads = 0;
+    QObject::connect(&Configuration::Instance(), &Configuration::StoredSessionsChanged, [&Reloads]() { Reloads++; });
     CHECK(Wait([&](const auto & D) { Teams.SyncAll(D); }));
+    CHECK(Reloads > 0);
     auto Db1 = Site(TeamFolder + QStringLiteral("/Shared/db1"));
     CHECK((Db1 != nullptr) && (Db1->Password == QStringLiteral("db1-password")));
     CHECK(Site(TeamFolder + QStringLiteral("/Shared/web1"))->AgentAccess == 1);
