@@ -1,4 +1,8 @@
 #include "core/CloudSync.h"
+
+#ifdef Q_OS_ANDROID
+#include <QJniObject>
+#endif
 #include "core/ConfigVault.h"
 #include "core/Security.h"
 
@@ -71,6 +75,13 @@ CloudSync::CloudSync() :
 
 QString CloudSync::DeviceName()
 {
+#ifdef Q_OS_ANDROID
+  // phones have no host name ("localhost"): the maker and model
+  QString Maker = QJniObject::getStaticObjectField<jstring>("android/os/Build", "MANUFACTURER").toString();
+  QString Model = QJniObject::getStaticObjectField<jstring>("android/os/Build", "MODEL").toString();
+  QString Phone = Model.startsWith(Maker, Qt::CaseInsensitive) ? Model : (Maker + QLatin1Char(' ') + Model);
+  return QStringLiteral("%1 (Android %2)").arg(Phone.trimmed(), QSysInfo::productVersion()).left(100);
+#endif
   QString Name = QSysInfo::machineHostName();
   QString Os = QSysInfo::prettyProductName();
   if (!Os.isEmpty())
