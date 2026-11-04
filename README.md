@@ -12,7 +12,7 @@
 <p align="center">
   <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/codewizdevs/nixscp?label=release"></a>
   <img alt="License: GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-green">
-  <img alt="Platform: Linux, Windows, macOS" src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-orange">
+  <img alt="Platform: Linux, Windows, macOS" src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS%20%7C%20Android-orange">
   <img alt="Qt 6" src="https://img.shields.io/badge/Qt-6-41cd52">
   <img alt="Desktops" src="https://img.shields.io/badge/desktop-GNOME%20%7C%20KDE%20%7C%20XFCE-lightgrey">
   <img alt="Languages" src="https://img.shields.io/badge/languages-55-blueviolet">
@@ -98,6 +98,7 @@ Download the package for your distribution from the [latest release](../../relea
 | Other distributions (Ubuntu 24.04+, Linux Mint, Arch, openSUSE…) | `NixSCP-<version>-x86_64.AppImage` |
 | Windows 10 / 11 (64-bit) | `NixSCP-<version>-setup.exe` (installer) or `NixSCP-<version>-windows-x64.zip` (portable) |
 | macOS 12 or newer (Apple Silicon and Intel) | `NixSCP-<version>-macos-universal.dmg` (not signed yet, see below) |
+| Android 9 or newer (64-bit ARM phones and tablets) | `NixSCP-<version>-android-arm64.apk` (not on Google Play yet, see below) |
 
 ```bash
 sudo apt install ./nixscp_*_amd64.deb      # Ubuntu / Debian
@@ -110,6 +111,8 @@ Release packages use your desktop icon theme. The AppImage bundles Qt, libssh an
 On Windows, the installer can add `nixscp-cli` to `PATH`; the portable zip runs from any folder. Settings are stored in `%APPDATA%\NixSCP`.
 
 **macOS (new, not signed yet):** open the `.dmg` and drag NixSCP to Applications. The app is not yet signed with an Apple Developer ID or notarized (we are working on it), so macOS blocks the first start: right-click NixSCP › **Open** › **Open**, or System Settings › Privacy & Security › **Open Anyway** (or `xattr -dr com.apple.quarantine /Applications/NixSCP.app`). The source code it is built from is right here, and the build runs on GitHub Actions, so you can review both. Settings are stored in `~/Library/Application Support/NixSCP`. For Agent Access and scripts, link the command line tools: `sudo ln -sf /Applications/NixSCP.app/Contents/MacOS/NixSCP /usr/local/bin/nixscp` (and `nixscp-cli` likewise).
+
+**Android (new):** a companion app for phones and tablets on the same core: saved sites with search and favourites, the phone's files and the server's side by side (two panes on foldables and tablets), a transfer queue that keeps going in the background, a terminal (top, htop, vi), an editor, SSH keys, and NixSCP Pro sync, encryption and Teams. It is not on Google Play yet: download the `.apk` on the phone, open it and allow installing from this source when Android asks. Updates install over it the same way. Details: [packaging/android/README.md](packaging/android/README.md).
 
 ### Build from source
 
@@ -140,6 +143,10 @@ The Windows version is cross-compiled on Linux with llvm-mingw, Qt for Windows (
 ### Building for macOS
 
 `packaging/build-macos.sh` builds the universal `NixSCP.app` and the `.dmg` on a Mac (Xcode command line tools, Qt for macOS, OpenSSL and libssh for both architectures); `.github/workflows/macos.yml` shows the whole setup.
+
+### Building for Android
+
+`packaging/android/setup-sdk.sh` installs the Android SDK, NDK and Qt for Android, `packaging/android/build-deps.sh` builds OpenSSL and libssh; the steps are in [packaging/android/README.md](packaging/android/README.md).
 
 ### Building with WinSCP's original icons
 
@@ -205,7 +212,7 @@ Share site folders with colleagues, end-to-end encrypted: **Pro › Teams...**. 
 
 ## Status
 
-**Version 1.2.1** for Linux, Windows and (new) macOS. NixSCP ports WinSCP's features, captions, defaults and shortcuts one-to-one where they make sense on Linux and macOS. Windows-only features without a sane equivalent there (registry storage, drive letters, Windows file attributes, shell extensions) are replaced by native equivalents or removed. The macOS app is not signed by Apple yet; signing is in progress. Bug reports and feature requests are welcome in [Issues](../../issues).
+**Version 1.2.1** for Linux, Windows, macOS and (new) Android. NixSCP ports WinSCP's features, captions, defaults and shortcuts one-to-one where they make sense on Linux and macOS. Windows-only features without a sane equivalent there (registry storage, drive letters, Windows file attributes, shell extensions) are replaced by native equivalents or removed. The macOS app is not signed by Apple yet; signing is in progress. Bug reports and feature requests are welcome in [Issues](../../issues).
 
 ## FAQ
 

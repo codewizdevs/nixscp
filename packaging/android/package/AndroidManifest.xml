@@ -3,6 +3,7 @@
      configuration (stored passwords), and the window kept in place when
      the keyboard opens (the pages keep the focused field visible) -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     package="org.qtproject.example"
     android:installLocation="auto"
     android:versionCode="-- %%INSERT_VERSION_CODE%% --"
@@ -18,10 +19,23 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Fingerprint / face unlock of the encrypted configuration (NixSCP Pro) -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission android:name="android.permission.USE_FINGERPRINT" />
+    <!-- The phone pane (a file manager for copying to and from servers):
+         "All files access" on Android 11+, the storage permission before -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" tools:ignore="ScopedStorage" />
     <!-- Open: which apps can view a file (package visibility, Android 11+) -->
     <queries>
         <intent>
             <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="*/*" />
+        </intent>
+        <!-- Edit: the editors for remote files (Settings) -->
+        <intent>
+            <action android:name="android.intent.action.EDIT" />
             <data android:mimeType="*/*" />
         </intent>
     </queries>
@@ -43,6 +57,13 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Share -> NixSCP: files from other apps to upload to a server -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
             </intent-filter>
 
           <!-- keep Qt's event loop running in the background: transfer callbacks

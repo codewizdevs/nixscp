@@ -15,6 +15,16 @@ foreach(QML_FILE ${MOBILE_QML})
   get_filename_component(QML_NAME ${QML_FILE} NAME)
   set_source_files_properties(${QML_FILE} PROPERTIES QT_RESOURCE_ALIAS ${QML_NAME})
 endforeach()
+# libvterm (third_party/libvterm, MIT): the terminal's screen
+enable_language(C)
+file(GLOB VTERM_SOURCES ${CMAKE_SOURCE_DIR}/third_party/libvterm/src/*.c)
+add_library(vterm STATIC ${VTERM_SOURCES})
+set_target_properties(vterm PROPERTIES C_STANDARD 99 POSITION_INDEPENDENT_CODE ON)
+target_include_directories(vterm PUBLIC ${CMAKE_SOURCE_DIR}/third_party/libvterm/include
+  PRIVATE ${CMAKE_SOURCE_DIR}/third_party/libvterm/src)
+target_compile_options(vterm PRIVATE -w)
+
+math(EXPR NIXSCP_ANDROID_VERSION_CODE "${PROJECT_VERSION_MAJOR} * 10000 + ${PROJECT_VERSION_MINOR} * 100 + ${PROJECT_VERSION_PATCH}")
 qt_add_executable(nixscp-mobile ${MOBILE_SOURCES})
 qt_add_qml_module(nixscp-mobile
   URI NixSCP
@@ -22,7 +32,8 @@ qt_add_qml_module(nixscp-mobile
   QML_FILES ${MOBILE_QML}
   RESOURCES ${CMAKE_SOURCE_DIR}/resources/appicon/nixscp-128.png ${MOBILE_ICONS})
 
-target_link_libraries(nixscp-mobile PRIVATE nixscpcore Qt6::Quick Qt6::QuickControls2 Qt6::Svg)
+# CorePrivate: QZipWriter (archives of servers without commands)
+target_link_libraries(nixscp-mobile PRIVATE nixscpcore vterm Qt6::Network Qt6::Quick Qt6::QuickControls2 Qt6::Svg Qt6::CorePrivate)
 target_compile_definitions(nixscp-mobile PRIVATE PROJECT_VERSION="${PROJECT_VERSION}")
 target_compile_options(nixscp-mobile PRIVATE -Wall -Wextra)
 
@@ -32,9 +43,10 @@ set_target_properties(nixscp-mobile PROPERTIES
   QT_ANDROID_PACKAGE_NAME com.nixscp.android
   QT_ANDROID_APP_NAME "NixSCP"
   QT_ANDROID_VERSION_NAME ${PROJECT_VERSION}
-  QT_ANDROID_VERSION_CODE 1
+  # 1.2.1 -> 10201: every release is higher (Android installs only upgrades)
+  QT_ANDROID_VERSION_CODE ${NIXSCP_ANDROID_VERSION_CODE}
   QT_ANDROID_MIN_SDK_VERSION 28
   QT_ANDROID_TARGET_SDK_VERSION 35
   QT_ANDROID_PACKAGE_SOURCE_DIR ${CMAKE_SOURCE_DIR}/packaging/android/package
   # OpenSSL serves libssh and Qt's TLS (cloud sync); bundled in the APK
-  QT_ANDROID_EXTRA_LIBS "${NIXSCP_ANDROID_DEPS}/lib/libssh.so;${NIXSCP_ANDROID_DEPS}/lib/libcrypto.so;${NIXSCP_ANDROID_DEPS}/lib/libssl.so")
+  QT_ANDROID_EXTRA_LIBS "${NIXSCP_ANDROID_DEPS}/lib/libssh.so;${NIXSCP_ANDROID_DEPS}/lib/libcrypto_3.so;${NIXSCP_ANDROID_DEPS}/lib/libssl_3.so")

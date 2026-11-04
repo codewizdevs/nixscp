@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Files NixSCP may hand to other apps (Open): its private files, the
-     downloads in its external folder and opened files in its cache -->
+<!-- Files NixSCP may hand to other apps (Open, Share): its private files,
+     the downloads in its external folder, opened files in its cache and
+     the phone pane's files in shared storage (each only when handed over) -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <files-path name="files_path" path="/"/>
     <external-files-path name="downloads" path="."/>
     <cache-path name="opened" path="open/"/>
+    <cache-path name="edited" path="edit/"/>
+    <external-path name="storage" path="."/>
 </paths>
