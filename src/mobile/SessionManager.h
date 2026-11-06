@@ -7,6 +7,7 @@
 
 #include "mobile/RemoteSession.h"
 
+#include <QHash>
 #include <QList>
 #include <QObject>
 #include <QPointer>
@@ -58,6 +59,8 @@ public:
   Q_INVOKABLE void closeAt(int Index);
   // edited files of every session go to their servers
   Q_INVOKABLE void checkEdits();
+  // at the end of the app: every connection, before libssh is finalized
+  void CloseAll();
 
 signals:
   void currentChanged();
@@ -73,6 +76,9 @@ signals:
   void opened(const QString & path, bool share);
   void shared(const QStringList & paths);
   void editReady(QObject * session, const QString & localPath, const QString & remotePath);
+  void editUnsent(const QString & site, const QString & localPath);
+  // a session ended (before it is removed): what belongs to it moves on
+  void sessionEnded(QObject * session);
   void archived(const QString & path);
   void notice(const QString & message);
 
@@ -85,6 +91,8 @@ private:
   QPointer<RemoteSession> FClipboardOwner;
   RemoteSession * FIdle;
   QList<RemoteSession *> FSessions;
+  // the site of each session, also when it has just closed
+  QHash<RemoteSession *, QString> FLastSite;
   int FCurrent = -1;
 
   void Watch(RemoteSession * Session);

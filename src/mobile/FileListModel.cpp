@@ -12,6 +12,12 @@
 void FileListModel::SetEntries(const QList<Entry> & Entries)
 {
   FAll = Entries;
+  FIndexOf.clear();
+  FIndexOf.reserve(FAll.size());
+  for (int I = 0; I < FAll.size(); I++)
+  {
+    FIndexOf.insert(FAll.at(I).Name, I);
+  }
   bool HadSelection = !FSelected.isEmpty();
   FSelected.clear();
   Rebuild();
@@ -103,6 +109,12 @@ void FileListModel::Rebuild()
     }
     return FDescending ? (Order > 0) : (Order < 0);
   });
+  FRowOf.clear();
+  FRowOf.reserve(FVisible.size());
+  for (int Row = 0; Row < FVisible.size(); Row++)
+  {
+    FRowOf.insert(FVisible.at(Row), Row);
+  }
   endResetModel();
   emit countChanged();
   // hidden by the filter: no longer selected
@@ -236,21 +248,17 @@ QString FileListModel::previewKind(const QString & Name)
 
 void FileListModel::SetThumbnail(const QString & Name, const QString & Url)
 {
-  for (Entry & E : FAll)
+  // called for every image of a folder: by the indexes, not by walking the lists
+  auto Index = FIndexOf.constFind(Name);
+  if (Index == FIndexOf.constEnd())
   {
-    if (E.Name == Name)
-    {
-      E.Thumbnail = Url;
-      break;
-    }
+    return;
   }
-  for (int Row = 0; Row < FVisible.size(); Row++)
+  FAll[Index.value()].Thumbnail = Url;
+  auto Row = FRowOf.constFind(Index.value());
+  if (Row != FRowOf.constEnd())
   {
-    if (FAll.at(FVisible.at(Row)).Name == Name)
-    {
-      emit dataChanged(index(Row), index(Row), {ThumbnailRole});
-      break;
-    }
+    emit dataChanged(index(Row.value()), index(Row.value()), {ThumbnailRole});
   }
 }
 
@@ -272,7 +280,8 @@ QVariant FileListModel::data(const QModelIndex & Index, int Role) const
     case IsDirRole: return E.IsDir;
     case IsLinkRole: return E.IsLink;
     case SizeRole: return E.IsDir ? QString() : QLocale().formattedDataSize(E.Size, 1, QLocale::DataSizeTraditionalFormat);
-    case DateRole: return QLocale().toString(E.Modified, QLocale::ShortFormat);
+    // in the phone's time zone: FTP's are UTC
+    case DateRole: return QLocale().toString(E.Modified.toLocalTime(), QLocale::ShortFormat);
     case RightsRole: return E.Rights;
     case SelectedRole: return FSelected.contains(E.Name);
     case ModeRole: return E.Mode;

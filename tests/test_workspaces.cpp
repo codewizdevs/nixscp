@@ -337,6 +337,169 @@ static void TestHelpers()
   CHECK(Workspaces::WorkspaceName(Config) == QStringLiteral("Last"));
 }
 
+static std::shared_ptr<SessionData> Site(const QString & Name, const QString & Host)
+{
+  auto Data = std::make_shared<SessionData>();
+  Data->Name = Name;
+  Data->HostName = Host;
+  return Data;
+}
+
+// X-M9, L38: a workspace never takes sites of the same name with it
+static void TestSitesSharingTheName()
+{
+  StoredSessionList Sessions;
+  Sessions.Add(Site(QStringLiteral("Prod/web"), QStringLiteral("web.example.com")));
+  Sessions.Add(Site(QStringLiteral("Prod/0000"), QStringLiteral("zero.example.com")));
+  SessionData Tab;
+  Tab.HostName = QStringLiteral("tab.example.com");
+  Tab.UserName = QStringLiteral("me");
+
+  // an auto-saved workspace is not validated
+  Workspaces::SaveWorkspace(Sessions, QStringLiteral("Prod"), {Tab}, false);
+  CHECK(Sessions.FindByName(QStringLiteral("Prod/web")) != nullptr);
+  auto Zero = Sessions.FindByName(QStringLiteral("Prod/0000"));
+  CHECK((Zero != nullptr) && (Zero->HostName == QStringLiteral("zero.example.com")) && !Zero->IsWorkspace);
+  CHECK(Workspaces::IsWorkspace(Sessions, QStringLiteral("Prod")));
+  CHECK(Workspaces::IsFolder(Sessions, QStringLiteral("Prod")));
+  // only its tabs are opened
+  QList<SessionData> Tabs = Workspaces::LoadWorkspace(Sessions, QStringLiteral("Prod"));
+  CHECK((Tabs.size() == 1) && (Tabs.value(0).HostName == QStringLiteral("tab.example.com")));
+  // saved again, also with a site sorted after the workspace entries
+  Sessions.Add(Site(QStringLiteral("Prod/zzz"), QStringLiteral("z.example.com")));
+  Workspaces::SaveWorkspace(Sessions, QStringLiteral("Prod"), {Tab, Tab}, false);
+  CHECK(Workspaces::LoadWorkspace(Sessions, QStringLiteral("Prod")).size() == 2);
+  for (const QString & Name : {QStringLiteral("Prod/web"), QStringLiteral("Prod/0000"), QStringLiteral("Prod/zzz")})
+  {
+    CHECK(Sessions.FindByName(Name) != nullptr);
+  }
+  // the dialog refuses the name of a site folder, whatever comes first in it
+  CHECK(!Workspaces::ValidateWorkspaceName(Sessions, QStringLiteral("Prod")).isEmpty());
+  CHECK(Workspaces::DeleteWorkspace(Sessions, QStringLiteral("Prod")) == 2);
+  CHECK(!Workspaces::IsWorkspace(Sessions, QStringLiteral("Prod")));
+  CHECK(Sessions.FindByName(QStringLiteral("Prod/web")) != nullptr);
+  CHECK(Sessions.Sessions().size() == 3);
+}
+
+// L37: rename and move do not leave links dangling
+static void TestLinksFollowRename()
+{
+  StoredSessionList Sessions;
+  auto Server = Site(QStringLiteral("Work/Server"), QStringLiteral("server.example.com"));
+  auto Other = Site(QStringLiteral("Workshop/Other"), QStringLiteral("other.example.com"));
+  Sessions.Add(Server);
+  Sessions.Add(Other);
+  SessionData T1 = *Server;
+  SessionData T2 = *Other;
+  Workspaces::SaveWorkspace(Sessions, QStringLiteral("WS"), {T1, T2}, false);
+  CHECK(Workspaces::LoadWorkspace(Sessions, QStringLiteral("WS")).size() == 2);
+
+  // a site
+  SessionData Copy = *Server;
+  Sessions.Remove(Server->Name);
+  Sessions.NewSession(QStringLiteral("Work/Renamed"), Copy);
+  CHECK(Workspaces::LoadWorkspace(Sessions, QStringLiteral("WS")).size() == 1);
+  CHECK(Workspaces::UpdateLinks(Sessions, QStringLiteral("Work/Server"), QStringLiteral("Work/Renamed")) == 1);
+  CHECK(Workspaces::LoadWorkspace(Sessions, QStringLiteral("WS")).size() == 2);
+  // a folder: not the sites of a folder of a similar name
+  Sessions.RenameFolder(QStringLiteral("Work"), QStringLiteral("Job"));
+  CHECK(Workspaces::UpdateLinks(Sessions, QStringLiteral("Work"), QStringLiteral("Job"), true) == 1);
+  QList<SessionData> Tabs = Workspaces::LoadWorkspace(Sessions, QStringLiteral("WS"));
+  CHECK((Tabs.size() == 2) && (Tabs.value(0).Name == QStringLiteral("Job/Renamed")) && (Tabs.value(1).Name == QStringLiteral("Workshop/Other")));
+}
+
+// X-M17: "Do not save passwords" means all of them
+static void TestNoPasswordsSaved(const QString & Dir)
+{
+  SessionData Tab;
+  Tab.HostName = QStringLiteral("adhoc.example.com");
+  Tab.UserName = QStringLiteral("me");
+  Tab.ProxyMethod = pmHTTP;
+  Tab.ProxyHost = QStringLiteral("proxy.example.com");
+  Tab.ProxyUsername = QStringLiteral("proxyuser");
+  CHECK(!Workspaces::HasAnySessionPassword(Tab));
+  Tab.ProxyPassword = QStringLiteral("proxypw");
+  CHECK(Workspaces::HasAnySessionPassword(Tab));
+  Tab.ProxyPassword.clear();
+  Tab.S3SessionToken = QStringLiteral("s3token");
+  CHECK(Workspaces::HasAnySessionPassword(Tab));
+  Tab.ProxyPassword = QStringLiteral("proxypw");
+  Tab.Password = QStringLiteral("sessionpw");
+  Tab.TunnelPassword = QStringLiteral("tunnelpw");
+
+  StoredSessionList Sessions;
+  CHECK(Workspaces::SavePasswordOptions(Sessions, {Tab}).CanSavePasswords);
+  Workspaces::SaveWorkspace(Sessions, QStringLiteral("NoPw"), {Tab}, false);
+  auto Entry = Sessions.FindByName(QStringLiteral("NoPw/0000"));
+  CHECK(Entry != nullptr);
+  if (Entry != nullptr)
+  {
+    CHECK(!Workspaces::HasAnySessionPassword(*Entry));
+  }
+  QString FileName = Dir + QStringLiteral("/nopw.ini");
+  IniFile File;
+  Sessions.Save(File);
+  CHECK(File.Save(FileName));
+  QByteArray Content = ReadFile(FileName);
+  CHECK(!Content.contains("s3token"));
+  CHECK(!Content.contains("ProxyPasswordEnc"));
+  // kept when wanted
+  Workspaces::SaveWorkspace(Sessions, QStringLiteral("WithPw"), {Tab}, true);
+  Entry = Sessions.FindByName(QStringLiteral("WithPw/0000"));
+  CHECK((Entry != nullptr) && (Entry->ProxyPassword == QStringLiteral("proxypw")) && (Entry->S3SessionToken == QStringLiteral("s3token")));
+}
+
+// F-04: local and disconnected tabs survive saving and loading
+static void TestLocalTabs(const QString & Dir)
+{
+  StoredSessionList Sessions;
+  auto Server = Site(QStringLiteral("Server"), QStringLiteral("server.example.com"));
+  Sessions.Add(Server);
+  SessionData Local;
+  Local.LocalDirectory = QStringLiteral("/home/me/left");
+  Local.OtherLocalDirectory = QStringLiteral("/home/me/right");
+  CHECK(Local.IsLocalBrowser() && Local.CanOpen() && !Local.CanLogin());
+  SessionData Tab = *Server;
+  Tab.RemoteDirectory = QStringLiteral("/var/www");
+  Workspaces::SaveWorkspace(Sessions, QStringLiteral("Mixed"), {Tab, Local}, false);
+  CHECK(Sessions.CanOpen(*Sessions.FindByName(QStringLiteral("Mixed/0001"))));
+
+  QString FileName = Dir + QStringLiteral("/mixed.ini");
+  IniFile File;
+  Sessions.Save(File);
+  CHECK(File.Save(FileName));
+  IniFile Read;
+  CHECK(Read.Load(FileName));
+  StoredSessionList Loaded;
+  Loaded.Load(Read);
+  QList<SessionData> Tabs = Workspaces::LoadWorkspace(Loaded, QStringLiteral("Mixed"));
+  CHECK(Tabs.size() == 2);
+  if (Tabs.size() == 2)
+  {
+    CHECK(Tabs[0].HostName == QStringLiteral("server.example.com"));
+    CHECK(Tabs[0].RemoteDirectory == QStringLiteral("/var/www"));
+    CHECK(Tabs[1].IsLocalBrowser() && Tabs[1].HostName.isEmpty());
+    CHECK(Tabs[1].LocalDirectory == QStringLiteral("/home/me/left"));
+    CHECK(Tabs[1].OtherLocalDirectory == QStringLiteral("/home/me/right"));
+  }
+  CHECK(Workspaces::FolderOrWorkspaceList(Loaded, QStringLiteral("Mixed")).value(1) ==
+    QStringLiteral("left \u2013 right"));
+}
+
+// F-03: LastStoredSession goes through the same place as the Login dialog's
+static void TestLastStoredSession(const QString & Dir)
+{
+  Configuration & Config = Configuration::Instance();
+  CHECK(Config.LastStoredSession().isEmpty());
+  Config.SetLastStoredSession(QStringLiteral("My WS"));
+  CHECK(Config.LastStoredSession() == QStringLiteral("My WS"));
+  CHECK(Config.Save());
+  QByteArray Content = ReadFile(Dir + QStringLiteral("/nixscp.ini"));
+  CHECK(Content.contains("LastStoredSession=My%20WS"));
+  Config.SetLastStoredSession(QString());
+  CHECK(Config.LastStoredSession().isEmpty());
+}
+
 int main()
 {
   QStandardPaths::setTestModeEnabled(true);
@@ -347,6 +510,11 @@ int main()
   TestLoadWinSCPWorkspace(Dir.path());
   TestSaveWorkspace(Dir.path());
   TestHelpers();
+  TestSitesSharingTheName();
+  TestLinksFollowRename();
+  TestNoPasswordsSaved(Dir.path());
+  TestLocalTabs(Dir.path());
+  TestLastStoredSession(Dir.path());
 
   if (Failures == 0)
   {

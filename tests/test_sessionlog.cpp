@@ -996,7 +996,14 @@ static void TestRealSession(const QString & Dir, TFSProtocol Protocol)
   {
     Names.append(A.Name + (A.Success ? QStringLiteral("+") : QStringLiteral("-")));
   }
-  CHECK_EQ(Names.join(QLatin1Char(' ')), QStringLiteral("upload+ mkdir+ mkdir- mv+ chmod+ download+ rm+ rm+"));
+  CHECK_EQ(Names.join(QLatin1Char(' ')), QStringLiteral("upload+ touch+ mkdir+ mkdir- mv+ chmod+ download+ rm+ rm+"));
+  // a touch record for the preserved time of the upload
+  if (Log.Actions.size() == 9)
+  {
+    CHECK_EQ(Log.Actions[1].Param(QStringLiteral("filename")), Remote + QStringLiteral("/up.txt"));
+    CHECK(!Log.Actions[1].Param(QStringLiteral("modification")).isEmpty());
+    Log.Actions.removeAt(1);
+  }
   if (Log.Actions.size() == 8)
   {
     CHECK_EQ(Log.Actions[0].Param(QStringLiteral("filename")), LocalFile);

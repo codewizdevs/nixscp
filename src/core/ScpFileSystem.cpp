@@ -3,6 +3,7 @@
 #include "core/ScpFileSystem.h"
 #include "core/Platform.h"
 #include "core/CopyParam.h"
+#include "core/LocalFileSystem.h"
 #include "core/SessionLog.h"
 #include "core/SftpFileSystem.h"
 
@@ -626,16 +627,39 @@ QString ScpFileSystem::AbsolutePath(const QString & Path) const
   return UnixPath::Combine(FHomeDirectory, Path);
 }
 
+// "~" or "~user": nothing the shell would take for more than a tilde prefix
+static bool IsTildePrefix(const QString & Word)
+{
+  if (!Word.startsWith(QLatin1Char('~')))
+  {
+    return false;
+  }
+  for (qsizetype Index = 1; Index < Word.size(); Index++)
+  {
+    QChar C = Word[Index];
+    bool Name = ((C >= QLatin1Char('a')) && (C <= QLatin1Char('z'))) || ((C >= QLatin1Char('A')) && (C <= QLatin1Char('Z'))) ||
+      ((C >= QLatin1Char('0')) && (C <= QLatin1Char('9'))) || (C == QLatin1Char('.')) || (C == QLatin1Char('_')) || (C == QLatin1Char('-'));
+    if (!Name)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 QString ScpFileSystem::CanonicalizePath(const QString & APath)
 {
   // TSCPFileSystem::ChangeDirectory + ReadCurrentDirectory
   QString Directory = AbsolutePath(APath);
   QString ToDir;
-  // This effectively disallows entering subdirectories starting with ~ and containing space
-  if (Directory.startsWith(QLatin1Char('~')) && (Directory.left(2) != QStringLiteral("~ ")))
+  qsizetype Slash = Directory.indexOf(QLatin1Char('/'));
+  QString First = (Slash < 0) ? Directory : Directory.left(Slash);
+  // Only a tilde stays out of quotes, for the shell to expand. WinSCP leaves all
+  // that comes before the first slash there, which runs whatever a directory
+  // of a site or a URL holds ("~;touch x")
+  if (IsTildePrefix(First))
   {
-    int Slash = Directory.indexOf(QLatin1Char('/'));
-    ToDir = (Slash < 0) ? Directory : (Directory.left(Slash + 1) + ShellQuoteStr(Directory.mid(Slash + 1)));
+    ToDir = (Slash < 0) ? First : (First + QLatin1Char('/') + ShellQuoteStr(Directory.mid(Slash + 1)));
   }
   else
   {
@@ -770,7 +794,15 @@ RemoteFileList ScpFileSystem::ReadDirectory(const QString & Directory)
         RemoteFile File = ParseFile(Line, Today);
         if ((File.FileName != QStringLiteral(".")) && (File.FileName != QStringLiteral("..")))
         {
-          Result.append(File);
+          // a hostile server's "x/..", see SftpFileSystem::RawFileFromName
+          if (IsValidListingName(File.FileName))
+          {
+            Result.append(File);
+          }
+          else
+          {
+            SessionLog::LogEvent(QStringLiteral("Discarding entry \"%1\" with invalid name.").arg(File.FileName));
+          }
         }
       }
       if (FLsFullTime == asAuto)
@@ -1117,7 +1149,9 @@ void ScpFileSystem::Upload(const QString & LocalPath, const QString & RemotePath
     BatchStarted = true;
 
     // Send file modes (rights), filesize and file name
-    FChannel->SendLine(QStringLiteral("C%1 %2 %3").arg(Rights::ToOctal(static_cast<unsigned int>(Mode))).arg(Size).arg(DestFileName));
+    // the protocol has no way to leave the mode out; scp -t applies the umask to it
+    unsigned int FileMode = (Mode >= 0) ? static_cast<unsigned int>(Mode) : 0644;
+    FChannel->SendLine(QStringLiteral("C%1 %2 %3").arg(Rights::ToOctal(FileMode)).arg(Size).arg(DestFileName));
     SCPResponse(&GotLastLine);
     // From now on the file has to be finished, otherwise the shell is reset
     Transferring = true;
@@ -2089,7 +2123,7 @@ void ScpFileSystem::BatchSink(const QString & RemotePath, const QString & Target
       }
       if (Options.PreserveRights)
       {
-        ::chmod(QFile::encodeName(LocalFull).constData(), Mode);
+        LocalFs::SetMode(LocalFull, Mode);
       }
       Stack.append(Level{LocalFull, RemoteFull, TMTime, TATime});
       FChannel->SendNull();
@@ -2178,7 +2212,7 @@ void ScpFileSystem::BatchSink(const QString & RemotePath, const QString & Target
     Local.close();
     if (Options.PreserveRights)
     {
-      ::chmod(QFile::encodeName(LocalFull).constData(), Mode);
+      LocalFs::SetMode(LocalFull, Mode);
     }
     if (Options.PreserveTime && (TMTime >= 0))
     {
@@ -2469,6 +2503,7 @@ RemoteFile ScpFileSystem::ParseListingLine(const QString & Value, const QDate & 
             if ((Month > Today.month()) ||
                 ((Month == Today.month()) && (Day > Today.day()))) Year--;
             Sec = 0;
+            File.ModificationFmt = mfMDHM;
           }
           else
           {
@@ -2476,6 +2511,7 @@ RemoteFile ScpFileSystem::ParseListingLine(const QString & Value, const QDate & 
             if (Year > 10000) throw ListingError();
             // When we didn't get time we assume midnight
             Hour = 0; Min = 0; Sec = 0;
+            File.ModificationFmt = mfMDY;
           }
         }
       }

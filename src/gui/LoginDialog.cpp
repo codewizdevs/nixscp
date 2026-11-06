@@ -7,6 +7,7 @@
 #include "gui/AgentAccessDialog.h"
 #include "core/Platform.h"
 #include "gui/CloudSyncUi.h"
+#include "gui/DesktopIntegration.h"
 #include "gui/Translator.h"
 #include "gui/HelpSystem.h"
 #include "gui/SiteAdvancedDialog.h"
@@ -439,6 +440,7 @@ void LoginDialog::CreateActions()
   ResetNewSessionAction = Action(QStringLiteral("&Reset"), [this]() { ResetNewSessionActionExecute(); });
   SetDefaultSessionAction = Action(QStringLiteral("Set De&faults"), [this]() { SetDefaultSessionActionExecute(); });
   DesktopIconAction = Action(QStringLiteral("Desktop &Icon"), [this]() { DesktopIconActionExecute(); });
+  DesktopIconAction->setVisible(DesktopIntegration::CanCreateSessionShortcut());
   RenameSessionAction = Action(QStringLiteral("&Rename"), [this]() { RenameSessionActionExecute(); });
   RenameSessionAction->setIcon(Icons::Get(QStringLiteral("rename")));
   NewSessionFolderAction = Action(QStringLiteral("Ne&w Folder..."), [this]() { NewSessionFolderActionExecute(); });
@@ -559,7 +561,9 @@ void LoginDialog::CreateControls()
   SessionTree->installEventFilter(this);
   SessionTree->CanDrag = [this](QTreeWidgetItem * Node)
   {
-    return IsSiteNode(Node) && !NodeSession(Node)->Special && !FEditing && !FRenaming;
+    // (the site of a node can be gone: another instance, a team sync)
+    std::shared_ptr<SessionData> Data = NodeSession(Node);
+    return (Data != nullptr) && !Data->Special && !FEditing && !FRenaming;
   };
   SessionTree->NormalizeTarget = [this](QTreeWidgetItem * Target) { return NormalizeDropTarget(Target); };
   SessionTree->AllowDrop = [this](QTreeWidgetItem * Target) { return SessionAllowDrop(Target); };
@@ -1722,10 +1726,8 @@ void LoginDialog::SaveSession(SessionData & Data)
   }
   Data.HostName = Host;
   Data.Ftps = GetFtps();
-  std::shared_ptr<SessionData> EditingSessionData = FEditing ? SelectedSession() : nullptr;
-  Data.Name =
-    (EditingSessionData != nullptr) ? EditingSessionData->Name :
-      (FNewSiteKeepName ? Data.Name : Data.DefaultSessionName());
+  // (the edited site may have been removed meanwhile: it is saved under its name again)
+  Data.Name = FEditing ? FEditingName : (FNewSiteKeepName ? Data.Name : Data.DefaultSessionName());
 }
 
 void LoginDialog::UpdateActions()
@@ -2180,6 +2182,7 @@ void LoginDialog::EditSessionActionExecute()
   if (SelectedSession() != nullptr)
   {
     FEditing = true;
+    FEditingName = SelectedSession()->Name;
     EditSession();
     // reload the session, to load the password
     LoadContents();
@@ -2276,6 +2279,10 @@ std::shared_ptr<SessionData> LoginDialog::DoSaveSession(SessionData & Data, cons
     SavePasswordCheck->setEnabled(CanSavePassword);
     // SAVE_SITE_WORKSPACE_SHORTCUT
     auto * CreateShortcutCheck = new QCheckBox(QStringLiteral("&Create desktop shortcut"));
+    if (!DesktopIntegration::CanCreateSessionShortcut())
+    {
+      CreateShortcutCheck->hide();
+    }
     Layout->addWidget(NameLabel);
     Layout->addWidget(SessionNameEdit);
     Layout->addWidget(FolderLabel);
@@ -2335,9 +2342,7 @@ std::shared_ptr<SessionData> LoginDialog::DoSaveSession(SessionData & Data, cons
   }
   if ((CanSavePassword && !SavePassword) || Config.DisablePasswordStoring())
   {
-    // ClearSessionPasswords
-    Data.Password.clear();
-    Data.TunnelPassword.clear();
+    Workspaces::ClearSessionPasswords(Data);
   }
   std::shared_ptr<SessionData> NewSession = FSessions.NewSession(SessionName, Data);
   Config.Save();
@@ -2389,6 +2394,10 @@ void LoginDialog::CloneToNewSite()
   }
   FNewSiteData = *Session;
   FNewSiteData.Special = false;
+  // a new site, usually another server: agents must not reach it unasked, or
+  // under the name they use for the original (AgentAccess::FindAgentSite)
+  FNewSiteData.AgentAccess = 0;
+  FNewSiteData.AgentName.clear();
   FNewSiteData.MakeUniqueIn(FSessions);
   FNewSiteKeepName = true;
   NewSite();
@@ -2428,7 +2437,11 @@ bool LoginDialog::SelectedTeamItem(QString & TeamUuid, QString & Relative) const
     // the team's folder itself: everything; a subfolder: "sub/"
     for (const TeamSync::Team & T : TeamSync::Instance().Teams())
     {
-      QString Folder = TeamSync::FolderName(T.Name);
+      QString Folder = T.Folder;
+      if (Folder.isEmpty())
+      {
+        continue;
+      }
       if (Path == Folder)
       {
         TeamUuid = T.Uuid;
@@ -2707,6 +2720,7 @@ void LoginDialog::SessionTreeEdited(QTreeWidgetItem * Node)
     SessionData Copy = *Session;
     FSessions.Remove(Session->Name);
     FSessions.NewSession(Path, Copy);
+    Workspaces::UpdateLinks(FSessions, Session->Name, Path);
     Configuration::Instance().Save();
     ReloadSessions(Path);
   }
@@ -2721,6 +2735,7 @@ void LoginDialog::SessionTreeEdited(QTreeWidgetItem * Node)
     QString OldRoot = SessionData::ComposePath(ParentPath, Original);
     QString NewRoot = SessionData::ComposePath(ParentPath, S);
     FSessions.RenameFolder(OldRoot, NewRoot);
+    Workspaces::UpdateLinks(FSessions, OldRoot, NewRoot, true);
     Configuration::Instance().Save();
     ReloadSessions(NewRoot + (IsFolderNode(Node) ? QStringLiteral("/") : QString()));
   }
@@ -2804,6 +2819,7 @@ void LoginDialog::SessionTreeDropped(QTreeWidgetItem * Node, QTreeWidgetItem * D
   SessionData Copy = *Session;
   FSessions.Remove(Session->Name);
   FSessions.NewSession(Path, Copy);
+  Workspaces::UpdateLinks(FSessions, Session->Name, Path);
   Configuration::Instance().Save();
   ReloadSessions(Path);
 }
@@ -2826,7 +2842,12 @@ void LoginDialog::DesktopIconActionExecute()
   QString Message;
   if (IsSiteNode(Node))
   {
-    Name = SelectedSession()->Name;
+    std::shared_ptr<SessionData> Session = SelectedSession();
+    if (Session == nullptr)
+    {
+      return;
+    }
+    Name = Session->Name;
     // CONFIRM_CREATE_SHORTCUT
     Message = QStringLiteral("Create desktop shortcut for site '%1'?").arg(Name);
   }

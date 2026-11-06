@@ -408,6 +408,17 @@ static void WriteFile(const QString & FileName, const QByteArray & Data, qint64 
   utimensat(AT_FDCWD, QFile::encodeName(FileName).constData(), Times, 0);
 }
 
+// The time of a file of years ago in a listing of the server, which is this computer
+static bool ListedTime(const RemoteFile & File, qint64 Time)
+{
+#ifdef Q_OS_MACOS
+  // ls of BSD has no --full-time, and the date is all it tells then
+  return (File.ModificationFmt == mfMDY) && (File.Modification.date() == QDateTime::fromSecsSinceEpoch(Time).date());
+#else
+  return File.Modification.toSecsSinceEpoch() == Time;
+#endif
+}
+
 static QByteArray RandomData(qint64 Size)
 {
   QByteArray Data(Size, Qt::Uninitialized);
@@ -606,8 +617,8 @@ static void TestConnectionSettings(const SessionData & Data, TestUserInterface &
   std::printf("[ssh: local proxy command]\n");
   if (qEnvironmentVariableIsEmpty("NIXSCP_TEST_PROXY"))
   {
-    // libssh terminates the proxy process with kill() on disconnect and waits
-    // for it; sandboxes that forbid signalling other programs make this hang
+    // SecureShell::StopProxyCommand ends the process with kill() on disconnect;
+    // sandboxes that forbid signalling other programs make this slow
     Log(QStringLiteral("SKIPPED (set NIXSCP_TEST_PROXY=1 to run)"));
   }
   else
@@ -729,6 +740,69 @@ int main(int argc, char ** argv)
   bool LocalFs = QFileInfo(Base).isDir();
   Log(QStringLiteral("Server filesystem is local: %1").arg(LocalFs));
 
+  std::printf("[directory starting with a tilde]\n");
+  {
+    // a RemoteDirectory can come from a team or a URL: what is before the
+    // first slash is a tilde prefix or a plain name, never shell syntax
+    QString Marker = UnixPath::Combine(Base, QStringLiteral("tilde-marker"));
+    const QStringList Hostile = {
+      QStringLiteral("~;touch %1").arg(Marker),
+      QStringLiteral("~;touch %1;").arg(Marker),
+      QStringLiteral("~&&touch %1").arg(Marker),
+      QStringLiteral("~||touch %1").arg(Marker),
+      QStringLiteral("~|touch %1").arg(Marker),
+      QStringLiteral("~&touch %1").arg(Marker),
+      QStringLiteral("~$(touch %1)").arg(Marker),
+      QStringLiteral("~`touch %1`").arg(Marker),
+      QStringLiteral("~>%1").arg(Marker),
+      QStringLiteral("~\ntouch %1").arg(Marker),
+      QStringLiteral("~ ;touch %1").arg(Marker),
+      QStringLiteral("~x;touch %1").arg(Marker),
+      QStringLiteral("~/;touch %1").arg(Marker),
+      QStringLiteral("~/$(touch %1)").arg(Marker),
+    };
+    for (const QString & Directory : Hostile)
+    {
+      SessionData D = Data;
+      D.FSProtocol = fsSCPonly;
+      D.RemoteDirectory = Directory;
+      Terminal TT(D, &UI);
+      R = DoOpen(TT);
+      Log(QStringLiteral("%1: %2").arg(QString(Directory).replace(QLatin1Char('\n'), QStringLiteral("\\n")), R.Ok ? TT.CurrentDirectory() : Describe(R)));
+      // a shell that does not get to run it says so with the file
+      if (R.Ok)
+      {
+        R = DoList(TT, Directory);
+        CHECK_MSG(!R.Ok && !R.Fatal, Directory);
+        CHECK_MSG(!TT.CurrentDirectory().contains(QStringLiteral("touch")), TT.CurrentDirectory());
+      }
+      if (LocalFs)
+      {
+        CHECK_MSG(!QFile::exists(Marker), Directory);
+        QFile::remove(Marker);
+      }
+      else
+      {
+        R = DoList(T, Marker);
+        CHECK_MSG(!R.Ok, Directory);
+      }
+    }
+    UI.Queries.clear();
+    // and what it is for goes on working: the same as the shell says
+    SessionData D = Data;
+    D.FSProtocol = fsSCPonly;
+    for (const QString & Directory : {QStringLiteral("~"), QStringLiteral("~/.."), QStringLiteral("~%1").arg(User), QStringLiteral("~%1/..").arg(User)})
+    {
+      CommandResult C = DoCommand(T, QStringLiteral("(cd %1 && pwd)").arg(Directory));
+      CHECK_MSG(C.Result.Ok && (C.Output.size() == 1), Describe(C.Result));
+      D.RemoteDirectory = Directory;
+      Terminal TT(D, &UI);
+      R = DoOpen(TT);
+      CHECK_MSG(R.Ok, Describe(R));
+      CHECK_MSG(TT.CurrentDirectory() == C.Output.value(0), Directory + QStringLiteral(": ") + TT.CurrentDirectory());
+    }
+  }
+
   // ---------------------------------------------------------------- local tree
   QTemporaryDir Work;
   QString Src = Work.filePath(QStringLiteral("src"));
@@ -763,9 +837,9 @@ int main(int argc, char ** argv)
   {
     CHECK(Files.size() == 6);
     const RemoteFile * F = Find(Files, QStringLiteral("a.txt"));
-    CHECK(F && (F->Size == 6) && (F->Modification.toSecsSinceEpoch() == T0) && !F->IsDirectory && (F->Permissions == 0644));
+    CHECK(F && (F->Size == 6) && ListedTime(*F, T0) && !F->IsDirectory && (F->Permissions == 0644));
     F = Find(Files, UnicodeName);
-    CHECK(F && (F->Size == 8) && (F->Modification.toSecsSinceEpoch() == T0 + 2));
+    CHECK(F && (F->Size == 8) && ListedTime(*F, T0 + 2));
     F = Find(Files, QStringLiteral(".hidden"));
     CHECK(F && F->IsHidden);
     F = Find(Files, QStringLiteral("sub"));
@@ -1060,7 +1134,7 @@ int main(int argc, char ** argv)
     CHECK(Find(Files, QStringLiteral("one.txt")) && Find(Files, QStringLiteral("three.txt")) && Find(Files, QStringLiteral("sub")));
     R = DoList(T, UnixPath::Combine(RB, QStringLiteral("sub")), &Files);
     CHECK_MSG(R.Ok, Describe(R));
-    CHECK(Find(Files, QStringLiteral("two.txt")) && (Find(Files, QStringLiteral("two.txt"))->Modification.toSecsSinceEpoch() == T0 + 1));
+    CHECK(Find(Files, QStringLiteral("two.txt")) && ListedTime(*Find(Files, QStringLiteral("two.txt")), T0 + 1));
     CHECK(!CanLock || !Find(Files, QStringLiteral("locked.txt")));
 
     // Overwrite: No for one.txt, Yes to all for the rest (two.txt, three.txt); locked.txt is new

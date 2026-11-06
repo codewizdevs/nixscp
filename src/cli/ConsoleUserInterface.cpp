@@ -830,6 +830,11 @@ bool ConsoleUserInterface::DoInput(QString & Str, bool Echo, unsigned int Timeou
   return Result;
 }
 
+void ConsoleUserInterface::Information(const QString & Message)
+{
+  FScript->PrintLine(Message);
+}
+
 UserInterface::HostKeyAnswer ConsoleUserInterface::VerifyHostKey(const QString & Host, int Port, const QString & KeyType,
   const QString & FingerprintSHA256, const QString & FingerprintMD5, HostKeyState State)
 {

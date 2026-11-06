@@ -18,7 +18,7 @@ class QWidget;
 namespace CloudSyncUi
 {
   void ShowDialog(QWidget * Parent);
-  // Top menu after Help: "Cloud Sync" when signed out, "Pro" when signed in;
+  // Top menu before Help: "Cloud Sync" when signed out, "Pro" when signed in;
   // filled every time it opens
   void SetupMenu(QMenu * Menu, QWidget * Window);
 

@@ -3,6 +3,7 @@
 // (CopyFilesToClipboard, PasteFromClipBoard, DDDownload, DoWarnLackOfTempSpace)
 // and core/Terminal.cpp + core/ScpFileSystem.cpp CopyFile (remote duplicate).
 #include "gui/ClipboardTransfer.h"
+#include "core/Platform.h"
 #include "gui/CopyDialog.h"
 #include "gui/DesktopIntegration.h"
 #include "gui/GuiUserInterface.h"
@@ -259,6 +260,7 @@ bool RemoteFilesMimeData::Download() const
   }
   Temp.setAutoRemove(false);
   QString Target = Temp.path();
+  Platform::MakeDirectoryPrivate(Target);
   TemporaryFolders().append(Target);
   FTemporaryDirectory = Target;
 

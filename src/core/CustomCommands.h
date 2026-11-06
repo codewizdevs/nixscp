@@ -125,15 +125,17 @@ struct CustomCommandData
   QString UserName;         // !U
   QString Password;         // !P
   int PortNumber = 0;       // !#
-  QString SessionUrl;       // !S (and !E)
+  QString SessionUrl;       // !S
+  QString CompleteSessionUrl; // !E: with the settings that differ from the defaults
   QString SessionName;      // !N
   QString PublicKeyFile;    // !K
 
   // Password: the actual session password when it is not stored in Data
   // (e.g. typed at login); empty = Data.Password
   static CustomCommandData FromSession(const SessionData & Data, const QString & Password = QString());
-  // TSessionData::GenerateSessionUrl(sufSession) without the host key part
-  static QString GenerateSessionUrl(const SessionData & Data, const QString & Password);
+  // TSessionData::GenerateSessionUrl(sufSession) without the host key part;
+  // Complete: sufComplete, that is with the raw settings too
+  static QString GenerateSessionUrl(const SessionData & Data, const QString & Password, bool Complete = false);
 };
 
 // TCustomCommand: two-pass pattern expansion. Complete(Command, false) keeps
@@ -229,6 +231,7 @@ protected:
   void ValidatePattern(const QString & Command, int Index, int Len, QChar PatternCmd, int * Found) override;
   int PatternLen(const QString & Command, int Index) override;
   bool PatternReplacement(int Index, const QString & Pattern, QString & Replacement, bool & Delimit) override;
+  void DelimitReplacement(QString & Replacement, QChar Quote) override;
 
 private:
   CustomCommandData FData;

@@ -38,12 +38,20 @@ public:
 
   // https://nixscp.com, or $NIXSCP_CLOUD_URL (testing against another server)
   static QString DefaultBaseUrl();
+  // Tokens and snapshots travel over https only. Plain http needs
+  // $NIXSCP_CLOUD_URL (FromEnvironment) and a server on this computer; a debug
+  // build allows any host for it
+  static bool AcceptableUrl(const QString & Url, bool FromEnvironment);
   QString BaseUrl() const { return FBaseUrl; }
+  // A URL that is not acceptable gives the default
   void SetBaseUrl(const QString & Url);
 
   QString RefreshToken() const { return FRefreshToken; }
   void SetRefreshToken(const QString & Token);
   bool HasRefreshToken() const { return !FRefreshToken.isEmpty(); }
+  // Asked before a refresh: a newer refresh token saved by another NixSCP on
+  // this computer, or empty. Using the old one would look like a stolen token.
+  void SetTokenSource(const std::function<QString()> & Source) { FTokenSource = Source; }
 
   // OAuth authorization code + PKCE exchange; stores the tokens on success.
   // Reply.Json has device_id.
@@ -51,8 +59,10 @@ public:
   // Authenticated API call; Path like "/v1/sync/head?slot=settings"
   void Api(const QByteArray & Method, const QString & Path, const QJsonObject & Body, const Callback & Done);
   void Api(const QByteArray & Method, const QString & Path, const Callback & Done) { Api(Method, Path, QJsonObject(), Done); }
-  // Signed R2 URL (no API authentication)
-  void Transfer(const QByteArray & Method, const QUrl & Url, const QByteArray & Data, const Headers & RequestHeaders, const Callback & Done);
+  // Signed R2 URL (no API authentication). The download stops at MaxBytes
+  // (0 = the limit of any reply): what the server announced, for a snapshot.
+  void Transfer(const QByteArray & Method, const QUrl & Url, const QByteArray & Data, const Headers & RequestHeaders, const Callback & Done,
+    qint64 MaxBytes = 0);
   // Forgets the tokens (after revoking them on the server, when possible)
   void SignOut(const std::function<void()> & Done = nullptr);
 
@@ -70,9 +80,10 @@ private:
   QString FRefreshToken;
   bool FRefreshing = false;
   QList<std::function<void(bool)>> FWaitingForRefresh;
+  std::function<QString()> FTokenSource;
 
   void Send(const QByteArray & Method, const QUrl & Url, const QByteArray & Body, const Headers & RequestHeaders,
-    const Callback & Done);
+    const Callback & Done, qint64 MaxBytes = 0);
   void SendApi(const QByteArray & Method, const QString & Path, const QJsonObject & Body, bool MayRefresh, const Callback & Done);
   void Refresh(const std::function<void(bool)> & Done);
   void SetTokens(const QJsonObject & Json);

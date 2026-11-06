@@ -1,12 +1,14 @@
-// PuTTY private key (.ppk) loader.
-// Port of the PPK reading part of WinSCP source/putty/sshpubk.c
-// (ppk_load_s, ssh2_ppk_derive_keys), with the key blob layouts of
+// PuTTY private key (.ppk) loader and writer.
+// Port of the PPK part of WinSCP source/putty/sshpubk.c
+// (ppk_load_s, ppk_save_sb, ssh2_ppk_derive_keys), with the key blob layouts of
 // source/putty/crypto/rsa.c, crypto/dsa.c and crypto/ecc-ssh.c.
 // The decrypted key is converted to an unencrypted "openssh-key-v1" private
 // key and imported into libssh, as libssh cannot read .ppk files itself.
 #include "core/PuttyKey.h"
+#include "core/Platform.h"
 
 #include <QFile>
+#include <QSaveFile>
 #include <cctype>
 #include <cstring>
 
@@ -15,6 +17,7 @@
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <openssl/params.h>
+#include <openssl/rand.h>
 
 namespace PuttyKey
 {
@@ -735,7 +738,282 @@ static bool ImportKey(const PpkFile & File, const QByteArray & PrivateBlob, ssh_
   return true;
 }
 
+// --- Conversion from the OpenSSH private key format ---
+
+// The blobs of a .ppk, from what libssh exports (the reverse of BuildOpenSshKey)
+static bool ParseOpenSshKey(const QByteArray & Pem, QByteArray & Algorithm, QByteArray & PublicBlob, QByteArray & PrivateBlob,
+  QString & Error)
+{
+  Error = QStringLiteral("The key could not be exported from libssh.");
+  SecureBytes Base64;
+  for (const QByteArray & Line : Pem.split('\n'))
+  {
+    if (!Line.startsWith("-----"))
+    {
+      Base64.Data.append(Line);
+    }
+  }
+  SecureBytes Blob;
+  Blob.Data = QByteArray::fromBase64(Base64.Data);
+  static const int MagicLength = 15; // including terminating NUL
+  if (!Blob.Data.startsWith("openssh-key-v1"))
+  {
+    return false;
+  }
+  SecureBytes Body;
+  Body.Data = Blob.Data.mid(MagicLength);
+  BlobReader Reader(Body.Data);
+  QByteArray Cipher = Reader.GetString();
+  QByteArray Kdf = Reader.GetString();
+  Reader.GetString(); // kdf options
+  quint32 Count = Reader.GetUint32();
+  PublicBlob = Reader.GetString();
+  SecureBytes Section;
+  Section.Data = Reader.GetString();
+  if (Reader.Error() || (Cipher != "none") || (Kdf != "none") || (Count != 1))
+  {
+    return false;
+  }
+  BlobReader Private(Section.Data);
+  if (Private.GetUint32() != Private.GetUint32())
+  {
+    return false;
+  }
+  Algorithm = Private.GetString();
+  SecureBytes F1, F2, F3, F4, F5, F6;
+  if (Algorithm == "ssh-rsa")
+  {
+    // OpenSSH: n, e, d, iqmp, p, q; .ppk private part: d, p, q, iqmp
+    F1.Data = Private.GetString();
+    F2.Data = Private.GetString();
+    F3.Data = Private.GetString();
+    F4.Data = Private.GetString();
+    F5.Data = Private.GetString();
+    F6.Data = Private.GetString();
+    PutString(PrivateBlob, F3.Data);
+    PutString(PrivateBlob, F5.Data);
+    PutString(PrivateBlob, F6.Data);
+    PutString(PrivateBlob, F4.Data);
+  }
+  else if (Algorithm == "ssh-dss")
+  {
+    // OpenSSH: p, q, g, y, x; .ppk: x
+    for (int Index = 0; Index < 4; Index++)
+    {
+      F1.Data = Private.GetString();
+    }
+    F2.Data = Private.GetString();
+    PutString(PrivateBlob, F2.Data);
+  }
+  else if ((Algorithm == "ecdsa-sha2-nistp256") || (Algorithm == "ecdsa-sha2-nistp384") ||
+           (Algorithm == "ecdsa-sha2-nistp521"))
+  {
+    // OpenSSH: curve name, Q, scalar; .ppk: scalar
+    F1.Data = Private.GetString();
+    F2.Data = Private.GetString();
+    F3.Data = Private.GetString();
+    PutString(PrivateBlob, F3.Data);
+  }
+  else if (Algorithm == "ssh-ed25519")
+  {
+    // OpenSSH: public key, seed || public key; .ppk: the seed
+    F1.Data = Private.GetString();
+    F2.Data = Private.GetString();
+    if (F2.Data.size() != 64)
+    {
+      return false;
+    }
+    F3.Data = F2.Data.left(32);
+    PutString(PrivateBlob, F3.Data);
+  }
+  else
+  {
+    Error = QStringLiteral("Key type '%1' is not supported.").arg(QString::fromLatin1(Algorithm));
+    return false;
+  }
+  if (Private.Error())
+  {
+    return false;
+  }
+  Error.clear();
+  return true;
+}
+
+static bool EncryptAes256Cbc(QByteArray & Data, const QByteArray & Key, const QByteArray & IV)
+{
+  if ((Data.size() % 16 != 0) || (Key.size() != 32) || (IV.size() != 16))
+  {
+    return false;
+  }
+  EVP_CIPHER_CTX * Ctx = EVP_CIPHER_CTX_new();
+  if (Ctx == nullptr)
+  {
+    return false;
+  }
+  QByteArray Encrypted(Data.size() + 16, Qt::Uninitialized);
+  int Len1 = 0;
+  int Len2 = 0;
+  bool Ok =
+    (EVP_EncryptInit_ex2(Ctx, EVP_aes_256_cbc(), reinterpret_cast<const unsigned char *>(Key.constData()),
+       reinterpret_cast<const unsigned char *>(IV.constData()), nullptr) == 1) &&
+    (EVP_CIPHER_CTX_set_padding(Ctx, 0) == 1) &&
+    (EVP_EncryptUpdate(Ctx, reinterpret_cast<unsigned char *>(Encrypted.data()), &Len1,
+       reinterpret_cast<const unsigned char *>(Data.constData()), static_cast<int>(Data.size())) == 1) &&
+    (EVP_EncryptFinal_ex(Ctx, reinterpret_cast<unsigned char *>(Encrypted.data()) + Len1, &Len2) == 1) &&
+    (Len1 + Len2 == Data.size());
+  EVP_CIPHER_CTX_free(Ctx);
+  if (Ok)
+  {
+    memcpy(Data.data(), Encrypted.constData(), static_cast<size_t>(Data.size()));
+  }
+  return Ok;
+}
+
+// base64_lines: 64 characters per line
+static QByteArray Base64Lines(const QByteArray & Blob, int & Lines)
+{
+  QByteArray Base64 = Blob.toBase64();
+  QByteArray Result;
+  Lines = 0;
+  for (int Pos = 0; Pos < Base64.size(); Pos += 64)
+  {
+    Result.append(Base64.constData() + Pos, qMin<qsizetype>(64, Base64.size() - Pos));
+    Result.append('\n');
+    Lines++;
+  }
+  return Result;
+}
+
 // --- Public API ---
+
+QString ReadComment(const QString & FileName)
+{
+  QFile File(FileName);
+  if ((File.size() > MaxKeyFileSize) || !File.open(QIODevice::ReadOnly))
+  {
+    return QString();
+  }
+  SecureBytes Data;
+  Data.Data = File.readAll();
+  PpkFile Ppk;
+  QString Error;
+  return ParsePpk(Data.Data, Ppk, Error) ? QString::fromUtf8(Ppk.Comment) : QString();
+}
+
+bool Save(const QString & FileName, ssh_key Key, const QString & Comment, const QString & Passphrase, QString * Error)
+{
+  auto Fail = [&](const QString & Message)
+  {
+    if (Error != nullptr)
+    {
+      *Error = Message;
+    }
+    return false;
+  };
+  if (Comment.contains(QLatin1Char('\n')) || Comment.contains(QLatin1Char('\r')))
+  {
+    return Fail(QStringLiteral("The comment of a key cannot have more than one line."));
+  }
+  char * Exported = nullptr;
+  if ((ssh_pki_export_privkey_base64_format(Key, nullptr, nullptr, nullptr, &Exported, SSH_FILE_FORMAT_OPENSSH) != SSH_OK) ||
+      (Exported == nullptr))
+  {
+    return Fail(QStringLiteral("The key could not be exported from libssh."));
+  }
+  SecureBytes Pem;
+  Pem.Data = QByteArray(Exported);
+  OPENSSL_cleanse(Exported, strlen(Exported));
+  ssh_string_free_char(Exported);
+
+  PpkFile Ppk;
+  SecureBytes Private;
+  QString ErrorStr;
+  if (!ParseOpenSshKey(Pem.Data, Ppk.Algorithm, Ppk.PublicBlob, Private.Data, ErrorStr))
+  {
+    return Fail(ErrorStr);
+  }
+  Ppk.Comment = Comment.toUtf8();
+  SecureBytes PassphraseUtf8;
+  PassphraseUtf8.Data = Passphrase.toUtf8();
+  bool Encrypt = !PassphraseUtf8.Data.isEmpty();
+  Ppk.Encryption = Encrypt ? QByteArray("aes256-cbc") : QByteArray("none");
+  Ppk.Version = 3;
+  if (Encrypt)
+  {
+    EVP_KDF * Kdf = EVP_KDF_fetch(nullptr, "ARGON2ID", nullptr);
+    if (Kdf == nullptr)
+    {
+      Ppk.Version = 2;
+    }
+    EVP_KDF_free(Kdf);
+    Ppk.Kdf = "Argon2id";
+    Ppk.Argon2Memory = 8192;
+    Ppk.Argon2Passes = 13;
+    Ppk.Argon2Parallelism = 1;
+    Ppk.Argon2Salt.resize(16);
+    if (RAND_bytes(reinterpret_cast<unsigned char *>(Ppk.Argon2Salt.data()), 16) != 1)
+    {
+      return Fail(QStringLiteral("No random data for the key file."));
+    }
+    // Padded to the cipher block with the SHA-1 of the data, as PuTTY
+    SecureBytes Padding;
+    if (!Digest("SHA1", Private.Data, Padding.Data))
+    {
+      return Fail(QStringLiteral("SHA-1 failed."));
+    }
+    int PadLength = (16 - (Private.Data.size() % 16)) % 16;
+    Private.Data.append(Padding.Data.left(PadLength));
+  }
+  SecureBytes CipherKey;
+  SecureBytes CipherIV;
+  SecureBytes MacKey;
+  if (!DeriveKeys(Ppk, PassphraseUtf8.Data, CipherKey.Data, CipherIV.Data, MacKey.Data, ErrorStr))
+  {
+    return Fail(ErrorStr);
+  }
+  QByteArray Mac;
+  if (!ComputeMac(Ppk, MacKey.Data, Private.Data, Mac))
+  {
+    return Fail(QStringLiteral("Cannot compute MAC of PuTTY key file."));
+  }
+  if (Encrypt && !EncryptAes256Cbc(Private.Data, CipherKey.Data, CipherIV.Data))
+  {
+    return Fail(QStringLiteral("Cannot encrypt the key."));
+  }
+
+  int PublicLines = 0;
+  int PrivateLines = 0;
+  QByteArray PublicText = Base64Lines(Ppk.PublicBlob, PublicLines);
+  SecureBytes PrivateText;
+  PrivateText.Data = Base64Lines(Private.Data, PrivateLines);
+  SecureBytes Text;
+  Text.Data = QByteArray(PpkHeaderPrefix) + QByteArray::number(Ppk.Version) + ": " + Ppk.Algorithm + "\n";
+  Text.Data += "Encryption: " + Ppk.Encryption + "\n";
+  Text.Data += "Comment: " + Ppk.Comment + "\n";
+  Text.Data += "Public-Lines: " + QByteArray::number(PublicLines) + "\n" + PublicText;
+  if (Encrypt && (Ppk.Version == 3))
+  {
+    Text.Data += "Key-Derivation: " + Ppk.Kdf + "\n";
+    Text.Data += "Argon2-Memory: " + QByteArray::number(Ppk.Argon2Memory) + "\n";
+    Text.Data += "Argon2-Passes: " + QByteArray::number(Ppk.Argon2Passes) + "\n";
+    Text.Data += "Argon2-Parallelism: " + QByteArray::number(Ppk.Argon2Parallelism) + "\n";
+    Text.Data += "Argon2-Salt: " + Ppk.Argon2Salt.toHex() + "\n";
+  }
+  Text.Data += "Private-Lines: " + QByteArray::number(PrivateLines) + "\n" + PrivateText.Data;
+  Text.Data += "Private-MAC: " + Mac.toHex() + "\n";
+
+  QSaveFile File(FileName);
+  if (!File.open(QIODevice::WriteOnly))
+  {
+    return Fail(QStringLiteral("Cannot create file '%1'.\n%2").arg(FileName, File.errorString()));
+  }
+  Platform::MakePrivate(File);
+  if ((File.write(Text.Data) != Text.Data.size()) || !File.commit())
+  {
+    return Fail(QStringLiteral("Cannot write file '%1'.\n%2").arg(FileName, File.errorString()));
+  }
+  return true;
+}
 
 bool IsPuttyKeyFile(const QString & FileName)
 {
@@ -749,6 +1027,34 @@ bool IsPuttyKeyFile(const QString & FileName)
 }
 
 LoadResult Load(const QString & FileName, const std::function<bool(QString & Passphrase, bool Retry)> & PromptPassphrase,
+  ssh_key * Key, QString * Error)
+{
+  auto Fail = [&](const QString & Message) -> LoadResult
+  {
+    if (Error != nullptr)
+    {
+      *Error = Message;
+    }
+    return lrError;
+  };
+
+  SecureBytes Data;
+  {
+    QFile File(FileName);
+    if (!File.open(QIODevice::ReadOnly))
+    {
+      return Fail(QStringLiteral("Unable to open key file \"%1\": %2").arg(FileName, File.errorString()));
+    }
+    if (File.size() > MaxKeyFileSize)
+    {
+      return Fail(QStringLiteral("Key file \"%1\" is too large.").arg(FileName));
+    }
+    Data.Data = File.readAll();
+  }
+  return LoadData(Data.Data, PromptPassphrase, Key, Error);
+}
+
+LoadResult LoadData(const QByteArray & FileData, const std::function<bool(QString & Passphrase, bool Retry)> & PromptPassphrase,
   ssh_key * Key, QString * Error)
 {
   QString ErrorStr;
@@ -768,18 +1074,7 @@ LoadResult Load(const QString & FileName, const std::function<bool(QString & Pas
   *Key = nullptr;
 
   SecureBytes Data;
-  {
-    QFile File(FileName);
-    if (!File.open(QIODevice::ReadOnly))
-    {
-      return Fail(QStringLiteral("Unable to open key file \"%1\": %2").arg(FileName, File.errorString()));
-    }
-    if (File.size() > MaxKeyFileSize)
-    {
-      return Fail(QStringLiteral("Key file \"%1\" is too large.").arg(FileName));
-    }
-    Data.Data = File.readAll();
-  }
+  Data.Data = FileData;
 
   PpkFile Ppk;
   if (!ParsePpk(Data.Data, Ppk, ErrorStr))

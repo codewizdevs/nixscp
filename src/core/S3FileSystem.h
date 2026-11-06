@@ -166,6 +166,7 @@ public:
   QString HomeDirectory() override;
   RemoteFileList ReadDirectory(const QString & Path) override;
   RemoteFile ReadFile(const QString & Path) override;
+  void CheckDirectory(const QString & Path) override;
   bool FileExists(const QString & Path, RemoteFile * File) override;
   void CreateDirectory(const QString & Path, int Mode) override;
   void DeleteFile(const QString & Path) override;

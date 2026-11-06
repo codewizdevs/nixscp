@@ -48,6 +48,19 @@ protected:
     ExtException(Message, MoreMessages) {}
 };
 
+// Upload could not open the remote file for writing, so nothing was
+// transferred and an existing file is untouched: the name can be changed
+// (.filepart fallback) or the file deleted first (overwrite failed)
+class CannotCreateFileException : public ExtException
+{
+public:
+  using ExtException::ExtException;
+};
+
+// Mode for Upload and CreateDirectory: no permissions sent, the server decides
+// (its umask, inherited rights), as WinSCP unless "Set permissions" is on
+constexpr int ServerDefaultMode = -1;
+
 // The current file of an operation is skipped (ESkipFile): "Skip" answer of
 // the per-file error prompt, "No" to an overwrite confirmation, or the
 // "Skip this file" button of the progress dialog (FileOperationProgress::CancelFile).
@@ -297,6 +310,9 @@ public:
 
   virtual void DisplayBanner(const QString & SessionName, const QString & Banner) = 0;
 
+  // TTerminal::Information: a line for the user, needing no answer
+  virtual void Information(const QString & /*Message*/) {}
+
   virtual unsigned int QueryUser(const QString & Query, const QString & MoreMessages, unsigned int Answers) = 0;
 
   // TTerminal::QueryUser with TQueryParams: button aliases, countdown,
@@ -450,6 +466,10 @@ public:
   virtual RemoteFile ReadFile(const QString & Path) = 0;      // lstat; symlinks resolved for IsDirectory
   virtual bool FileExists(const QString & Path, RemoteFile * File) = 0;
   virtual void CreateDirectory(const QString & Path, int Mode) = 0;
+  // TSFTPFileSystem::TryOpenDirectory: throws when Path, canonicalized,
+  // cannot be opened as a directory; for protocols where CanonicalizePath
+  // does not already go there (an SFTP server need not check a REALPATH)
+  virtual void CheckDirectory(const QString & /*Path*/) {}
   virtual void DeleteFile(const QString & Path) = 0;
   virtual void RemoveDirectory(const QString & Path) = 0;
   virtual void RenameFile(const QString & From, const QString & To) = 0;

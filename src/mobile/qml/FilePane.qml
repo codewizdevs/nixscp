@@ -52,8 +52,9 @@ Item {
     // false at the top
     function up() {
         if (remote) {
-            if (session.directory === "/" || session.busy) return false
-            session.enter("..")
+            if (session.directory === "/") return false
+            // something runs: Back must not fall through to closing the tab
+            if (!session.busy) session.enter("..")
             return true
         }
         if (phone.atRoot) return false
@@ -766,23 +767,46 @@ Item {
         id: propertiesDialog
         property var names: []
         property bool hasFolder: false
+        // the bits all items have, those that differ between them (or are not
+        // listed by the server): shown half checked and left alone
         property int mode: 0
+        property int mixed: 0
+        // what the user changed: only that is applied, to each item's own rights
+        property int setBits: 0
+        property int unsetBits: 0
         property string owner
         property string group
+        function octalText() { return mixed === 0 ? ("000" + mode.toString(8)).slice(-4) : "" }
         function show(list) {
             names = list
             var first = pane.files.entry(list[0])
             hasFolder = false
-            for (var i = 0; i < list.length; i++)
+            var all = 4095, any = 0
+            for (var i = 0; i < list.length; i++) {
                 if (pane.files.isDir(list[i])) hasFolder = true
-            mode = first.mode
+                var item = pane.files.entry(list[i])
+                // no rights in the listing (S3, WebDAV): nothing is known about them
+                if (item.mode === 0) { all = 0; any = 4095 }
+                all &= item.mode
+                any |= item.mode
+            }
+            mode = all
+            mixed = all ^ any
+            setBits = 0
+            unsetBits = 0
             owner = first.owner
             group = first.group
-            ownerField.text = owner
-            groupField.text = group
+            ownerField.text = list.length === 1 ? owner : ""
+            groupField.text = list.length === 1 ? group : ""
             recursive.checked = false
-            octal.text = ("000" + mode.toString(8)).slice(-4)
+            octal.text = octalText()
             open()
+        }
+        function change(bit, on) {
+            mode = on ? (mode | bit) : (mode & ~bit)
+            mixed &= ~bit
+            setBits = on ? (setBits | bit) : (setBits & ~bit)
+            unsetBits = on ? (unsetBits & ~bit) : (unsetBits | bit)
         }
         parent: Overlay.overlay
         anchors.centerIn: undefined
@@ -794,9 +818,10 @@ Item {
         title: names.length === 1 ? names[0] : qsTr("%1 items").arg(names.length)
         standardButtons: Dialog.Cancel | Dialog.Ok
         onAccepted: {
-            session.setProperties(names, mode,
-                                  ownerField.text !== owner ? ownerField.text : "",
-                                  groupField.text !== group ? groupField.text : "",
+            var one = names.length === 1
+            session.setProperties(names, setBits, unsetBits,
+                                  !one || ownerField.text !== owner ? ownerField.text : "",
+                                  !one || groupField.text !== group ? groupField.text : "",
                                   recursive.checked)
             pane.files.clearSelection()
         }
@@ -824,10 +849,16 @@ Item {
                         Layout.row: Math.floor(index / 3) + 1
                         Layout.column: index % 3 + 1
                         Layout.alignment: Qt.AlignHCenter
-                        checked: (propertiesDialog.mode & bit) !== 0
-                        onToggled: {
-                            propertiesDialog.mode = checked ? (propertiesDialog.mode | bit) : (propertiesDialog.mode & ~bit)
-                            octal.text = ("000" + propertiesDialog.mode.toString(8)).slice(-4)
+                        readonly property bool isMixed: (propertiesDialog.mixed & bit) !== 0
+                        readonly property bool isSet: (propertiesDialog.mode & bit) !== 0
+                        tristate: true
+                        checkState: isMixed ? Qt.PartiallyChecked : (isSet ? Qt.Checked : Qt.Unchecked)
+                        // only shows the dialog's state: a tap changes that (a half
+                        // checked box turns on), and the box follows
+                        nextCheckState: function() { return checkState }
+                        onClicked: {
+                            propertiesDialog.change(bit, isMixed || !isSet)
+                            octal.text = propertiesDialog.octalText()
                         }
                     }
                 }
@@ -840,7 +871,13 @@ Item {
                     font.family: monoFont
                     inputMethodHints: Qt.ImhDigitsOnly
                     validator: RegularExpressionValidator { regularExpression: /[0-7]{3,4}/ }
-                    onTextEdited: if (acceptableInput) propertiesDialog.mode = parseInt(text, 8)
+                    onTextEdited: {
+                        if (!acceptableInput) return
+                        // the octal says all of the rights
+                        var value = parseInt(text, 8)
+                        for (var bit = 1; bit <= 2048; bit *= 2)
+                            propertiesDialog.change(bit, (value & bit) !== 0)
+                    }
                 }
             }
             RowLayout {

@@ -24,6 +24,7 @@
 //                               other than the default one (region detection test)
 // The test creates and deletes a bucket named nixscp-test-<random>.
 #include "core/S3FileSystem.h"
+#include "core/Configuration.h"
 #include "core/Terminal.h"
 
 #include <QCoreApplication>
@@ -34,6 +35,7 @@
 #include <QFileInfo>
 #include <QMutex>
 #include <QRandomGenerator>
+#include <QTcpSocket>
 #include <QTemporaryDir>
 #include <QTimeZone>
 #include <QTimer>
@@ -800,6 +802,13 @@ static void TestServer(const SessionData & Data, const QString & Scratch)
     E = Error([&]() { Files = Fs.ReadDirectory(Root + QStringLiteral("/dir/sub dir")); });
     CHECK_MSG(E.isEmpty() && Files.isEmpty(), E);
     E = Error([&]() { Fs.ReadDirectory(Root + QStringLiteral("/nonexistent")); });
+    {
+      // the check of an initial directory (open s3://host/bucket/missing/)
+      QString Existing = Error([&]() { Fs.CheckDirectory(Root + QStringLiteral("/dir")); });
+      CHECK_MSG(Existing.isEmpty(), Existing);
+      CHECK(!Error([&]() { Fs.CheckDirectory(Root + QStringLiteral("/nonexistent")); }).isEmpty());
+      CHECK(Error([&]() { Fs.CheckDirectory(QStringLiteral("/")); }).isEmpty());
+    }
     CHECK_MSG(E.startsWith(QStringLiteral("Error listing directory")), E);
     CHECK(!Fs.FileExists(Root + QStringLiteral("/nonexistent"), nullptr));
     E = Error([&]() { Fs.ReadFile(Root + QStringLiteral("/nonexistent")); });
@@ -1032,6 +1041,57 @@ static void TestServer(const SessionData & Data, const QString & Scratch)
     Waiter W5;
     T.DeleteFiles({Root + QStringLiteral("/up")}, W5.Cb());
     CHECK_MSG(W5.Wait().Ok, Describe(W5.Result));
+  }
+
+  std::printf("[MimeTypes]\n");
+  {
+    // the override of the hidden setting, "<mask>=<type>,..."; a signed HEAD
+    // of our own shows what the server stored
+    auto Type = [&](const QString & Name)
+    {
+      QString Remote = Root + QLatin1Char('/') + Name;
+      QString Local = Scratch + QLatin1Char('/') + Name;
+      WriteFile(Local, "mime");
+      FileOperationProgress MimeProgress;
+      QString UploadError = Error([&]() { Fs.Upload(Local, Remote, 0644, MimeProgress); });
+      CHECK_MSG(UploadError.isEmpty(), UploadError);
+      QTcpSocket Socket;
+      Socket.connectToHost(Data.HostName, static_cast<quint16>(Data.PortNumber));
+      CHECK(Socket.waitForConnected(5000));
+      QByteArray Host = QStringLiteral("%1:%2").arg(Data.HostName).arg(Data.PortNumber).toUtf8();
+      S3SignatureV4 Signature;
+      Signature.Method = "HEAD";
+      Signature.CanonicalUri = S3SignatureV4::UriEncode(Remote.toUtf8(), false);
+      Signature.Time = QDateTime::currentDateTimeUtc();
+      Signature.PayloadHash = S3SignatureV4::EmptyPayloadHash();
+      QByteArray Date = S3SignatureV4::AmzDate(Signature.Time);
+      Signature.Headers = {qMakePair(QByteArray("Host"), Host), qMakePair(QByteArray("x-amz-date"), Date),
+        qMakePair(QByteArray("x-amz-content-sha256"), Signature.PayloadHash)};
+      Signature.AccessKeyId = Data.UserName.toUtf8();
+      Signature.SecretAccessKey = Data.Password.toUtf8();
+      Signature.Region = Data.S3DefaultRegion.isEmpty() ? QByteArray("us-east-1") : Data.S3DefaultRegion.toUtf8();
+      Signature.Sign();
+      Socket.write("HEAD " + Signature.CanonicalUri + " HTTP/1.0\r\nHost: " + Host + "\r\nx-amz-date: " + Date +
+        "\r\nx-amz-content-sha256: " + Signature.PayloadHash + "\r\nAuthorization: " + Signature.Authorization + "\r\n\r\n");
+      while (Socket.waitForReadyRead(5000))
+      {
+      }
+      QString Header = QString::fromLatin1(Socket.readAll());
+      Fs.DeleteFile(Remote);
+      return Header;
+    };
+    // (plain HTTP, path style: the only form this hand-made request speaks)
+    if ((Data.Ftps == ftpsNone) && (Data.S3UrlStyle == s3usPath))
+    {
+      Configuration::Instance().MimeTypes = QStringLiteral("*.xyz=application/x-nixscp, *.txt=text/x-nixscp");
+      QString Header = Type(QStringLiteral("a.xyz"));
+      CHECK_MSG(Header.contains(QStringLiteral("application/x-nixscp"), Qt::CaseInsensitive), Header);
+      Header = Type(QStringLiteral("b.txt"));
+      CHECK_MSG(Header.contains(QStringLiteral("text/x-nixscp"), Qt::CaseInsensitive), Header);
+      Configuration::Instance().MimeTypes.clear();
+      Header = Type(QStringLiteral("c.txt"));
+      CHECK_MSG(Header.contains(QStringLiteral("text/plain"), Qt::CaseInsensitive), Header);
+    }
   }
 
   std::printf("[server cleanup]\n");

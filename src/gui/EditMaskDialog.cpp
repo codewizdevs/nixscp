@@ -1,5 +1,4 @@
 // Port of WinSCP source/forms/SelectMask.{cpp,dfm} and source/forms/EditMask.{cpp,dfm}
-// (the "Color" button of the file colors mode is not ported)
 #include "gui/EditMaskDialog.h"
 #include "gui/HelpSystem.h"
 #include "gui/HistoryComboBox.h"

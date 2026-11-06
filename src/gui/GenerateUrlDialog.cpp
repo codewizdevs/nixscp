@@ -291,32 +291,7 @@ QString GenerateUrlDialog::ProtocolUrl(const SessionData & Data, bool HttpForWeb
 
 QStringList GenerateUrlDialog::RawSettingsForUrl(const SessionData & Data)
 {
-  // TSessionData::GetRawSettingsForUrl
-  SessionData FactoryDefaults;
-  SessionData Copy = Data;
-  Copy.FSProtocol = FactoryDefaults.FSProtocol;
-  Copy.HostName = FactoryDefaults.HostName;
-  Copy.PortNumber = FactoryDefaults.PortNumber;
-  Copy.UserName = FactoryDefaults.UserName;
-  Copy.Password = FactoryDefaults.Password;
-  Copy.Ftps = FactoryDefaults.Ftps;
-  Copy.HostKey = FactoryDefaults.HostKey;
-  ResetNonCoreData(Copy, FactoryDefaults);
-  QStringList Result = Copy.SaveToOptions(&FactoryDefaults);
-  // SaveName: HasSessionName() && (Name != DefaultSessionName)
-  if (!Data.Name.isEmpty() && (Data.Name != Data.DefaultSessionName()) && !Data.IsWorkspace)
-  {
-    bool HasName = false;
-    for (const QString & S : Result)
-    {
-      HasName = HasName || S.startsWith(QStringLiteral("Name="), Qt::CaseInsensitive);
-    }
-    if (!HasName)
-    {
-      Result.prepend(QStringLiteral("Name=") + Data.Name);
-    }
-  }
-  return Result;
+  return Data.RawSettingsForUrl();
 }
 
 QString GenerateUrlDialog::GenerateSessionUrl(const SessionData & Data, unsigned int Flags)

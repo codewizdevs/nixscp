@@ -87,6 +87,7 @@ private:
   // FSessionData: advanced settings of the edited site / New Site
   SessionData FEditingData;
   bool FEditing = false;
+  QString FEditingName;                 // the site being edited
   bool FRenaming = false;
   int FNoUpdate = 0;
   bool FInitialized = false;

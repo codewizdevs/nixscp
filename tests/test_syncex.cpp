@@ -23,7 +23,9 @@
 #include <cerrno>
 #include <cstdio>
 #include <fcntl.h>
+#include <pwd.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static int Failures = 0;
 
@@ -133,8 +135,12 @@ static const SynchronizeChecklist::Item * Find(const SynchronizeChecklist & Chec
 static void TestWithoutServer(const QString & Scratch)
 {
   std::printf("[defaults]\n");
-  // Linux: case sensitive by default
+  // Linux: case sensitive by default; not on macOS, where the disk ignores case
+#ifdef Q_OS_MACOS
+  CHECK((spDefault & spCaseSensitive) == 0);
+#else
   CHECK((spDefault & spCaseSensitive) != 0);
+#endif
   CHECK((spDefault & spPreviewChanges) != 0);
   CHECK(SynchronizeChecklist::OppositeMoveAction(SynchronizeChecklist::saUploadNew) == SynchronizeChecklist::saDeleteRemote);
   CHECK(SynchronizeChecklist::OppositeMoveAction(SynchronizeChecklist::saDeleteLocal) == SynchronizeChecklist::saDownloadNew);
@@ -149,8 +155,10 @@ static void TestWithoutServer(const QString & Scratch)
       QStringLiteral("ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789 */bin/x"),
       QStringLiteral("\\0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  /tmp/new\\nline\\\\back"),
       QStringLiteral("sha256sum: /tmp/missing: No such file or directory"),
+      QStringLiteral("d41d8cd98f00b204e9800998ecf8427e /tmp/md5 -r.txt"),
       QString()});
-    CHECK(H.size() == 3);
+    CHECK(H.size() == 4);
+    CHECK(H.value(QStringLiteral("/tmp/md5 -r.txt")) == QStringLiteral("d41d8cd98f00b204e9800998ecf8427e"));
     CHECK(H.value(QStringLiteral("/tmp/a b.txt")) == QStringLiteral("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
     CHECK(H.value(QStringLiteral("/bin/x")) == QStringLiteral("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"));
     CHECK(H.contains(QStringLiteral("/tmp/new\nline\\back")));
@@ -443,6 +451,20 @@ int main(int argc, char ** argv)
     CHECK(!Ok);
   }
 
+#ifdef Q_OS_MACOS
+  std::printf("[both Unicode forms of a name]\n");
+  {
+    // one file to the disk: not a new one on each side, and a transfer of
+    // the "new" file would overwrite the other one unasked
+    QDir(Local).removeRecursively();
+    QDir(Remote).removeRecursively();
+    WriteFile(QDir(Local).filePath(QString::fromUtf8("cafe\xCC\x81.txt")), "same", T0);
+    WriteFile(QDir(Remote).filePath(QString::fromUtf8("caf\xC3\xA9.txt")), "same", T0);
+    auto C = Collect(&T, Local, Remote, smBoth, 0);
+    CHECK_MSG(C->Count() == 0, Names(*C).join(QLatin1Char(',')));
+  }
+#endif
+
   std::printf("[local deletes to trash]\n");
   {
     QDir(Local).removeRecursively();
@@ -459,8 +481,14 @@ int main(int argc, char ** argv)
     CHECK(WaitUntil([&]() { return Called; }, 30000));
     CHECK(Stats.FilesDeletedLocal == 2);
     CHECK(!QFileInfo::exists(QDir(Local).filePath(QStringLiteral("obsolete.txt"))));
+#ifdef Q_OS_MACOS
+    // the system's trash, ~/.Trash of the real user whatever $HOME says, and the name may get a suffix
+    QString Trash = QString::fromLocal8Bit(getpwuid(getuid())->pw_dir) + QStringLiteral("/.Trash");
+    bool InTrash = !QDir(Trash).entryList({QStringLiteral("obsolete*.txt")}, QDir::Files).isEmpty();
+#else
     QString Trash = Scratch.filePath(QStringLiteral("xdg-data/Trash/files"));
     bool InTrash = QFileInfo::exists(QDir(Trash).filePath(QStringLiteral("obsolete.txt")));
+#endif
     // /tmp may be another file system than XDG_DATA_HOME: Qt then uses $topdir/.Trash-$uid
     if (!InTrash)
     {

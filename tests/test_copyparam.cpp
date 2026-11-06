@@ -8,6 +8,7 @@
 #include "core/CopyParamList.h"
 #include "core/FileSystem.h"
 #include "core/IniStorage.h"
+#include "core/RemoteFile.h"
 #include "core/Terminal.h"
 
 #include <QCoreApplication>
@@ -77,6 +78,74 @@ static void TestLocalFileNames()
   {
     CHECK_EQ(CopyParam::RestoreChars(CopyParam::ValidLocalFileName(Name)), Name);
   }
+}
+
+// The rules of Windows, on every platform: what a hostile server can send
+static void TestWindowsFileNames()
+{
+  auto Valid = [](const char * Name) { return CopyParam::WindowsLocalFileName(QString::fromUtf8(Name)); };
+  CHECK_EQ(Valid("report 12:30.txt"), QStringLiteral("report 12%3A30.txt"));
+  // alternate data streams, drives, separators and shares end up in a single name
+  CHECK_EQ(Valid("a.txt:evil.exe"), QStringLiteral("a.txt%3Aevil.exe"));
+  CHECK_EQ(Valid("a.txt::$DATA"), QStringLiteral("a.txt%3A%3A$DATA"));
+  CHECK_EQ(Valid("C:\\Windows\\x.dll"), QStringLiteral("C%3A%5CWindows%5Cx.dll"));
+  CHECK_EQ(Valid("..\\..\\x"), QStringLiteral("..%5C..%5Cx"));
+  CHECK_EQ(Valid("\\\\server\\share\\x"), QStringLiteral("%5C%5Cserver%5Cshare%5Cx"));
+  // the end of a name is trimmed by Windows
+  CHECK_EQ(Valid("x.exe."), QStringLiteral("x.exe%2E"));
+  CHECK_EQ(Valid("x.exe "), QStringLiteral("x.exe%20"));
+  CHECK_EQ(Valid("x.exe. ."), QStringLiteral("x.exe. %2E"));
+  CHECK_EQ(Valid(".."), QStringLiteral(".%2E"));
+  CHECK_EQ(Valid(".. "), QStringLiteral("..%20"));
+  // devices, in any case, with an extension and with spaces before it
+  CHECK_EQ(Valid("con"), QStringLiteral("con%00"));
+  CHECK_EQ(Valid("NUL.txt"), QStringLiteral("NUL%00.txt"));
+  CHECK_EQ(Valid("NUL .txt"), QStringLiteral("NUL %00.txt"));
+  CHECK_EQ(Valid("aux  .tar.gz"), QStringLiteral("aux  %00.tar.gz"));
+  CHECK_EQ(Valid("COM1"), QStringLiteral("COM1%00"));
+  CHECK_EQ(Valid("lpt9.log"), QStringLiteral("lpt9%00.log"));
+  CHECK_EQ(Valid("COM0"), QStringLiteral("COM0%00"));
+  CHECK_EQ(Valid("CONIN$"), QStringLiteral("CONIN$%00"));
+  CHECK_EQ(Valid("conout$.txt"), QStringLiteral("conout$%00.txt"));
+  CHECK_EQ(Valid("COM\xC2\xB9"), QStringLiteral("COM\u00B9%00"));
+  CHECK_EQ(Valid("LPT\xC2\xB3.txt"), QStringLiteral("LPT\u00B3%00.txt"));
+  // not devices
+  CHECK_EQ(Valid("console"), QStringLiteral("console"));
+  CHECK_EQ(Valid("COM10"), QStringLiteral("COM10"));
+  CHECK_EQ(Valid("LPT"), QStringLiteral("LPT"));
+  CHECK_EQ(Valid("my.con"), QStringLiteral("my.con"));
+  CHECK_EQ(Valid("\xC5\xA1kola.txt"), QStringLiteral("\u0161kola.txt"));
+  const QStringList Names = {
+    QStringLiteral("NUL .txt"), QStringLiteral("aux  .tar.gz"), QStringLiteral("CONIN$"), QStringLiteral("conout$.txt"),
+    QStringLiteral("COM\u00B9"), QStringLiteral("LPT\u00B3.txt"), QStringLiteral("COM0"), QStringLiteral("a.txt:evil.exe"),
+    QStringLiteral("..\\..\\x"), QStringLiteral("C:\\x"), QStringLiteral("x.exe. ."), QStringLiteral(".. "), QStringLiteral("%00")};
+  for (const QString & Name : Names)
+  {
+    QString Local = CopyParam::WindowsLocalFileName(Name);
+    CHECK_EQ(CopyParam::WindowsRestoreChars(Local), Name);
+    // nothing Windows would read as a path, a stream or a device is left
+    CHECK(!Local.contains(QLatin1Char('\\')) && !Local.contains(QLatin1Char(':')) && !Local.contains(QLatin1Char('/')));
+    CHECK(!Local.endsWith(QLatin1Char('.')) && !Local.endsWith(QLatin1Char(' ')));
+  }
+
+  // what must not even be listed on Windows
+  for (const char * Name : {"..\\x", "a\\..\\..\\x", "\\x", "\\\\server\\share", "C:\\x", "C:x", "z:", ".. ", "...", ". .", " ", "x\\.. \\y"})
+  {
+    CHECK(LeavesWindowsFolder(QString::fromUtf8(Name)));
+  }
+  // what stays listed, and is encoded by ValidLocalFileName
+  for (const char * Name : {"plain.txt", "a\\b", "report 12:30.txt", "12:30", "con", "..a", "a..", ".hidden", "\xC5\xA1:x"})
+  {
+    CHECK(!LeavesWindowsFolder(QString::fromUtf8(Name)));
+  }
+#ifdef _WIN32
+  CHECK(!IsValidListingName(QStringLiteral("..\\x")));
+  CHECK(IsValidListingName(QStringLiteral("a\\b")));
+#else
+  // no meaning here: nothing changes on Linux and macOS
+  CHECK(IsValidListingName(QStringLiteral("..\\x")));
+  CHECK(IsValidListingName(QStringLiteral("C:x")));
+#endif
 }
 
 static void TestPreserveReadOnly()
@@ -437,6 +506,7 @@ int main(int argc, char ** argv)
 
   TestFileMask();
   TestLocalFileNames();
+  TestWindowsFileNames();
   TestPreserveReadOnly();
   TestUsableAttrs();
   TestEOL();

@@ -11,7 +11,7 @@
 class TeamsModel : public QObject
 {
   Q_OBJECT
-  // [{uuid, name, role, canEdit, members, needsRotation, keyReady}]
+  // [{uuid, name, folder, role, canEdit, members, needsRotation, keyReady, error, conflict}]
   Q_PROPERTY(QVariantList teams READ teams NOTIFY changed)
   Q_PROPERTY(bool available READ available NOTIFY changed)
   Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
@@ -28,15 +28,17 @@ public:
   Q_INVOKABLE void rename(const QString & Uuid, const QString & Name);
   Q_INVOKABLE void remove(const QString & Uuid);
   Q_INVOKABLE void leave(const QString & Uuid);
+  // a team that fails verification leaves this phone; KeepSites: they stay as a plain folder
+  Q_INVOKABLE void forget(const QString & Uuid, bool KeepSites);
   Q_INVOKABLE void join(const QString & Code);
   // the sites of a folder of the site list move into the team
   Q_INVOKABLE void shareFolder(const QString & Uuid, const QString & Folder);
   // Role: admin or member; data: the code to hand over
   Q_INVOKABLE void invite(const QString & Uuid, const QString & Role, int Days);
-  // data: [{id, role, expires_at...}]
+  // data: {uuid, list: [{id, role, expires_at...}]}
   Q_INVOKABLE void invites(const QString & Uuid);
   Q_INVOKABLE void revokeInvite(const QString & Uuid, const QString & Id);
-  // data: [{user, email, role...}]
+  // data: {uuid, list: [{user_uuid, email, role, fingerprint, gone, unusable...}]}
   Q_INVOKABLE void members(const QString & Uuid);
   Q_INVOKABLE void setRole(const QString & Uuid, const QString & User, const QString & Role);
   Q_INVOKABLE void removeMember(const QString & Uuid, const QString & User);
@@ -54,6 +56,13 @@ public:
   Q_INVOKABLE void unshare(const QString & Uuid, const QStringList & Names, bool KeepCopy);
   // the team of a stored site name: {uuid, name, relative, canEdit}, or empty
   Q_INVOKABLE QVariantMap siteTeam(const QString & Site) const;
+  // a conflict of the team: KeepLocal pushes this phone's sites over the team's
+  Q_INVOKABLE void resolveConflict(const QString & Uuid, bool KeepLocal);
+  // data: {uuid, list: [{version, created_at, user_email...}]}, newest first
+  Q_INVOKABLE void history(const QString & Uuid);
+  Q_INVOKABLE void restore(const QString & Uuid, double Version);
+  // this account's key fingerprint, for comparing with colleagues
+  Q_INVOKABLE QString fingerprint() const;
 
 signals:
   void changed();

@@ -20,6 +20,7 @@ public class TransferService extends Service
 {
     private static final String CHANNEL = "transfers";
     private static final int NOTIFICATION = 1;
+    private static final int TIMEOUT_NOTIFICATION = 2;
     private static final String EXTRA_TEXT = "text";
     private static final String EXTRA_PERCENT = "percent";
 
@@ -55,6 +56,15 @@ public class TransferService extends Service
 
     private Notification build(String text, int percent)
     {
+        return builder(text)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setProgress(100, Math.max(0, percent), percent < 0)
+            .build();
+    }
+
+    private Notification.Builder builder(String text)
+    {
         NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         Notification.Builder builder;
         if (Build.VERSION.SDK_INT >= 26) {
@@ -69,11 +79,20 @@ public class TransferService extends Service
         return builder.setContentTitle("NixSCP")
             .setContentText(text)
             .setSmallIcon(getApplicationInfo().icon)
-            .setContentIntent(content)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setProgress(100, Math.max(0, percent), percent < 0)
-            .build();
+            .setContentIntent(content);
+    }
+
+    // Android 15: a dataSync service gets 6 hours a day, then this call, and
+    // must stop within seconds or the whole app is stopped with an error.
+    // The transfers go on while the app is in front; the user is told why
+    // they may not in the background
+    @Override
+    public void onTimeout(int startId, int foregroundServiceType)
+    {
+        NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        manager.notify(TIMEOUT_NOTIFICATION, builder("Android's limit for background transfers was reached. Open NixSCP to go on.").build());
+        stopForeground(STOP_FOREGROUND_REMOVE);
+        stopSelf();
     }
 
     @Override

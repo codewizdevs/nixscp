@@ -93,11 +93,13 @@ void RunKeepRemoteUpToDate(QWidget * Parent, Terminal * Term, const QString & Lo
   const QString & RemoteDirectory, const CopyParam & Param, const QStringList & SelectedNames,
   std::function<void()> Finished);
 
-// Commands > Compare Directories: compares the files listed in the panels
-// (non-recursive) with the criteria of Preferences > Commander
+// Commands > Compare Directories: compares the files shown in the panels
+// (non-recursive; RemoteFiles and LocalNames, without hidden and filtered out
+// files) with the criteria of Preferences > Commander
 // (Configuration::CompareByTime/CompareBySize). Select is called with the
 // names to select in each panel (all other files should be deselected, as
 // WinSCP does); when nothing differs, "No differences found." is shown and
 // Select is called with empty lists.
 void RunCompareDirectories(QWidget * Parent, const QString & LocalDirectory, const RemoteFileList & RemoteFiles,
+  const QSet<QString> & LocalNames,
   std::function<void(const QStringList & LocalNames, const QStringList & RemoteNames)> Select);

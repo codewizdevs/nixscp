@@ -88,6 +88,10 @@ struct CopyParam
   // TConfiguration (Preferences > Confirmations), not saved by Save()
   bool ConfirmOverwriting = true;
   bool ConfirmResume = true;
+  // cpAppend (scripting): an existing target gets the file added at its end. Not saved.
+  bool Append = false;
+  // TTerminal::GetBaseFileName: the site's TrimVMSVersions, for ChangeFileName. Not saved.
+  bool TrimVMSVersions = false;
 
   // TGUICopyParamType
   bool Queue = false;                            // "Transfer in background" default
@@ -125,6 +129,9 @@ struct CopyParam
   // RestoreChars reverses it for uploads. Both return the name as is on Linux.
   static QString ValidLocalFileName(const QString & FileName);
   static QString RestoreChars(const QString & FileName);
+  // The same for Windows, on any platform (what the two above do there)
+  static QString WindowsLocalFileName(const QString & FileName);
+  static QString WindowsRestoreChars(const QString & FileName);
   // Rights for newly uploaded file/directory (TCopyParamType::RemoteFileRights)
   unsigned int RemoteFileRights(bool Directory) const;
 
@@ -189,8 +196,6 @@ private:
   void Emit(QByteArray & Out, char C);
 };
 
-// TModificationFmt (precision of a timestamp, e.g. of FTP listings)
-enum TModificationFmt { mfNone, mfMDY, mfYMDHM, mfMDHM, mfFull };
 QDateTime ReduceDateTimePrecision(const QDateTime & DateTime, TModificationFmt Precision);
 TModificationFmt LessDateTimePrecision(TModificationFmt Precision1, TModificationFmt Precision2);
 // "New and updated files only": Source is newer than Dest when compared with

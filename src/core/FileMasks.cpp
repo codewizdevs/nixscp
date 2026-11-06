@@ -737,7 +737,40 @@ void FileMasks::CreateMask(const QString & MaskStr, int MaskStart, bool Include)
         DirectoryMaskStr.replace(QLatin1Char('\\'), QLatin1Char('/'));
         // make sure sole "/" (root dir) is preserved as is
         DirectoryMaskStr = SimpleUnixExcludeTrailingBackslash(DirectoryMaskStr);
-        CreateMaskMask(DirectoryMaskStr, PartStart, PartStart + D, false, M.DirectoryMaskKind, M.DirectoryMask);
+        QString RemoteDirectoryMaskStr = DirectoryMaskStr;
+        QString LocalDirectoryMaskStr = DirectoryMaskStr;
+        const QString RelativePrefix = QStringLiteral(".");
+        const QString RelativePrefixWithSlash = RelativePrefix + QLatin1Char('/');
+        if (DirectoryMaskStr == RelativePrefix)
+        {
+          FAnyRelative = true;
+          if (!FRemoteRoot.isEmpty())
+          {
+            RemoteDirectoryMaskStr = SimpleUnixExcludeTrailingBackslash(FRemoteRoot);
+          }
+          if (!FLocalRoot.isEmpty())
+          {
+            LocalDirectoryMaskStr = SimpleUnixExcludeTrailingBackslash(FLocalRoot);
+          }
+        }
+        else if (DirectoryMaskStr.startsWith(RelativePrefixWithSlash))
+        {
+          FAnyRelative = true;
+          DirectoryMaskStr.remove(0, RelativePrefixWithSlash.size());
+          if (!FRemoteRoot.isEmpty())
+          {
+            RemoteDirectoryMaskStr = FRemoteRoot + DirectoryMaskStr;
+          }
+          if (!FLocalRoot.isEmpty())
+          {
+            LocalDirectoryMaskStr = FLocalRoot + DirectoryMaskStr;
+          }
+        }
+        CreateMaskMask(RemoteDirectoryMaskStr, PartStart, PartStart + D, false, M.DirectoryMaskKind, M.DirectoryMask);
+        if (M.DirectoryMask)
+        {
+          M.LocalDirectoryMask = std::make_shared<WildcardMask>(LocalDirectoryMaskStr);
+        }
         CreateMaskMask(PartStr.mid(D + 1), PartStart + D + 1, PartEnd, true, M.FileNameMaskKind, M.FileNameMask);
       }
       else
@@ -763,7 +796,7 @@ bool FileMasks::MatchesMaskMask(Mask::Kind MaskKind, const WildcardMask * MaskMa
   return MaskMask->Matches(Str);
 }
 
-bool FileMasks::MatchesMasks(const QString & FileName, bool Directory, const QString & Path,
+bool FileMasks::MatchesMasks(const QString & FileName, bool Local, bool Directory, const QString & Path,
   const Params * AParams, const MaskList & Masks, bool Recurse)
 {
   bool Result = false;
@@ -771,7 +804,7 @@ bool FileMasks::MatchesMasks(const QString & FileName, bool Directory, const QSt
   {
     const Mask & M = *I;
     Result =
-      MatchesMaskMask(M.DirectoryMaskKind, M.DirectoryMask.get(), Path) &&
+      MatchesMaskMask(M.DirectoryMaskKind, Local ? M.LocalDirectoryMask.get() : M.DirectoryMask.get(), Path) &&
       MatchesMaskMask(M.FileNameMaskKind, M.FileNameMask.get(), FileName);
 
     if (Result)
@@ -819,21 +852,31 @@ bool FileMasks::MatchesMasks(const QString & FileName, bool Directory, const QSt
     // directory is included, when any of its parents is
     QString ParentFileName = UnixExtractFileName(Path);
     QString ParentPath = UnixExtractFileDir(Path);
-    Result = MatchesMasks(ParentFileName, true, ParentPath, AParams, Masks, Recurse);
+    Result = MatchesMasks(ParentFileName, Local, true, ParentPath, AParams, Masks, Recurse);
   }
   return Result;
 }
 
-bool FileMasks::DoMatches(const QString & FileName, bool Directory, const QString & Path, const Params * AParams,
+void FileMasks::SetRoots(const QString & LocalRoot, const QString & RemoteRoot)
+{
+  if (FAnyRelative) // optimization
+  {
+    FLocalRoot = EscapeMask(LocalRoot.endsWith(QLatin1Char('/')) ? LocalRoot : (LocalRoot + QLatin1Char('/')));
+    FRemoteRoot = EscapeMask(RemoteRoot.endsWith(QLatin1Char('/')) ? RemoteRoot : (RemoteRoot + QLatin1Char('/')));
+    SetStr(FStr, false);
+  }
+}
+
+bool FileMasks::DoMatches(const QString & FileName, bool Local, bool Directory, const QString & Path, const Params * AParams,
   bool RecurseInclude, bool & ImplicitMatch) const
 {
   const MaskList & IncludeMasks = FMasks[MaskIndex(Directory, true)];
   const MaskList & ExcludeMasks = FMasks[MaskIndex(Directory, false)];
   bool ImplicitIncludeMatch = (AllDirsAreImplicitlyIncluded && Directory) || IncludeMasks.empty();
-  bool ExplicitIncludeMatch = MatchesMasks(FileName, Directory, Path, AParams, IncludeMasks, RecurseInclude);
+  bool ExplicitIncludeMatch = MatchesMasks(FileName, Local, Directory, Path, AParams, IncludeMasks, RecurseInclude);
   bool Result =
     (ImplicitIncludeMatch || ExplicitIncludeMatch) &&
-    !MatchesMasks(FileName, Directory, Path, AParams, ExcludeMasks, false);
+    !MatchesMasks(FileName, Local, Directory, Path, AParams, ExcludeMasks, false);
   ImplicitMatch =
     Result && ImplicitIncludeMatch && !ExplicitIncludeMatch &&
     ((Directory && NoImplicitMatchWithDirExcludeMask) || ExcludeMasks.empty());
@@ -846,21 +889,21 @@ bool FileMasks::Matches(const QString & FileName, bool Local, bool Directory, co
   return Matches(FileName, Local, Directory, AParams, true, ImplicitMatch);
 }
 
-bool FileMasks::Matches(const QString & FileName, bool /*Local*/, bool Directory, const Params * AParams,
+bool FileMasks::Matches(const QString & FileName, bool Local, bool Directory, const Params * AParams,
   bool RecurseInclude, bool & ImplicitMatch) const
 {
-  return DoMatches(UnixExtractFileName(FileName), Directory, UnixExtractFileDir(FileName), AParams,
+  return DoMatches(UnixExtractFileName(FileName), Local, Directory, UnixExtractFileDir(FileName), AParams,
     RecurseInclude, ImplicitMatch);
 }
 
 bool FileMasks::Matches(const QString & FileName, bool Directory, const QString & Path, const Params * AParams) const
 {
   bool ImplicitMatch;
-  return DoMatches(FileName, Directory, SimpleUnixExcludeTrailingBackslash(Path), AParams, true, ImplicitMatch);
+  return DoMatches(FileName, false, Directory, SimpleUnixExcludeTrailingBackslash(Path), AParams, true, ImplicitMatch);
 }
 
 bool FileMasks::MatchesFileName(const QString & FileName, bool Directory, const Params * AParams) const
 {
   bool ImplicitMatch;
-  return DoMatches(FileName, Directory, QString(), AParams, true, ImplicitMatch);
+  return DoMatches(FileName, false, Directory, QString(), AParams, true, ImplicitMatch);
 }

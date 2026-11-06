@@ -8,19 +8,25 @@ import QtQuick.Layouts
 Page {
     id: page
     objectName: "preview"
+    // the session the file came from (the phone's own files: the current one)
+    property var owner: session
     property string localPath
     property string name
     // "image" or "text"
     property string kind: "image"
     property string text: ""
+    // handed to another app: it may still be reading the file
+    property bool handedOver: false
 
     Component.onCompleted: {
         if (kind === "text") {
-            var file = session.readText(localPath)
+            var file = owner.readText(localPath)
             if (file.error) { app.toast(file.error); Qt.callLater(function() { page.StackView.view.pop() }) }
             else text = file.text
         }
     }
+    // a server's file does not stay on the phone once it was looked at
+    StackView.onRemoved: if (owner && !handedOver) owner.closePreview(localPath)
 
     header: ToolBar {
         Material.background: Material.primary
@@ -33,11 +39,17 @@ Page {
                 icon.source: "icons/share.svg"
                 icon.color: "white"
                 Accessible.name: qsTr("Share")
-                onClicked: if (!androidFiles.share([page.localPath])) app.toast(qsTr("This file cannot be shared."))
+                onClicked: {
+                    page.handedOver = true
+                    if (!androidFiles.share([page.localPath])) app.toast(qsTr("This file cannot be shared."))
+                }
             }
             ToolButton {
                 text: qsTr("Open")
-                onClicked: if (!androidFiles.open(page.localPath)) app.toast(qsTr("No app on this phone opens this kind of file."))
+                onClicked: {
+                    page.handedOver = true
+                    if (!androidFiles.open(page.localPath)) app.toast(qsTr("No app on this phone opens this kind of file."))
+                }
             }
         }
     }
@@ -53,7 +65,8 @@ Page {
         Rectangle { anchors.fill: parent; color: "black"; z: -1 }
         Image {
             id: image
-            source: page.kind === "image" ? "file://" + page.localPath : ""
+            // as a URL: a name may hold # ? %
+            source: page.kind === "image" ? androidFiles.fileUrl(page.localPath) : ""
             asynchronous: true
             fillMode: Image.PreserveAspectFit
             width: flick.width
@@ -95,6 +108,7 @@ Page {
             readOnly: true
             selectByMouse: true
             wrapMode: TextEdit.Wrap
+            textFormat: TextEdit.PlainText
             font.family: monoFont
             font.pixelSize: 13
             text: page.text

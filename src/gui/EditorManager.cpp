@@ -770,7 +770,7 @@ bool EditorManager::TemporaryDirectoryForRemoteFiles(Terminal * Term, const QStr
         Directory = Result;
         return false;
       }
-      QFile::setPermissions(Result, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+      Platform::MakeDirectoryPrivate(Result);
     }
   }
   Directory = Result;
@@ -1132,8 +1132,8 @@ bool EditorManager::StartExternal(const QString & Command, const QString & FileN
     return false;
   }
   QProcess Process;
-  Process.setProgram(Args.takeFirst());
-  Process.setArguments(Args);
+  QString Program = Args.takeFirst();
+  Platform::SetProgram(Process, Program, Args);
   Process.setStandardInputFile(QProcess::nullDevice());
   Process.setStandardOutputFile(QProcess::nullDevice());
   Process.setStandardErrorFile(QProcess::nullDevice());
@@ -2053,24 +2053,26 @@ QStringList EditorManager::EditorCommandArguments(const QString & Command, const
   {
     return Args;
   }
+  // programs of Windows, explorer.exe for one, read "/" as the start of a switch
+  QString NativeName = QDir::toNativeSeparators(FileName);
   bool Found = false;
   for (int Index = 1; Index < Args.size(); Index++)
   {
     QString & Arg = Args[Index];
     if (Arg.contains(QStringLiteral("!.!")))
     {
-      Arg.replace(QStringLiteral("!.!"), FileName);
+      Arg.replace(QStringLiteral("!.!"), NativeName);
       Found = true;
     }
     else if (Arg.contains(QStringLiteral("%1")))
     {
-      Arg.replace(QStringLiteral("%1"), FileName);
+      Arg.replace(QStringLiteral("%1"), NativeName);
       Found = true;
     }
   }
   if (!Found)
   {
-    Args.append(FileName);
+    Args.append(NativeName);
   }
   Args[0] = SessionData::ExpandEnvironmentVariables(Args[0]);
   return Args;
@@ -2134,6 +2136,7 @@ QString EditorManager::CreateUniqueTemporaryDirectory(const QString & Base, std:
   }
   Dir.setAutoRemove(false);
   QString Path = Dir.path();
+  Platform::MakeDirectoryPrivate(Path);
   if (Lock != nullptr)
   {
     auto File = std::make_unique<QLockFile>(QDir(Path).filePath(LockFileName()));

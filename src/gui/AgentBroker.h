@@ -13,6 +13,9 @@ namespace AgentBroker
 {
   // Starts listening (once per process); Window parents the approval prompts
   void Start(QWidget * Window);
-  // Number of requests running now (tests, diagnostics)
+  // Number of requests running now, tunnels included (tests, diagnostics)
   int ActiveJobs();
+  // Why agents cannot reach this instance, when it is not just that another
+  // NixSCP serves them; empty when all is well
+  QString ListenError();
 }

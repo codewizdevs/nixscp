@@ -663,7 +663,7 @@ struct PreferencesDialog::Private
   QComboBox * AutoWorkspaceCombo;
   // Commander
   QComboBox * NortonLikeModeCombo;
-  QCheckBox * SwappedPanelsCheck, * TreeOnLeftCheck, * UseLocationProfilesCheck;
+  QCheckBox * SwappedPanelsCheck, * UseLocationProfilesCheck;
   QComboBox * ExplorerKeyboardShortcutsCombo;
   QCheckBox * CompareByTimeCheck, * CompareBySizeCheck;
   // Panels
@@ -678,7 +678,7 @@ struct PreferencesDialog::Private
   QCheckBox * ShowInaccesibleDirectoriesCheck, * AutoReadDirectoryAfterOpCheck, * RefreshRemotePanelCheck;
   QSpinBox * RefreshRemotePanelIntervalEdit;
   // Local
-  QCheckBox * PreserveLocalDirectoryCheck, * SystemContextMenuCheck, * DeleteToRecycleBinCheck;
+  QCheckBox * PreserveLocalDirectoryCheck, * DeleteToRecycleBinCheck;
   // File colors (mask, BGR TColor), Configuration\Interface\FileColors
   QList<QPair<QString, int>> FileColors;
   QTreeWidget * FileColorsView;
@@ -911,9 +911,7 @@ PreferencesDialog::PreferencesDialog(QWidget * Parent) :
     Grid->addWidget(Buddy(QStringLiteral("&Explorer-style selection:"), d->NortonLikeModeCombo), 0, 0);
     Grid->addWidget(d->NortonLikeModeCombo, 0, 1);
     d->SwappedPanelsCheck = new QCheckBox(QStringLiteral("S&wap panels (local on right, remote on left)"));
-    d->TreeOnLeftCheck = new QCheckBox(QStringLiteral("Show &directory tree left of file list"));
     Grid->addWidget(d->SwappedPanelsCheck, 1, 0, 1, 2);
-    Grid->addWidget(d->TreeOnLeftCheck, 2, 0, 1, 2);
     L->addWidget(G);
 
     auto * M = new QGroupBox(QStringLiteral("Miscellaneous"));
@@ -1140,10 +1138,8 @@ PreferencesDialog::PreferencesDialog(QWidget * Parent) :
     auto * G = new QGroupBox(QStringLiteral("Local panel"));
     auto * V = new QVBoxLayout(G);
     d->PreserveLocalDirectoryCheck = new QCheckBox(QStringLiteral("Do not &change state when switching sessions"));
-    d->SystemContextMenuCheck = new QCheckBox(QStringLiteral("Use &system file context menu"));
     d->DeleteToRecycleBinCheck = new QCheckBox(QStringLiteral("&Delete files to recycle bin"));
     V->addWidget(d->PreserveLocalDirectoryCheck);
-    V->addWidget(d->SystemContextMenuCheck);
     V->addWidget(d->DeleteToRecycleBinCheck);
     L->addWidget(G);
     L->addStretch();
@@ -1626,15 +1622,6 @@ PreferencesDialog::PreferencesDialog(QWidget * Parent) :
     UrlMenu->addAction(QStringLiteral("Unregister"), this, [this]() { RegisterAsUrlHandler(false); })
       ->setObjectName(QStringLiteral("UnregisterForDefaultProtocolsItem"));
     UrlButton->setMenu(UrlMenu);
-#ifdef Q_OS_MACOS
-    // freedesktop.org desktop entries; the macOS ways (Dock, URL schemes of
-    // the app bundle) are not implemented yet
-    for (QPushButton * B : {DesktopIconButton, UrlButton})
-    {
-      B->setEnabled(false);
-      B->setToolTip(QStringLiteral("Not available on macOS yet"));
-    }
-#endif
     for (QPushButton * B : {DesktopIconButton, UrlButton})
     {
       auto * Row = new QHBoxLayout();
@@ -1645,6 +1632,11 @@ PreferencesDialog::PreferencesDialog(QWidget * Parent) :
     L->addWidget(G);
     L->addStretch();
     connect(DesktopIconButton, &QPushButton::clicked, this, [this]() { CreateDesktopIcon(); });
+#ifdef Q_OS_MACOS
+    // freedesktop.org desktop entries, the Windows registry and links: the macOS
+    // ways (Dock, URL schemes of the app bundle) are not implemented
+    G->hide();
+#endif
     AddPage(QStringLiteral("Integration"), Sheet, false);
   }
 
@@ -2038,7 +2030,6 @@ void PreferencesDialog::LoadConfiguration()
   // Commander
   d->NortonLikeModeCombo->setCurrentIndex((C.NortonLikeMode == nlOff) ? 2 : ((C.NortonLikeMode == nlKeyboard) ? 1 : 0));
   d->SwappedPanelsCheck->setChecked(C.SwappedPanels);
-  d->TreeOnLeftCheck->setChecked(C.TreeOnLeft);
   d->ExplorerKeyboardShortcutsCombo->setCurrentIndex(C.ExplorerKeyboardShortcuts ? 1 : 0);
   d->UseLocationProfilesCheck->setChecked(C.UseLocationProfiles);
   d->CompareByTimeCheck->setChecked(C.CompareByTime);
@@ -2088,7 +2079,6 @@ void PreferencesDialog::LoadConfiguration()
   d->RefreshRemotePanelCheck->setChecked(C.RefreshRemotePanel);
   d->RefreshRemotePanelIntervalEdit->setValue(C.RefreshRemotePanelInterval);
   d->PreserveLocalDirectoryCheck->setChecked(C.PreserveLocalDirectory);
-  d->SystemContextMenuCheck->setChecked(C.SystemContextMenu);
   d->DeleteToRecycleBinCheck->setChecked(C.DeleteToRecycleBin);
 
   // Editors
@@ -2263,7 +2253,6 @@ void PreferencesDialog::SaveConfiguration()
   static const TNortonLikeMode NortonLikeModes[] = { nlOn, nlKeyboard, nlOff };
   C.NortonLikeMode = NortonLikeModes[qBound(0, d->NortonLikeModeCombo->currentIndex(), 2)];
   C.SwappedPanels = d->SwappedPanelsCheck->isChecked();
-  C.TreeOnLeft = d->TreeOnLeftCheck->isChecked();
   C.ExplorerKeyboardShortcuts = (d->ExplorerKeyboardShortcutsCombo->currentIndex() == 1);
   C.UseLocationProfiles = d->UseLocationProfilesCheck->isChecked();
   C.CompareByTime = d->CompareByTimeCheck->isChecked();
@@ -2318,7 +2307,6 @@ void PreferencesDialog::SaveConfiguration()
   C.RefreshRemotePanel = d->RefreshRemotePanelCheck->isChecked();
   C.RefreshRemotePanelInterval = d->RefreshRemotePanelIntervalEdit->value();
   C.PreserveLocalDirectory = d->PreserveLocalDirectoryCheck->isChecked();
-  C.SystemContextMenu = d->SystemContextMenuCheck->isChecked();
   C.DeleteToRecycleBin = d->DeleteToRecycleBinCheck->isChecked();
 
   // Editors

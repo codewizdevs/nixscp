@@ -1,6 +1,8 @@
 // Port of WinSCP source/core/RemoteFiles.cpp (subset)
 #include "core/RemoteFile.h"
 
+#include <QStringList>
+
 QString Rights::ToText(unsigned int Mode)
 {
   // TRights::GetText, including setuid/setgid/sticky representation
@@ -52,6 +54,33 @@ QString RemoteFile::TypeChar() const
   return QStringLiteral("-");
 }
 
+bool LeavesWindowsFolder(const QString & Name)
+{
+  if (Name.startsWith(QLatin1Char('\\')))
+  {
+    return true;   // "\x", "\\server\share"
+  }
+  if ((Name.size() >= 2) && (Name.at(1) == QLatin1Char(':')) && (Name.at(0).unicode() < 0x80) && Name.at(0).isLetter())
+  {
+    return true;   // "C:\x", and "C:x" in the current folder of that drive
+  }
+  const QStringList Parts = Name.split(QLatin1Char('\\'));
+  for (const QString & Part : Parts)
+  {
+    // Windows drops dots and spaces at the end of a name: ".. " is ".."
+    bool Dots = !Part.isEmpty();
+    for (QChar C : Part)
+    {
+      Dots = Dots && ((C == QLatin1Char('.')) || (C == QLatin1Char(' ')));
+    }
+    if (Dots)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
 namespace UnixPath
 {
 
@@ -92,6 +121,11 @@ QString Parent(const QString & Path)
     P.chop(1);
   }
   return IsRoot(P) ? P : ExtractFileDir(P);
+}
+
+bool HasValidFileName(const QString & Path)
+{
+  return IsRoot(Path) || IsValidListingName(ExtractFileName(Path));
 }
 
 bool IsRoot(const QString & Path)

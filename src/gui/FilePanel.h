@@ -54,6 +54,8 @@ public:
   virtual bool IsBusy() const { return false; }
   // Session user name (remote "Show inaccessible directories")
   virtual QString UserName() const { return QString(); }
+  // TTerminal::ResolvingSymlinks: links are shown as what they point to
+  virtual bool ResolvingSymlinks() const { return true; }
 
 private:
   std::shared_ptr<bool> FAlive = std::make_shared<bool>(true);
@@ -97,6 +99,7 @@ public:
   void ResolveHomeDirectory(std::function<void(const QString & Path)> Done) override;
   bool IsBusy() const override;
   QString UserName() const override;
+  bool ResolvingSymlinks() const override;
   bool ShowHiddenFiles = false;
 private:
   QPointer<Terminal> FTerminal;
@@ -113,6 +116,13 @@ public:
   bool IsRemote() const { return FRemote; }
   // nullptr = not connected: panel shows a "Not connected" placeholder with "New Session..." button
   void SetProvider(DirectoryProvider * Provider);
+  // ReconnectToolbar, ReconnectPanel: the placeholder offers Reconnect too and
+  // tells why the session ended
+  void SetDisconnected(bool CanReconnect, const QString & Message = QString());
+  // Identity of the session of the tab, carried by drags of remote files: remote
+  // paths mean something only to the session they were dragged from
+  void SetSessionId(const QString & SessionId);
+  QString SessionId() const;
   DirectoryProvider * Provider() const { return FProvider; }
 
   QString CurrentDirectory() const;
@@ -139,14 +149,21 @@ public:
   void HomeDirectory();
   bool CanBack() const;
   bool CanForward() const;
+  bool IsRoot() const;                          // TCustomDirView::IsRoot
   bool IsLoading() const;
   void CancelLoading();                         // "Reading directory" Cancel / Esc
 
   // Full paths (local: native absolute path; remote: unix path). Marked files,
   // or the focused item when nothing is marked (not with Explorer-style
   // keyboard selection, as GetMarkedFile). Never includes "..".
-  QStringList SelectedPaths() const;
-  QList<RemoteFile> SelectedFiles() const;
+  // OnFocused (TCustomDirView::OperateOnFocusedFile, the *Focused actions of
+  // the file popups): a focused file that is not marked is the only target.
+  QStringList SelectedPaths(bool OnFocused = false) const;
+  QList<RemoteFile> SelectedFiles(bool OnFocused = false) const;
+  // The listed files of full paths of the current directory (e.g. dragged ones)
+  QList<RemoteFile> FilesOfPaths(const QStringList & Paths) const;
+  // All files shown (not hidden or filtered out), without ".."
+  QList<RemoteFile> VisibleFiles() const;
   bool HasFocusedFile() const;                  // false when ".." or nothing is focused
   RemoteFile FocusedFile() const;
   QString FullPath(const QString & FileName) const;
@@ -182,6 +199,13 @@ public:
   QString FilterMask() const;
   void SelectSameExtension(bool Select);
   void StartRename();                           // inline edit of focused name
+  // TCustomScpExplorerForm::IncrementalSearchStart (Ctrl+F)
+  void StartIncrementalSearch();
+  // TCustomDirView::RestoreState(nil): the tab was switched to with "Remember
+  // panels' state when switching sessions" off. Forgets marks, focus and the
+  // history; sorting and filter come from Other, the panel left (the panels
+  // of WinSCP are shared by the sessions).
+  void ResetState(const FilePanel * Other);
   void SetActive(bool Active);                  // highlights the path label of the active panel
   bool IsActive() const { return FActive; }
   QTreeView * View() const;
@@ -248,6 +272,8 @@ signals:
   // PathLabelDblClick and a click of the current directory (Open directory)
   void PathLabelDoubleClicked();
   void NewSessionRequested();
+  void ReconnectRequested();                     // Reconnect of the placeholder
+  void CalculateDirectorySizesRequested();       // the popup of the Size column
   void LoadFailed(const QString & Error, const QString & MoreMessages);
   void SelectionChanged();
   void FilterRequested();                        // "N filtered" status panel or path label mask clicked

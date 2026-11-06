@@ -34,6 +34,7 @@ public:
     QStringList Sources;   // remote paths (download) or local paths (upload)
     QString Target;        // local folder (download) or remote folder (upload)
     bool Publish = false;  // downloaded into the app's folder: to Download/NixSCP through Android
+    QString CacheFolder;   // the copies made for an upload, kept for Retry
     QString Title;
     State St = Waiting;
     double Progress = -1;
@@ -41,7 +42,7 @@ public:
     QString Error;
   };
   enum Roles { IdRole = Qt::UserRole + 1, SiteRole, TitleRole, DirectionRole, StateRole, ProgressRole, DetailRole,
-    ErrorRole, TargetRole };
+    ErrorRole, TargetRole, CanRetryRole };
 
   explicit MobileQueue(QObject * Parent = nullptr) : QAbstractListModel(Parent) {}
 
@@ -50,7 +51,10 @@ public:
   double progress() const;
   QString summary() const;
 
-  int Add(RemoteSession * Owner, Direction Dir, const QStringList & Sources, const QString & Target, bool Publish);
+  int Add(RemoteSession * Owner, Direction Dir, const QStringList & Sources, const QString & Target, bool Publish,
+    const QString & CacheFolder = QString());
+  // an item of the session waits or runs
+  bool HasActive(const RemoteSession * Owner) const;
   // the session's first waiting item (null: none)
   const Item * Next(RemoteSession * Owner) const;
   const Item * Find(int Id) const;
@@ -73,6 +77,8 @@ signals:
   void added(RemoteSession * owner);
   // cancel of a running item (its session stops the transfer)
   void cancelRequested(int id);
+  // an upload into this folder ended, in any way: its listing changed
+  void uploadEnded(const QString & directory);
   // results, as RemoteSession's
   void downloaded(const QStringList & paths);
   void copied(const QString & targetDir, int count);
@@ -84,4 +90,5 @@ private:
   int FNextId = 1;
 
   int RowOf(int Id) const;
+  void RemoveCopies(Item & I);
 };

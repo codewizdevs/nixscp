@@ -1,7 +1,9 @@
 #include "gui/CloudSyncUi.h"
+#include "core/Platform.h"
 #include "gui/UnlockDialog.h"
 
 #include "core/TeamSync.h"
+#include "core/CloudCrypto.h"
 #include "core/ConfigVault.h"
 #include "core/AgentAccess.h"
 #include "core/CloudSync.h"
@@ -58,7 +60,6 @@ static constexpr int LicenseCheckIntervalMs = 24 * 60 * 60 * 1000;
 static constexpr int FocusCheckSeconds = 60;
 static constexpr int FlushTimeoutMs = 4000;
 static constexpr int RestoreTimeoutMs = 5000;
-static constexpr int MinSyncPasswordLength = 8;
 
 //---------------------------------------------------------------------------
 // Session payload
@@ -278,6 +279,32 @@ private:
 class CloudSyncDialog : public QDialog
 {
 public:
+  static void ShowRecoveryKey(QWidget * Parent, const QString & Key)
+  {
+    QDialog Dialog(Parent);
+    Dialog.setWindowTitle(QStringLiteral("Your recovery key"));
+    auto * Layout = new QVBoxLayout(&Dialog);
+    Layout->addWidget(Text(QStringLiteral(
+      "<p>If you forget your sync password, this key is the only way to decrypt your synced data. "
+      "Print it or store it in your password manager now; it is not shown again.</p>"), &Dialog));
+    auto * Edit = new QPlainTextEdit(Key, &Dialog);
+    Edit->setReadOnly(true);
+    QFont Mono(QStringLiteral("monospace"));
+    Mono.setStyleHint(QFont::Monospace);
+    Edit->setFont(Mono);
+    Edit->setFixedHeight(Edit->fontMetrics().height() * 4);
+    Layout->addWidget(Edit);
+    auto * Buttons = new QDialogButtonBox(&Dialog);
+    Buttons->addButton(QStringLiteral("I have saved it"), QDialogButtonBox::AcceptRole);
+    connect(Buttons, &QDialogButtonBox::accepted, &Dialog, &QDialog::accept);
+    Layout->addWidget(Buttons);
+    // Until this is confirmed it comes back at the next start
+    if (Dialog.exec() == QDialog::Accepted)
+    {
+      CloudSync::Instance().RecoveryKeySaved();
+    }
+  }
+
   explicit CloudSyncDialog(QWidget * Parent) : QDialog(Parent)
   {
     setWindowTitle(QStringLiteral("Cloud Sync"));
@@ -306,13 +333,17 @@ private:
   QLineEdit * FPassword;
   QLineEdit * FPasswordConfirm;
   QLabel * FConfirmLabel;
+  QLabel * FStrength;
+  QToolButton * FSuggest;
   QCheckBox * FRecoveryCheck;
   QPushButton * FKeyButton;
   QToolButton * FUseRecoveryKey;
   QLabel * FKeyError;
   bool FCloudHasData = false;
+  bool FCloudOldFormat = false;       // made by NixSCP 1.2.3 or older: it can only be replaced
   bool FProbed = false;
   bool FRecoveryMode = false;
+  bool FShowPassphrase = false;
   // Ready
   QLabel * FAccount;
   QLabel * FLicense;
@@ -357,22 +388,7 @@ private:
     RemoveRow->addStretch();
     Layout->addLayout(RemoveRow);
     Layout->addStretch();
-    connect(FRemoveEncryption, &QPushButton::clicked, this, [this]()
-    {
-      if (QMessageBox::question(this, QStringLiteral("Remove encryption"),
-            QStringLiteral("Store the configuration on this computer unencrypted?\n\nNixSCP will no longer ask for your NixSCP "
-              "password at startup, and saved site passwords are then only obfuscated, as in WinSCP. Signing in to NixSCP Pro "
-              "encrypts it again.")) != QMessageBox::Yes)
-      {
-        return;
-      }
-      ConfigVault::Disable();
-      if (!Configuration::Instance().Rewrite())
-      {
-        QMessageBox::warning(this, QStringLiteral("Remove encryption"), Configuration::Instance().LastSaveError());
-      }
-      Update();
-    });
+    connect(FRemoveEncryption, &QPushButton::clicked, this, [this]() { DoRemoveEncryption(); });
     connect(FSignInButton, &QPushButton::clicked, this, [this]() { SignIn(); });
     connect(Create, &QPushButton::clicked, this, []()
     {
@@ -397,6 +413,28 @@ private:
     Form->addRow(QStringLiteral("Sync password:"), FPassword);
     Form->addRow(FConfirmLabel, FPasswordConfirm);
     Layout->addLayout(Form);
+    auto * StrengthRow = new QHBoxLayout();
+    FStrength = Text(QString(), Page);
+    FSuggest = new QToolButton(Page);
+    FSuggest->setAutoRaise(true);
+    FSuggest->setText(QStringLiteral("Generate a passphrase"));
+    StrengthRow->addWidget(FStrength);
+    StrengthRow->addStretch();
+    StrengthRow->addWidget(FSuggest);
+    Layout->addLayout(StrengthRow);
+    connect(FPassword, &QLineEdit::textChanged, this, [this](const QString & Password)
+    {
+      FStrength->setText(FStrength->isVisible() ? StrengthText(Password) : QString());
+    });
+    connect(FSuggest, &QToolButton::clicked, this, [this]()
+    {
+      QString Passphrase = CloudCrypto::NewPassphrase();
+      FShowPassphrase = true;
+      FPassword->setEchoMode(QLineEdit::Normal);
+      FPassword->setText(Passphrase);
+      FPasswordConfirm->setText(Passphrase);
+      FKeyError->setText(QStringLiteral("Save this passphrase in your password manager before you continue."));
+    });
     FRecoveryCheck = new QCheckBox(QStringLiteral("Create a recovery key (recommended)"), Page);
     FRecoveryCheck->setChecked(true);
     Layout->addWidget(FRecoveryCheck);
@@ -461,10 +499,12 @@ private:
     auto * Row = new QHBoxLayout();
     auto * SyncNow = new QPushButton(QStringLiteral("Sync now"), Page);
     auto * ChangePassword = new QPushButton(QStringLiteral("Change NixSCP password..."), Page);
+    auto * NewRecovery = new QPushButton(QStringLiteral("New recovery key..."), Page);
     auto * Manage = new QPushButton(QStringLiteral("Manage account"), Page);
     auto * SignOut = new QPushButton(QStringLiteral("Sign out"), Page);
     Row->addWidget(SyncNow);
     Row->addWidget(ChangePassword);
+    Row->addWidget(NewRecovery);
     Row->addWidget(Manage);
     Row->addStretch();
     Row->addWidget(SignOut);
@@ -475,6 +515,7 @@ private:
     connect(FRestoreSessions, &QCheckBox::toggled, this, [&Sync](bool On) { Sync.SetRestoreSessions(On); });
     connect(SyncNow, &QPushButton::clicked, this, [&Sync]() { Sync.SyncNow(); });
     connect(ChangePassword, &QPushButton::clicked, this, [this]() { DoChangePassword(); });
+    connect(NewRecovery, &QPushButton::clicked, this, [this]() { DoNewRecoveryKey(); });
     connect(Manage, &QPushButton::clicked, this, [&Sync]()
     {
       QDesktopServices::openUrl(QUrl(Sync.Client().BaseUrl() + QStringLiteral("/account")));
@@ -511,15 +552,17 @@ private:
       {
         FProbed = false;
         FRecoveryMode = false;
+        FShowPassphrase = false;
         FPassword->clear();
         FPasswordConfirm->clear();
         FKeyError->clear();
-        Sync.ProbeCloud([Guard = QPointer<CloudSyncDialog>(this)](bool Ok, bool HasData, const QString & Error)
+        Sync.ProbeCloud([Guard = QPointer<CloudSyncDialog>(this)](bool Ok, bool HasData, bool OldFormat, const QString & Error)
         {
           if (Guard)
           {
             Guard->FProbed = Ok;
             Guard->FCloudHasData = HasData;
+            Guard->FCloudOldFormat = OldFormat;
             Guard->FKeyError->setText(Ok ? QString() : Error);
             Guard->UpdateKeyPage();
           }
@@ -589,10 +632,18 @@ private:
 
   void UpdateKeyPage()
   {
-    bool Create = FProbed && !FCloudHasData;
+    bool Create = FProbed && (!FCloudHasData || FCloudOldFormat);
     if (!FProbed)
     {
       FKeyIntro->setText(QStringLiteral("<h3>Sync password</h3><p>Checking the cloud...</p>"));
+    }
+    else if (FCloudOldFormat)
+    {
+      FKeyIntro->setText(QStringLiteral(
+        "<h3>Your cloud data is from an older NixSCP</h3>"
+        "<p>It was encrypted by NixSCP 1.2.3 or older. This version cannot read that format, so no password opens it here.</p>"
+        "<p>You can start over: choose a new sync password, and this computer's settings replace the cloud data. "
+        "Nothing is replaced until you confirm. Your other computers then need the new password.</p>"));
     }
     else if (Create)
     {
@@ -600,7 +651,9 @@ private:
         "<h3>Choose a sync password</h3>"
         "<p>Your data is encrypted with it on this computer before upload. Use the same password on your other computers.</p>"
         "<p><b>It never leaves your computers: nobody, not even NixSCP support, can reset it.</b> "
-        "Without it (or the recovery key) your synced data cannot be decrypted.</p>"));
+        "Without it (or the recovery key) your synced data cannot be decrypted.</p>"
+        "<p>Whoever holds your encrypted data, the server included, can try guesses at it offline, so make it long and "
+        "unique. <b>Do not reuse your account password:</b> the website sees that one when you sign in.</p>"));
     }
     else
     {
@@ -609,14 +662,16 @@ private:
         : QStringLiteral("<h3>Enter your sync password</h3><p>The password you chose on your first computer.</p>"));
     }
     FPassword->setEnabled(FProbed);
-    FPassword->setEchoMode(FRecoveryMode ? QLineEdit::Normal : QLineEdit::Password);
+    FPassword->setEchoMode((FRecoveryMode || FShowPassphrase) ? QLineEdit::Normal : QLineEdit::Password);
     FPassword->setPlaceholderText(FRecoveryMode ? QStringLiteral("XXXX-XXXX-...") : QString());
     FConfirmLabel->setVisible(Create);
     FPasswordConfirm->setVisible(Create);
+    FStrength->setVisible(Create);
+    FSuggest->setVisible(Create);
     FRecoveryCheck->setVisible(Create);
     FUseRecoveryKey->setVisible(FProbed && !Create);
     FUseRecoveryKey->setText(FRecoveryMode ? QStringLiteral("Use the sync password") : QStringLiteral("I forgot it: use the recovery key"));
-    FKeyButton->setText(Create ? QStringLiteral("Start syncing") : QStringLiteral("Unlock"));
+    FKeyButton->setText(FCloudOldFormat ? QStringLiteral("Replace the cloud data...") : (Create ? QStringLiteral("Start syncing") : QStringLiteral("Unlock")));
     FKeyButton->setEnabled(FProbed);
   }
 
@@ -639,11 +694,12 @@ private:
     }
     CloudSync & Sync = CloudSync::Instance();
     QPointer<CloudSyncDialog> Guard(this);
-    if (!FCloudHasData)
+    if (!FCloudHasData || FCloudOldFormat)
     {
-      if (FPassword->text().size() < MinSyncPasswordLength)
+      QString Problem = CloudCrypto::PasswordProblem(FPassword->text(), Sync.Email());
+      if (!Problem.isEmpty())
       {
-        FKeyError->setText(QStringLiteral("Use at least %1 characters.").arg(MinSyncPasswordLength));
+        FKeyError->setText(Problem.toHtmlEscaped());
         return;
       }
       if (FPassword->text() != FPasswordConfirm->text())
@@ -651,8 +707,16 @@ private:
         FKeyError->setText(QStringLiteral("The passwords do not match."));
         return;
       }
+      // What only the user decides: the server's word that the data is old is
+      // no reason to replace it
+      if (FCloudOldFormat && (QMessageBox::warning(this, QStringLiteral("Replace the cloud data"),
+          QStringLiteral("Replace the data in the NixSCP cloud with this computer's settings? The old data was made by NixSCP 1.2.3 "
+            "or older and will not be used again."), QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes))
+      {
+        return;
+      }
       SetBusy(true);
-      Sync.CreateKey(FPassword->text(), FRecoveryCheck->isChecked(), [Guard](bool Ok, const QString & Result)
+      auto Finished = [Guard](bool Ok, const QString & Result)
       {
         if (!Guard)
         {
@@ -668,11 +732,20 @@ private:
         {
           ShowRecoveryKey(Guard, Result);
         }
-      });
+      };
+      if (FCloudOldFormat)
+      {
+        Sync.ReplaceOldCloud(FPassword->text(), FRecoveryCheck->isChecked(), Finished);
+      }
+      else
+      {
+        Sync.CreateKey(FPassword->text(), FRecoveryCheck->isChecked(), Finished);
+      }
       return;
     }
     SetBusy(true);
-    Sync.UnlockKey(FPassword->text(), FRecoveryMode, [Guard](bool Ok, const QString & Error)
+    QString Secret = FPassword->text();
+    Sync.UnlockKey(Secret, FRecoveryMode, [Guard, Secret](bool Ok, const QString & Error)
     {
       if (!Guard)
       {
@@ -687,48 +760,47 @@ private:
       if (Guard->FRecoveryMode)
       {
         // The old password is forgotten: choose a new one right away
-        Guard->DoChangePassword();
+        Guard->DoChangePassword(Secret, true);
       }
     });
   }
 
-  static void ShowRecoveryKey(QWidget * Parent, const QString & Key)
+  static QString StrengthText(const QString & Password)
   {
-    QDialog Dialog(Parent);
-    Dialog.setWindowTitle(QStringLiteral("Your recovery key"));
-    auto * Layout = new QVBoxLayout(&Dialog);
-    Layout->addWidget(Text(QStringLiteral(
-      "<p>If you forget your sync password, this key is the only way to decrypt your synced data. "
-      "Print it or store it in your password manager now; it is not shown again.</p>"), &Dialog));
-    auto * Edit = new QPlainTextEdit(Key, &Dialog);
-    Edit->setReadOnly(true);
-    QFont Mono(QStringLiteral("monospace"));
-    Mono.setStyleHint(QFont::Monospace);
-    Edit->setFont(Mono);
-    Edit->setFixedHeight(Edit->fontMetrics().height() * 4);
-    Layout->addWidget(Edit);
-    auto * Buttons = new QDialogButtonBox(&Dialog);
-    Buttons->addButton(QStringLiteral("I have saved it"), QDialogButtonBox::AcceptRole);
-    connect(Buttons, &QDialogButtonBox::accepted, &Dialog, &QDialog::accept);
-    Layout->addWidget(Buttons);
-    Dialog.exec();
+    static const char * const Names[] = {"too weak", "acceptable", "good", "strong"};
+    return Password.isEmpty() ? QString() :
+      QStringLiteral("Strength: %1").arg(QString::fromLatin1(Names[CloudCrypto::PasswordScore(Password)]));
   }
 
-  void DoChangePassword()
+  // The current password or recovery key: an unlocked session alone allows no
+  // sensitive change. Rows of a form; IsRecoveryKey tells which was typed.
+  static QLineEdit * AddCurrentSecret(QFormLayout * Form, QWidget * Parent, QCheckBox *& IsRecoveryKey)
+  {
+    auto * Edit = new QLineEdit(Parent);
+    Edit->setEchoMode(QLineEdit::Password);
+    IsRecoveryKey = new QCheckBox(QStringLiteral("This is my recovery key"), Parent);
+    Form->addRow(QStringLiteral("Current NixSCP password:"), Edit);
+    Form->addRow(QString(), IsRecoveryKey);
+    return Edit;
+  }
+
+  void ShowRecoveryKeyLater(const QString & Key)
+  {
+    // Queued: a dialog must not run inside the network callback
+    QTimer::singleShot(0, this, [this, Key]() { ShowRecoveryKey(this, Key); });
+  }
+
+  void DoRemoveEncryption()
   {
     QDialog Dialog(this);
-    Dialog.setWindowTitle(QStringLiteral("Change sync password"));
+    Dialog.setWindowTitle(QStringLiteral("Remove encryption"));
     auto * Layout = new QVBoxLayout(&Dialog);
     Layout->addWidget(Text(QStringLiteral(
-      "<p>The new password applies on all your computers; the ones already syncing keep working. "
-      "Your recovery key stays valid.</p>"), &Dialog));
+      "<p>Store the configuration on this computer unencrypted? NixSCP will no longer ask for your NixSCP password at "
+      "startup, and saved site passwords are then only obfuscated, as in WinSCP. Signing in to NixSCP Pro encrypts it again.</p>"), &Dialog));
     auto * Form = new QFormLayout();
-    auto * New = new QLineEdit(&Dialog);
-    New->setEchoMode(QLineEdit::Password);
-    auto * Repeat = new QLineEdit(&Dialog);
-    Repeat->setEchoMode(QLineEdit::Password);
-    Form->addRow(QStringLiteral("New sync password:"), New);
-    Form->addRow(QStringLiteral("Repeat:"), Repeat);
+    QCheckBox * IsRecoveryKey = nullptr;
+    QLineEdit * Current = AddCurrentSecret(Form, &Dialog, IsRecoveryKey);
     Layout->addLayout(Form);
     auto * Error = Text(QString(), &Dialog);
     Error->setStyleSheet(QStringLiteral("color: #cf222e"));
@@ -738,9 +810,73 @@ private:
     connect(Buttons, &QDialogButtonBox::rejected, &Dialog, &QDialog::reject);
     connect(Buttons, &QDialogButtonBox::accepted, &Dialog, [&]()
     {
-      if (New->text().size() < MinSyncPasswordLength)
+      QString Problem;
+      if (ConfigVault::CheckSecret(Current->text(), IsRecoveryKey->isChecked(), &Problem))
       {
-        Error->setText(QStringLiteral("Use at least %1 characters.").arg(MinSyncPasswordLength));
+        Dialog.accept();
+      }
+      else
+      {
+        Error->setText(Problem.toHtmlEscaped());
+      }
+    });
+    if (Dialog.exec() == QDialog::Accepted)
+    {
+      QString Problem;
+      if (!CloudSync::Instance().RemoveEncryption(&Problem))
+      {
+        QMessageBox::warning(this, QStringLiteral("Remove encryption"), Problem);
+      }
+      Update();
+    }
+  }
+
+  // Known: the secret just entered to unlock this computer
+  void DoChangePassword(const QString & Known = QString(), bool KnownIsRecoveryKey = false)
+  {
+    QDialog Dialog(this);
+    Dialog.setWindowTitle(QStringLiteral("Change sync password"));
+    auto * Layout = new QVBoxLayout(&Dialog);
+    Layout->addWidget(Text(QStringLiteral(
+      "<p>The new password applies on all your computers; the ones already syncing keep working. "
+      "Your recovery key stays valid.</p>"
+      "<p>This does not lock out someone who learned the old password: it still opens the data key from any old copy of "
+      "your encrypted data. If that may have happened, replace the data key as well.</p>"), &Dialog));
+    auto * Form = new QFormLayout();
+    QCheckBox * IsRecoveryKey = nullptr;
+    QLineEdit * Current = nullptr;
+    if (Known.isEmpty())
+    {
+      Current = AddCurrentSecret(Form, &Dialog, IsRecoveryKey);
+    }
+    auto * New = new QLineEdit(&Dialog);
+    New->setEchoMode(QLineEdit::Password);
+    auto * Repeat = new QLineEdit(&Dialog);
+    Repeat->setEchoMode(QLineEdit::Password);
+    Form->addRow(QStringLiteral("New sync password:"), New);
+    Form->addRow(QStringLiteral("Repeat:"), Repeat);
+    Layout->addLayout(Form);
+    auto * Strength = Text(QString(), &Dialog);
+    Layout->addWidget(Strength);
+    connect(New, &QLineEdit::textChanged, &Dialog, [Strength](const QString & Password) { Strength->setText(StrengthText(Password)); });
+    auto * Rotate = new QCheckBox(QStringLiteral("Also replace the data key and the recovery key (if a password or recovery key may have leaked)"), &Dialog);
+    Layout->addWidget(Rotate);
+    Layout->addWidget(Text(QStringLiteral(
+      "<p>With a new data key everything is encrypted again, your other computers ask for the new password once, "
+      "and you get a new recovery key. Older versions kept in the cloud stay readable with the old key.</p>"), &Dialog));
+    auto * Error = Text(QString(), &Dialog);
+    Error->setStyleSheet(QStringLiteral("color: #cf222e"));
+    Layout->addWidget(Error);
+    auto * Buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &Dialog);
+    Layout->addWidget(Buttons);
+    auto Open = std::make_shared<bool>(true);
+    connect(Buttons, &QDialogButtonBox::rejected, &Dialog, &QDialog::reject);
+    connect(Buttons, &QDialogButtonBox::accepted, &Dialog, [&, Open]()
+    {
+      QString Problem = CloudCrypto::PasswordProblem(New->text(), CloudSync::Instance().Email());
+      if (!Problem.isEmpty())
+      {
+        Error->setText(Problem.toHtmlEscaped());
       }
       else if (New->text() != Repeat->text())
       {
@@ -748,8 +884,20 @@ private:
       }
       else
       {
-        CloudSync::Instance().ChangePassword(New->text(), [&](bool Ok, const QString & Message)
+        CloudSync::KeyChange Change;
+        Change.Current = (Current != nullptr) ? Current->text() : Known;
+        Change.CurrentIsRecoveryKey = (Current != nullptr) ? IsRecoveryKey->isChecked() : KnownIsRecoveryKey;
+        Change.NewPassword = New->text();
+        Change.RotateDataKey = Rotate->isChecked();
+        Buttons->setEnabled(false);
+        Error->setText(QStringLiteral("<i>Working...</i>"));
+        RunKeyChange(Change, [&, Open](bool Ok, const QString & Message)
         {
+          if (!*Open)
+          {
+            return;
+          }
+          Buttons->setEnabled(true);
           if (Ok)
           {
             Dialog.accept();
@@ -762,6 +910,75 @@ private:
       }
     });
     Dialog.exec();
+    *Open = false;
+  }
+
+  void DoNewRecoveryKey()
+  {
+    QDialog Dialog(this);
+    Dialog.setWindowTitle(QStringLiteral("New recovery key"));
+    auto * Layout = new QVBoxLayout(&Dialog);
+    Layout->addWidget(Text(QStringLiteral(
+      "<p>Creates a new recovery key, shown once, in place of the old one (or the first one, if you have none).</p>"
+      "<p>If the old key may have leaked, keep the data key replaced: a new recovery key alone leaves the old one able "
+      "to open the data key from any old copy of your encrypted data.</p>"), &Dialog));
+    auto * Form = new QFormLayout();
+    QCheckBox * IsRecoveryKey = nullptr;
+    QLineEdit * Current = AddCurrentSecret(Form, &Dialog, IsRecoveryKey);
+    Layout->addLayout(Form);
+    auto * Rotate = new QCheckBox(QStringLiteral("Also replace the data key"), &Dialog);
+    Rotate->setChecked(true);
+    Layout->addWidget(Rotate);
+    auto * Error = Text(QString(), &Dialog);
+    Error->setStyleSheet(QStringLiteral("color: #cf222e"));
+    Layout->addWidget(Error);
+    auto * Buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &Dialog);
+    Layout->addWidget(Buttons);
+    auto Open = std::make_shared<bool>(true);
+    connect(Buttons, &QDialogButtonBox::rejected, &Dialog, &QDialog::reject);
+    connect(Buttons, &QDialogButtonBox::accepted, &Dialog, [&, Open]()
+    {
+      CloudSync::KeyChange Change;
+      Change.Current = Current->text();
+      Change.CurrentIsRecoveryKey = IsRecoveryKey->isChecked();
+      Change.NewRecoveryKey = true;
+      Change.RotateDataKey = Rotate->isChecked();
+      Buttons->setEnabled(false);
+      Error->setText(QStringLiteral("<i>Working...</i>"));
+      RunKeyChange(Change, [&, Open](bool Ok, const QString & Message)
+      {
+        if (!*Open)
+        {
+          return;
+        }
+        Buttons->setEnabled(true);
+        if (Ok)
+        {
+          Dialog.accept();
+        }
+        else
+        {
+          Error->setText(Message.toHtmlEscaped());
+        }
+      });
+    });
+    Dialog.exec();
+    *Open = false;
+  }
+
+  // Finished gets the error, if any. A new recovery key is shown even when the
+  // dialog was closed meanwhile: it is the only time it can be seen.
+  void RunKeyChange(const CloudSync::KeyChange & Change, const std::function<void(bool, const QString &)> & Finished)
+  {
+    QPointer<CloudSyncDialog> Guard(this);
+    CloudSync::Instance().ChangeKey(Change, [Guard, Finished](bool Ok, const QString & Result)
+    {
+      if (Ok && !Result.isEmpty() && Guard)
+      {
+        Guard->ShowRecoveryKeyLater(Result);
+      }
+      Finished(Ok, Result);
+    });
   }
 
   void SignIn()
@@ -898,7 +1115,12 @@ bool ExportConfiguration(QWidget * Parent, const QString & FileName, QString * E
     if (Box.clickedButton() == Encrypted)
     {
       QSaveFile File(FileName);
-      if (!File.open(QIODevice::WriteOnly) || (File.write(ConfigVault::SealExport(Out.SaveToData())) < 0) || !File.commit())
+      bool Opened = File.open(QIODevice::WriteOnly);
+      if (Opened)
+      {
+        Platform::MakePrivate(File);
+      }
+      if (!Opened || (File.write(ConfigVault::SealExport(Out.SaveToData())) < 0) || !File.commit())
       {
         if (Error != nullptr)
         {
@@ -906,7 +1128,6 @@ bool ExportConfiguration(QWidget * Parent, const QString & FileName, QString * E
         }
         return false;
       }
-      QFile::setPermissions(FileName, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
       return true;
     }
     if (Box.clickedButton() != Plain)
@@ -1040,6 +1261,8 @@ public:
         return;
       }
       auto * Box = new QMessageBox(QMessageBox::Information, QStringLiteral("NixSCP Teams"), Message, QMessageBox::Ok, FWindow);
+      // Names in it come from other people
+      Box->setTextFormat(Qt::PlainText);
       Box->setAttribute(Qt::WA_DeleteOnClose);
       Box->setWindowModality(Qt::NonModal);
       Box->show();
@@ -1098,6 +1321,12 @@ public:
       // Queued: the prompt must not run inside the network callback
       QTimer::singleShot(0, this, [this, Device, Time]() { AskConflict(Device, Time); });
     });
+    connect(&Sync, &CloudSync::KeyChangeSettled, this, [this](bool, const QString & Message)
+    {
+      QTimer::singleShot(0, this, [this, Message]() { NotifyKeyChange(Message); });
+    });
+    // A crash may have come between a new recovery key and showing it
+    QTimer::singleShot(0, this, [this]() { ShowWaitingRecoveryKey(); });
     UpdateIndicator();
   }
 
@@ -1163,6 +1392,24 @@ private:
   void OpenAccount()
   {
     QDesktopServices::openUrl(QUrl(CloudSync::Instance().Client().BaseUrl() + QStringLiteral("/account")));
+  }
+
+  void ShowWaitingRecoveryKey()
+  {
+    QString Key = CloudSync::Instance().PendingRecoveryKey();
+    if (!FClosing && !Key.isEmpty())
+    {
+      CloudSyncDialog::ShowRecoveryKey(FWindow, Key);
+    }
+  }
+
+  void NotifyKeyChange(const QString & Message)
+  {
+    if (!FClosing)
+    {
+      QMessageBox::information(FWindow, QStringLiteral("Cloud Sync"), Message);
+      ShowWaitingRecoveryKey();
+    }
   }
 
   void NotifySignedOut(const QString & Message)
@@ -1232,8 +1479,8 @@ private:
         .arg(Device.isEmpty() ? QStringLiteral("an unknown computer") : Device),
       QMessageBox::NoButton, FWindow);
     Box.setInformativeText(QStringLiteral("Your settings are safe: that computer cannot read them, and valid settings were uploaded again. "
-      "If you do not recognize it, remove it from the Computers list of your account and change your account password "
-      "with \"Also sign out all computers\"."));
+      "If you do not recognize it, remove it from the Computers list of your account and change your account password, "
+      "which signs out all your devices."));
     QPushButton * Manage = Box.addButton(QStringLiteral("Manage Account..."), QMessageBox::AcceptRole);
     Box.addButton(QStringLiteral("Close"), QMessageBox::RejectRole);
     Box.exec();

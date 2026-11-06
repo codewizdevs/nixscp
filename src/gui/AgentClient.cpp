@@ -2,6 +2,7 @@
 #include "gui/AgentMcp.h"
 
 #include "core/AgentAccess.h"
+#include "core/CopyParam.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -13,6 +14,8 @@
 #include <QLocalSocket>
 #include <QTimer>
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <thread>
@@ -33,7 +36,6 @@ using namespace AgentAccess;
 namespace
 {
 
-constexpr qint64 UploadWindow = 4 * 1024 * 1024;
 constexpr int ChunkSize = 64 * 1024;
 
 #ifndef Q_OS_WIN
@@ -120,13 +122,9 @@ public:
     {
       return Usage(QStringLiteral("NixSCP is not running. The user needs to start NixSCP (and unlock it with the NixSCP password) to use agent access."));
     }
-    if (FOp == QStringLiteral("get"))
+    if (!PeerIsSameUser(FSocket.socketDescriptor()))
     {
-      FOutput.reset(new QFile(FLocalFile));
-      if (!FOutput->open(QIODevice::WriteOnly | QIODevice::Truncate))
-      {
-        return Usage(QStringLiteral("Cannot write \"%1\".").arg(FLocalFile));
-      }
+      return Usage(QStringLiteral("Refusing the agent socket \"%1\": it belongs to another user.").arg(SocketName()));
     }
     if (FOp == QStringLiteral("put"))
     {
@@ -182,10 +180,14 @@ private:
   QLocalSocket FSocket;
   FrameReader FReader;
   int FResult = -1;
-  std::unique_ptr<QFile> FOutput;
+  // a download goes here, and replaces the local file only when it is complete
+  std::unique_ptr<DownloadFile> FOutput;
+  bool FDownloaded = false;
   std::unique_ptr<QFile> FInput;
   qint64 FSent = 0;
-  qint64 FAcked = 0;
+  // stdin (exec, shell) is sent from the main thread, read by another one
+  std::atomic<qint64> FStdinRead{0};
+  std::atomic<qint64> FAcked{0};
   bool FUploading = false;
 
   void Finish(int Code)
@@ -195,6 +197,8 @@ private:
       return;
     }
     FResult = Code;
+    // the process ends with _Exit: an unfinished download must clean up now
+    FOutput.reset();
 #ifndef Q_OS_WIN
     RestoreTerminal();
 #endif
@@ -210,11 +214,18 @@ private:
       char Buffer[ChunkSize];
       for (;;)
       {
+        // no further ahead of the server than the flow control allows: a
+        // program that reads slowly (or never) stops the reading here
+        while (FStdinRead - FAcked >= InputWindow)
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
 #ifdef Q_OS_WIN
         int N = _read(_fileno(stdin), Buffer, sizeof(Buffer));
 #else
         ssize_t N = read(STDIN_FILENO, Buffer, sizeof(Buffer));
 #endif
+        FStdinRead += qMax<qint64>(N, 0);
         QByteArray Data = (N > 0) ? QByteArray(Buffer, static_cast<int>(N)) : QByteArray();
         QMetaObject::invokeMethod(this, [this, Data]()
         {
@@ -233,7 +244,7 @@ private:
 
   void SendUpload()
   {
-    while (FUploading && (FSent - FAcked < UploadWindow))
+    while (FUploading && (FSent - FAcked < InputWindow))
     {
       QByteArray Chunk = FInput->read(ChunkSize);
       if (Chunk.isEmpty())
@@ -264,20 +275,27 @@ private:
           WriteOut(stderr, Payload);
           break;
         case frData:
-          if (FOutput && (FOutput->write(Payload) != Payload.size()))
+          if (FOutput && !FOutput->Write(Payload))
           {
-            Finish(Usage(QStringLiteral("Cannot write \"%1\".").arg(FLocalFile)));
+            Finish(Usage(QStringLiteral("Cannot write \"%1\": %2").arg(FLocalFile, FOutput->ErrorString())));
             return;
           }
           break;
         case frDataEnd:
-          if (FOutput)
-          {
-            FOutput->close();
-          }
+          FDownloaded = true;
           break;
         case frInfo:
-          if (FOp == QStringLiteral("put"))
+          if (FOp == QStringLiteral("get"))
+          {
+            // the request was accepted and the file exists: not before that
+            FOutput.reset(new DownloadFile(FLocalFile));
+            if (!FOutput->Open())
+            {
+              Finish(Usage(QStringLiteral("Cannot write \"%1\": %2").arg(FLocalFile, FOutput->ErrorString())));
+              return;
+            }
+          }
+          else if (FOp == QStringLiteral("put"))
           {
             FUploading = true;
             SendUpload();
@@ -298,14 +316,20 @@ private:
           PrintList(Payload);
           break;
         case frExit:
-          Finish(QJsonDocument::fromJson(Payload).object().value(QStringLiteral("code")).toInt(0));
-          return;
-        case frError:
-          if (FOutput && (FOutput->isOpen() || FOutput->exists()))
+        {
+          int Code = QJsonDocument::fromJson(Payload).object().value(QStringLiteral("code")).toInt(0);
+          if ((FOp == QStringLiteral("get")) && (Code == 0) && (!FOutput || !FDownloaded || !FOutput->Commit()))
           {
-            FOutput->close();
-            FOutput->remove();
+            Finish(Usage(QStringLiteral("Cannot write \"%1\"%2").arg(FLocalFile,
+              FOutput ? QStringLiteral(": ") + FOutput->ErrorString() : QStringLiteral("."))));
+            return;
           }
+          Finish(Code);
+          return;
+        }
+        case frError:
+          // whatever came so far is dropped, the local file stays as it was
+          FOutput.reset();
           Finish(Usage(QString::fromUtf8(Payload)));
           return;
         default:
@@ -514,10 +538,11 @@ int Run(int argc, char * argv[], const QStringList & Arguments)
     {
       return Usage(QStringLiteral("Give a remote file, not a folder."));
     }
-    LocalFile = (Positional.size() > 2) ? Positional.at(2) : RemoteName;
+    QString LocalName = CopyParam::ValidLocalFileName(RemoteName);
+    LocalFile = (Positional.size() > 2) ? Positional.at(2) : LocalName;
     if (QFileInfo(LocalFile).isDir())
     {
-      LocalFile = QDir(LocalFile).filePath(RemoteName);
+      LocalFile = QDir(LocalFile).filePath(LocalName);
     }
     Request.insert(QStringLiteral("op"), QStringLiteral("get"));
     Request.insert(QStringLiteral("site"), Positional.at(0));

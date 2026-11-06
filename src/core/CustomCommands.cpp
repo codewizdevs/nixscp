@@ -21,7 +21,6 @@ static const QString CustomCommandsNoneValue = QStringLiteral("CustomCommandsNon
 
 // TEXT_TOKEN (WinSCP uses L'\255'; a noncharacter cannot clash with real text)
 static const QChar TextToken(0xFFFF);
-static const QString Quotes = QStringLiteral("\"'");
 
 //---------------------------------------------------------------------------
 // TCustomCommandType / TCustomCommandList
@@ -313,7 +312,7 @@ static QString EncodeUrlString(const QString & S)
   return Result;
 }
 
-QString CustomCommandData::GenerateSessionUrl(const SessionData & Data, const QString & Password)
+QString CustomCommandData::GenerateSessionUrl(const SessionData & Data, const QString & Password, bool Complete)
 {
   // TSessionData::GetProtocolUrl
   QString Url;
@@ -351,14 +350,26 @@ QString CustomCommandData::GenerateSessionUrl(const SessionData & Data, const QS
   Url += QStringLiteral("://");
 
   // sufSession = sufUserName | sufPassword | sufHostKey (host key not included)
+  QString UserInfo;
   if (!Data.UserName.isEmpty())
   {
-    Url += EncodeUrlString(Data.UserName);
+    UserInfo = EncodeUrlString(Data.UserName);
     if (!Password.isEmpty())
     {
-      Url += QLatin1Char(':') + EncodeUrlString(Password);
+      UserInfo += QLatin1Char(':') + EncodeUrlString(Password);
     }
-    Url += QLatin1Char('@');
+  }
+  if (Complete)
+  {
+    for (const QString & Setting : Data.RawSettingsForUrl())
+    {
+      qsizetype P = Setting.indexOf(QLatin1Char('='));
+      UserInfo += QStringLiteral(";x-") + EncodeUrlString(Setting.left(P).toLower()) + QLatin1Char('=') + EncodeUrlString(Setting.mid(P + 1));
+    }
+  }
+  if (!UserInfo.isEmpty())
+  {
+    Url += UserInfo + QLatin1Char('@');
   }
 
   if (Data.HostName.contains(QLatin1Char(':')))
@@ -387,6 +398,7 @@ CustomCommandData CustomCommandData::FromSession(const SessionData & Data, const
   Result.Password = Password.isEmpty() ? Data.Password : Password;
   Result.PortNumber = Data.PortNumber;
   Result.SessionUrl = GenerateSessionUrl(Data, Result.Password);
+  Result.CompleteSessionUrl = GenerateSessionUrl(Data, Result.Password, true);
   Result.SessionName = Data.SessionName();
   Result.PublicKeyFile = Data.PublicKeyFile;
   return Result;
@@ -487,6 +499,38 @@ void CustomCommand::PatternHint(int, const QString &)
   // noop
 }
 
+// The quotes left open by Text, which starts with Quote open: the shell sees
+// a pattern inside of a longer quoted word as well, not only "!"
+static void TrackShellQuote(const QString & Text, QChar & Quote)
+{
+  for (qsizetype Index = 0; Index < Text.size(); Index++)
+  {
+    QChar C = Text[Index];
+    if (Quote == QLatin1Char('\''))
+    {
+      if (C == QLatin1Char('\''))
+      {
+        Quote = QChar();
+      }
+    }
+    else if (C == QLatin1Char('\\'))
+    {
+      Index++;
+    }
+    else if (Quote == QLatin1Char('"'))
+    {
+      if (C == QLatin1Char('"'))
+      {
+        Quote = QChar();
+      }
+    }
+    else if ((C == QLatin1Char('"')) || (C == QLatin1Char('\'')))
+    {
+      Quote = C;
+    }
+  }
+}
+
 QString CustomCommand::Complete(const QString & Command, bool LastPass)
 {
   int Index = 1;
@@ -507,6 +551,7 @@ QString CustomCommand::Complete(const QString & Command, bool LastPass)
   }
 
   QString Result;
+  QChar ShellQuote;
   Index = 1;
   PatternIndex = 0;
   while (Index <= Command.size())
@@ -518,6 +563,7 @@ QString CustomCommand::Complete(const QString & Command, bool LastPass)
     if (PatternCmd == TextToken)
     {
       Result += Command.mid(Index - 1, Len);
+      TrackShellQuote(Command.mid(Index - 1, Len), ShellQuote);
     }
     else if (PatternCmd == QLatin1Char('!'))
     {
@@ -532,14 +578,7 @@ QString CustomCommand::Complete(const QString & Command, bool LastPass)
     }
     else
     {
-      QChar Quote;
-      QChar Before = CharAt(Command, Index - 1);
-      QChar After = CharAt(Command, Index + Len);
-      if ((Index > 1) && (Index + Len - 1 < Command.size()) &&
-          Quotes.contains(Before) && Quotes.contains(After) && (Before == After))
-      {
-        Quote = Before;
-      }
+      QChar Quote = ShellQuote;
       QString Pattern = Command.mid(Index - 1, Len);
       QString Replacement;
       bool Delimit = true;
@@ -549,7 +588,9 @@ QString CustomCommand::Complete(const QString & Command, bool LastPass)
         {
           Replacement = Escape(Replacement);
         }
-        if (Delimit)
+        // A list is made for outside of quotes: within them its quotes would
+        // end those of the command, so there it is plain text
+        if (Delimit || (!Quote.isNull() && (Pattern == QStringLiteral("!&"))))
         {
           DelimitReplacement(Replacement, Quote);
         }
@@ -790,10 +831,13 @@ int FileCustomCommand::PatternLen(const QString & Command, int Index)
 bool FileCustomCommand::PatternReplacement(int, const QString & Pattern, QString & Replacement, bool & Delimit)
 {
   // keep consistent with TSessionLog::OpenLogFile
-  if ((Pattern.compare(QStringLiteral("!s"), Qt::CaseInsensitive) == 0) ||
-      (Pattern.compare(QStringLiteral("!e"), Qt::CaseInsensitive) == 0))
+  if (Pattern.compare(QStringLiteral("!s"), Qt::CaseInsensitive) == 0)
   {
     Replacement = FData.HasSession ? FData.SessionUrl : QString();
+  }
+  else if (Pattern.compare(QStringLiteral("!e"), Qt::CaseInsensitive) == 0)
+  {
+    Replacement = FData.HasSession ? FData.CompleteSessionUrl : QString();
   }
   else if (Pattern == QStringLiteral("!@"))
   {
@@ -839,6 +883,21 @@ bool FileCustomCommand::PatternReplacement(int, const QString & Pattern, QString
     Replacement = FFileName;
   }
   return true;
+}
+
+void FileCustomCommand::DelimitReplacement(QString & Replacement, QChar Quote)
+{
+  if (Quote.isNull() && !Replacement.isEmpty())
+  {
+    // WinSCP leaves it as it is, but a file name is chosen by whoever put the
+    // file on the server, and ";", "|" or a space must not be syntax for the shell.
+    // (What the user answers to a prompt is theirs, "*.txt" goes on working.)
+    Replacement = QLatin1Char('\'') + DelimitStr(Replacement, QLatin1Char('\'')) + QLatin1Char('\'');
+  }
+  else
+  {
+    CustomCommand::DelimitReplacement(Replacement, Quote);
+  }
 }
 
 void FileCustomCommand::Validate(const QString & Command)
@@ -971,14 +1030,22 @@ static QString ShellSingleQuoteLocal(const QString & Value)
 void LocalCustomCommand::DelimitReplacement(QString & Replacement, QChar Quote)
 {
 #ifdef Q_OS_WIN
-  // cmd.exe: WinSCP does not delimit. Downloaded names cannot contain '"',
-  // '|', '<' or '>' (ValidLocalFileName), but "&", "^", "(", ")" and "%" are
-  // valid in Windows names and syntax for cmd.exe: unquoted, such a name
-  // (chosen by the server) is put in double quotes. Inside quotes it is inert.
-  static const QRegularExpression CmdSyntax(QStringLiteral("[\\s&^()%;,=!]"));
-  if (FShellQuoting && (Quote != QLatin1Char('"')) && Replacement.contains(CmdSyntax))
+  // cmd.exe: WinSCP does not delimit. A server chooses these names: downloaded
+  // ones can still have "&", "^", "(", ")" and "%", and a remote name anything,
+  // also a '"'. Double quotes alone do not hold them, see Platform::CmdQuote.
+  // A name without syntax stays as it is, as it did.
+  static const QRegularExpression CmdSyntax(QStringLiteral("[\\s\\x00-\\x1f&^()%;,=!\"<>|]"));
+  if (!FShellQuoting)
   {
-    Replacement = QLatin1Char('"') + Replacement + QLatin1Char('"');
+    return;
+  }
+  if (Quote == QLatin1Char('"'))
+  {
+    Replacement = Platform::CmdInsideQuotes(Replacement);
+  }
+  else if (Replacement.contains(CmdSyntax))
+  {
+    Replacement = Platform::CmdQuote(Replacement);
   }
   return;
 #endif
@@ -986,6 +1053,11 @@ void LocalCustomCommand::DelimitReplacement(QString & Replacement, QChar Quote)
   {
     return;
   }
+#ifdef Q_OS_MACOS
+  // QProcess hands its arguments over decomposed (QFile::encodeName), and that
+  // makes a backtick of U+1FEF: the quotes must hold what the shell will get
+  Replacement = Replacement.normalized(QString::NormalizationForm_D);
+#endif
   if (Quote == QLatin1Char('\''))
   {
     Replacement.replace(QLatin1Char('\''), QStringLiteral("'\\''"));

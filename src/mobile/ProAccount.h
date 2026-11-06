@@ -50,13 +50,27 @@ public:
   Q_INVOKABLE void signIn();
   Q_INVOKABLE void cancelSignIn();
   Q_INVOKABLE void signOut();
-  // whether the cloud has data (probed): unlock it, or create the key
+  // whether the cloud has data (probed): unlock it, or create the key. oldFormat:
+  // it is from NixSCP 1.2.3 or older, and only replaceOldCloud gets past it
   Q_INVOKABLE void probe();
   // keyFinished(ok, recovery key or error)
   Q_INVOKABLE void createKey(const QString & Password, bool WithRecoveryKey);
+  // keyFinished(ok, recovery key or error); the user confirmed replacing the cloud data
+  Q_INVOKABLE void replaceOldCloud(const QString & Password, bool WithRecoveryKey);
   // keyFinished(ok, error)
   Q_INVOKABLE void unlockKey(const QString & Secret, bool IsRecoveryKey);
-  Q_INVOKABLE void changePassword(const QString & Password);
+  // what is wrong with a new password ("" = nothing); 0 = too weak ... 3 = strong
+  Q_INVOKABLE QString passwordProblem(const QString & Password) const;
+  Q_INVOKABLE int passwordScore(const QString & Password) const;
+  Q_INVOKABLE QString generatePassphrase() const;
+  // passwordChanged(ok, new recovery key or error). Current: the password or
+  // recovery key, needed for any change. RotateKey: a new data key as well
+  // (needs the network; other devices ask for the password once).
+  Q_INVOKABLE void changePassword(const QString & Current, bool CurrentIsRecoveryKey, const QString & Password, bool RotateKey);
+  // recoveryKeyChanged(ok, new recovery key or error)
+  Q_INVOKABLE void newRecoveryKey(const QString & Current, bool CurrentIsRecoveryKey, bool RotateKey);
+  // the user has the recovery key: it no longer comes back (recoveryKeyWaiting)
+  Q_INVOKABLE void recoveryKeySaved();
   Q_INVOKABLE void syncNow();
   // 0 = the cloud's, 1 = this phone's, 2 = later
   Q_INVOKABLE void resolveConflict(int Choice);
@@ -68,9 +82,12 @@ public:
 signals:
   void changed();
   void signInFinished(bool ok, const QString & error);
-  void probed(bool ok, bool hasData, const QString & error);
+  void probed(bool ok, bool hasData, bool oldFormat, const QString & error);
   void keyFinished(bool ok, const QString & result);
-  void passwordChanged(bool ok, const QString & error);
+  void passwordChanged(bool ok, const QString & result);
+  void recoveryKeyChanged(bool ok, const QString & result);
+  // a recovery key nobody saw yet: a crash, or a key change that ended later
+  void recoveryKeyWaiting(const QString & key);
   void account(const QVariantMap & data);
   void conflict(const QString & device, const QString & time);
   // something to show (settings pulled, signed out by the server...)

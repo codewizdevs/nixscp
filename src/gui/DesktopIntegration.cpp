@@ -5,6 +5,7 @@
 // ApplicationRestore, TrayIconClick, PopupTrayBalloon, OperationComplete,
 // taskbar progress) and forms/Login.cpp (DesktopIconActionExecute).
 #include "gui/DesktopIntegration.h"
+#include "core/AgentAccess.h"
 #include "core/Platform.h"
 #include "gui/CustomCommandRunner.h"
 #include "gui/GuiUserInterface.h"
@@ -26,10 +27,13 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QMainWindow>
 #include <QMenu>
 #include <QPointer>
 #include <QProcess>
+#include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
@@ -38,6 +42,7 @@
 #include <QSystemTrayIcon>
 #include <QTemporaryFile>
 #include <QThread>
+#include <QTimeZone>
 #include <QTimer>
 #include <QUrl>
 #include <QWindow>
@@ -49,6 +54,8 @@
 #include <QDBusPendingReply>
 #include <QDBusVariant>
 #endif
+
+#include <openssl/crypto.h>
 
 #include <memory>
 #include <unistd.h>
@@ -76,7 +83,35 @@ static bool StartDetached(const QString & Program, const QStringList & Arguments
   {
     return Runner()(Program, Arguments);
   }
-  return QProcess::startDetached(Program, Arguments);
+  QProcess Process;
+  Platform::SetProgram(Process, Program, Arguments);
+  return Process.startDetached();
+}
+
+// A terminal client. On Windows it needs a console of its own, and it is started
+// directly: "cmd /c start" would interpret & | ^ of host and user names.
+// Environment: what must not be on its command line, which anyone can read
+static bool StartTerminalClient(const QString & Program, const QStringList & Arguments, const QStringList & Environment)
+{
+  if (!Runner())
+  {
+    QProcess Process;
+    Platform::SetProgram(Process, Program, Arguments);
+    QProcessEnvironment ProcessEnvironment = QProcessEnvironment::systemEnvironment();
+    for (const QString & Variable : Environment)
+    {
+      ProcessEnvironment.insert(Variable.section(QLatin1Char('='), 0, 0), Variable.section(QLatin1Char('='), 1, -1));
+    }
+    Process.setProcessEnvironment(ProcessEnvironment);
+#ifdef Q_OS_WIN
+    Process.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments * ProcessArguments)
+    {
+      ProcessArguments->flags = (ProcessArguments->flags & ~static_cast<DWORD>(CREATE_NO_WINDOW)) | CREATE_NEW_CONSOLE;
+    });
+#endif
+    return Process.startDetached();
+  }
+  return StartDetached(Program, Arguments);
 }
 
 // Runs Program asynchronously; Finished(Ok) on the GUI thread
@@ -906,6 +941,13 @@ static bool IsSshProgram(const QString & Arg)
   return (Name == QStringLiteral("ssh")) || (Name == QStringLiteral("ssh.exe"));
 }
 
+static bool IsPuttyProgram(const QString & Arg)
+{
+  QString Name = QFileInfo(Arg).fileName();
+  return (Name.compare(QStringLiteral("putty"), Qt::CaseInsensitive) == 0) ||
+    (Name.compare(QStringLiteral("putty.exe"), Qt::CaseInsensitive) == 0);
+}
+
 static bool IsTelnetProgram(const QString & Arg)
 {
   return (QFileInfo(Arg).fileName() == QStringLiteral("telnet"));
@@ -965,30 +1007,59 @@ QString ApplyTerminalEmulator(const TerminalEmulator & Emulator, QStringList & A
 }
 } // namespace
 
-QString ResolveTerminalProgram(const QString & Program, QStringList & Arguments)
+QByteArray TerminalScript(const QStringList & Arguments, const QStringList & Environment)
 {
+  auto Quoted = [](QString Text) { return QLatin1Char('\'') + Text.replace(QLatin1Char('\''), QStringLiteral("'\\''")) + QLatin1Char('\''); };
+  QString Script = QStringLiteral("#!/bin/sh\nrm -f \"$0\"\nclear\n");
+  for (const QString & Variable : Environment)
+  {
+    Script += QStringLiteral("export %1=%2\n").arg(Variable.section(QLatin1Char('='), 0, 0), Quoted(Variable.section(QLatin1Char('='), 1, -1)));
+  }
+  Script += QStringLiteral("exec");
+  for (const QString & Arg : Arguments)
+  {
+    Script += QLatin1Char(' ') + Quoted(Arg);
+  }
+  return (Script + QLatin1Char('\n')).toUtf8();
+}
+
+QString ResolveTerminalProgram(const QString & Program, QStringList & Arguments, const QStringList & Environment)
+{
+#ifndef Q_OS_MACOS
+  Q_UNUSED(Environment);
+#endif
+#ifdef Q_OS_WIN
+  if (Program == QStringLiteral("x-terminal-emulator"))
+  {
+    // A configuration of Linux: the console of a command is its own (StartTerminalClient)
+    if (!Arguments.isEmpty() && (Arguments.first() == QStringLiteral("-e")))
+    {
+      Arguments.removeFirst();
+    }
+    if (Arguments.isEmpty())
+    {
+      Arguments = QStringList{QStringLiteral("/c")};
+      return QStringLiteral("cmd.exe");
+    }
+    return Arguments.takeFirst();
+  }
+#endif
 #ifdef Q_OS_MACOS
   if (Program == QStringLiteral("x-terminal-emulator"))
   {
     // Terminal.app opens a private .command script that removes itself,
     // clears the window and runs the command line (no typed-in command, no
-    // permission to control Terminal needed)
+    // permission to control Terminal needed). It starts the script with an
+    // environment of its own, so Environment goes in there too
     if (!Arguments.isEmpty() && (Arguments.first() == QStringLiteral("-e")))
     {
       Arguments.removeFirst();
-    }
-    QString Line;
-    for (const QString & Arg : std::as_const(Arguments))
-    {
-      QString Quoted = Arg;
-      Quoted.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
-      Line += QStringLiteral(" '") + Quoted + QLatin1Char('\'');
     }
     QTemporaryFile Script(QDir::tempPath() + QStringLiteral("/nixscp-terminal-XXXXXX.command"));
     Script.setAutoRemove(false);
     if (Script.open())
     {
-      Script.write(("#!/bin/sh\nrm -f \"$0\"\nclear\nexec" + Line + "\n").toUtf8());
+      Script.write(TerminalScript(Arguments, Environment));
       Script.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
       Script.close();
       Arguments = QStringList{QStringLiteral("-a"), QStringLiteral("Terminal"), Script.fileName()};
@@ -1138,14 +1209,27 @@ bool BuildTerminalCommand(const SessionData & AData, const QString & APassword, 
   }
   else
   {
-    if (ClientIndex < 0)
+    if ((ClientIndex < 0) && IsPuttyProgram(Args.first()))
+    {
+      // PuTTY itself: with its own switches, what OpenSSH needs does not apply
+      if (!SiteCommand)
+      {
+        Args << QStringLiteral("-ssh") << QStringLiteral("-P") << QString::number(Data.PortNumber);
+        if (!Data.UserNameExpanded().isEmpty())
+        {
+          Args << QStringLiteral("-l") << Data.UserNameExpanded();
+        }
+        Args << Data.HostNameExpanded();
+      }
+    }
+    else if (ClientIndex < 0)
     {
       // No client in the command (e.g. "konsole -e"): run OpenSSH
       ClientIndex = static_cast<int>(Args.size());
       Args << QStringLiteral("ssh");
       SiteCommand = false;
     }
-    if (IsTelnetProgram(Args[ClientIndex]))
+    if ((ClientIndex >= 0) && IsTelnetProgram(Args[ClientIndex]))
     {
       ClientIndex = -1;
     }
@@ -1252,30 +1336,29 @@ bool BuildTerminalCommand(const SessionData & AData, const QString & APassword, 
       Args << QStringLiteral("-t") << QStringLiteral("cd %1 && exec \"$SHELL\" -l").arg(ShellSingleQuote(RemotePath));
     }
     // "Remember session password and pass it to PuTTY": OpenSSH has no -pw, so
-    // NixSCP itself acts as SSH_ASKPASS, reading a one-time private file (src/main.cpp)
+    // NixSCP itself acts as SSH_ASKPASS (src/main.cpp), asking this process
     if (!Password.isEmpty() && !PasswordCommand)
     {
-      QString RuntimeDir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
-      if (RuntimeDir.isEmpty())
+      QString Token;
+      Result.AskPassSocket = OfferAskPassPassword(Password, Token);
+      if (!Result.AskPassSocket.isEmpty())
       {
-        RuntimeDir = QDir::tempPath();
-      }
-      QTemporaryFile File(RuntimeDir + QStringLiteral("/nixscp-askpass-XXXXXX"));
-      File.setAutoRemove(false);
-      if (File.open())
-      {
-        File.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-        File.write(Password.toUtf8());
-        File.close();
-        Result.AskPassFile = File.fileName();
-        QStringList Env{QStringLiteral("env"), QStringLiteral("SSH_ASKPASS=%1").arg(QCoreApplication::applicationFilePath()),
-          QStringLiteral("SSH_ASKPASS_REQUIRE=force"), QStringLiteral("NIXSCP_ASKPASS_FILE=%1").arg(Result.AskPassFile),
+        QStringList Env{QStringLiteral("SSH_ASKPASS=%1").arg(QCoreApplication::applicationFilePath()),
+          QStringLiteral("SSH_ASKPASS_REQUIRE=force"), QStringLiteral("NIXSCP_ASKPASS_SOCKET=%1").arg(Result.AskPassSocket),
           // only the target host's password prompt gets the password (not a jump host's)
           QStringLiteral("NIXSCP_ASKPASS_HOST=%1").arg(Data.HostNameExpanded())};
+        // the socket can be seen in its folder and these arguments in the process
+        // list: this one must never be on a command line
+        Result.Environment = QStringList{QStringLiteral("NIXSCP_ASKPASS_TOKEN=%1").arg(Token)};
+#ifdef Q_OS_WIN
+        Result.Environment += Env;
+#else
+        Env.prepend(QStringLiteral("env"));
         for (int I = 0; I < Env.size(); I++)
         {
           Args.insert(ClientIndex + I, Env[I]);
         }
+#endif
       }
     }
   }
@@ -1283,6 +1366,181 @@ bool BuildTerminalCommand(const SessionData & AData, const QString & APassword, 
   Result.Program = Args.takeFirst();
   Result.Arguments = Args;
   return true;
+}
+
+namespace
+{
+const QString AskPassPrefix = QStringLiteral("nixscp-askpass-");
+const int AskPassLifetimeMs = 120000;
+
+QStringList AskPassDirectories()
+{
+  QStringList Result{QDir::tempPath()};
+  QString RuntimeDir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+  if (!RuntimeDir.isEmpty() && (RuntimeDir != Result.first()))
+  {
+    Result.prepend(RuntimeDir);
+  }
+  return Result;
+}
+
+// Serves the password once, to the first reader that knows the token; a child of
+// the application, so that it does not outlive it
+class AskPassServer : public QLocalServer
+{
+public:
+  AskPassServer(const QString & Password, const QByteArray & Token, QObject * Parent) :
+    QLocalServer(Parent), FPassword(Password.toUtf8()), FToken(Token)
+  {
+    setSocketOptions(QLocalServer::UserAccessOption);
+    connect(this, &QLocalServer::newConnection, this, &AskPassServer::Accept);
+    QTimer::singleShot(AskPassLifetimeMs, this, &AskPassServer::Finish);
+  }
+
+  ~AskPassServer() override
+  {
+    FPassword.fill('\0');
+  }
+
+  void Finish()
+  {
+    close();
+    FPassword.fill('\0');
+    deleteLater();
+  }
+
+private:
+  QByteArray FPassword;
+  QByteArray FToken;
+
+  void Accept()
+  {
+    while (QLocalSocket * Socket = nextPendingConnection())
+    {
+      if (!AgentAccess::PeerIsSameUser(Socket->socketDescriptor()))
+      {
+        Socket->abort();
+        Socket->deleteLater();
+        continue;
+      }
+      Socket->setParent(this);
+      connect(Socket, &QLocalSocket::disconnected, Socket, &QObject::deleteLater);
+      connect(Socket, &QLocalSocket::readyRead, this, [this, Socket]() { Answer(Socket); });
+      Answer(Socket);
+    }
+  }
+
+  // A program of the user can find the socket: in its folder, in the process list.
+  // That is not enough, and it does not use up the offer of the one who has the token
+  void Answer(QLocalSocket * Socket)
+  {
+    if (Socket->bytesAvailable() < FToken.size() + 1)
+    {
+      return;
+    }
+    QByteArray Token = Socket->read(FToken.size() + 1);
+    if ((Token.size() != FToken.size() + 1) || (Token.back() != '\n') ||
+        (CRYPTO_memcmp(Token.constData(), FToken.constData(), static_cast<size_t>(FToken.size())) != 0))
+    {
+      Socket->abort();
+      return;
+    }
+    // must outlive the server, to deliver what was written
+    Socket->setParent(qApp);
+    disconnect(Socket, nullptr, this, nullptr);
+    Socket->write(FPassword);
+    Socket->disconnectFromServer();
+    Finish();
+  }
+};
+}
+
+QString OfferAskPassPassword(const QString & Password, QString & Token)
+{
+  QString Name = AskPassPrefix + QStringLiteral("%1%2")
+    .arg(QRandomGenerator::system()->generate64(), 16, 16, QLatin1Char('0'))
+    .arg(QRandomGenerator::system()->generate(), 8, 16, QLatin1Char('0'));
+  Token = QStringLiteral("%1%2").arg(QRandomGenerator::system()->generate64(), 16, 16, QLatin1Char('0'))
+    .arg(QRandomGenerator::system()->generate64(), 16, 16, QLatin1Char('0'));
+  auto * Server = new AskPassServer(Password, Token.toLatin1(), qApp);
+#ifdef Q_OS_WIN
+  // a named pipe
+  QStringList Names{Name};
+#else
+  // (a socket path is limited to about 100 characters)
+  QStringList Names;
+  for (const QString & Directory : AskPassDirectories())
+  {
+    Names.append(QDir(Directory).filePath(Name));
+  }
+#endif
+  for (const QString & SocketName : Names)
+  {
+    if (Server->listen(SocketName))
+    {
+      Server->setObjectName(SocketName);
+      return SocketName;
+    }
+  }
+  delete Server;
+  return QString();
+}
+
+void WithdrawAskPassPassword(const QString & SocketName)
+{
+  // (all QLocalServer children of that name are AskPassServer)
+  if (auto * Server = qApp->findChild<QLocalServer *>(SocketName, Qt::FindDirectChildrenOnly))
+  {
+    static_cast<AskPassServer *>(Server)->Finish();
+  }
+}
+
+QByteArray FetchAskPassPassword(const QString & SocketName, const QString & Token)
+{
+  const int TimeoutMs = 10000;
+  QLocalSocket Socket;
+  Socket.connectToServer(SocketName);
+  QByteArray Result;
+  if (Socket.waitForConnected(TimeoutMs) && AgentAccess::PeerIsSameUser(Socket.socketDescriptor()))
+  {
+    Socket.write(Token.toLatin1() + '\n');
+    Socket.flush();
+    while (Socket.state() == QLocalSocket::ConnectedState)
+    {
+      if (!Socket.waitForReadyRead(TimeoutMs))
+      {
+        break;
+      }
+      Result += Socket.readAll();
+    }
+    Result += Socket.readAll();
+  }
+  return Result;
+}
+
+void RemoveStaleAskPassFiles()
+{
+  QDateTime Now = QDateTime::currentDateTimeUtc();
+  for (const QString & Directory : AskPassDirectories())
+  {
+    const QFileInfoList Files = QDir(Directory).entryInfoList({AskPassPrefix + QLatin1Char('*')}, QDir::Files | QDir::System | QDir::Hidden);
+    for (const QFileInfo & File : Files)
+    {
+      if (File.lastModified(QTimeZone::UTC).msecsTo(Now) > AskPassLifetimeMs)
+      {
+        QFile::remove(File.absoluteFilePath());
+      }
+    }
+  }
+}
+
+bool CanCreateSessionShortcut()
+{
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+  return false;
+#else
+  return true;
+#endif
 }
 
 bool OpenSessionInTerminal(QWidget * Parent, const SessionData & Data, const QString & Password,
@@ -1304,23 +1562,14 @@ bool OpenSessionInTerminal(QWidget * Parent, const SessionData & Data, const QSt
     }
     return false;
   }
-  QString Program = ResolveTerminalProgram(Command.Program, Command.Arguments);
-  if (!StartDetached(Program, Command.Arguments))
+  QString Program = ResolveTerminalProgram(Command.Program, Command.Arguments, Command.Environment);
+  if (!StartTerminalClient(Program, Command.Arguments, Command.Environment))
   {
-    if (!Command.AskPassFile.isEmpty())
-    {
-      QFile::remove(Command.AskPassFile);
-    }
+    WithdrawAskPassPassword(Command.AskPassSocket);
     // EXECUTE_APP_ERROR
     ShowErrorMessage(Parent, QStringLiteral("Cannot execute \"%1\".").arg(Program),
       QStringLiteral("Check the PuTTY/Terminal client path in Preferences > Integration > Applications."));
     return false;
-  }
-  if (!Command.AskPassFile.isEmpty())
-  {
-    // Do not leave the password behind if ssh never asks
-    QString FileName = Command.AskPassFile;
-    QTimer::singleShot(120000, qApp, [FileName]() { QFile::remove(FileName); });
   }
   return true;
 }

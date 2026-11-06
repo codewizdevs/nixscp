@@ -249,9 +249,260 @@ static void TestUrls()
     CHECK_EQ(D.Ftps, ftpsImplicit);
     CHECK_EQ(D.PortNumber, 4022);
     CHECK(D.Compression);
-    CHECK_EQ(D.KnownHostsFile, QStringLiteral("/tmp/kh"));
+    // the trust store of a session is not for raw settings to choose
+    CHECK(D.KnownHostsFile.isEmpty());
     QString Unused;
     CHECK(!O.UnusedSwitch(Unused));
+  }
+  {
+    // S13: neither from a URL nor from /rawsettings, in both parsers
+    SessionData D;
+    SessionExtras X;
+    int Info = 0;
+    ParseSessionUrl(QStringLiteral("sftp://u;x-knownhostsfile=%2Fdev%2Fnull;x-logicalhostname=other@h/"), nullptr, &Stored, D, X, Info);
+    CHECK(D.KnownHostsFile.isEmpty());
+    CHECK(D.LogicalHostName.isEmpty());
+    ApplySessionRawSettings(D, X, {QStringLiteral("KnownHostsFile=/dev/null"), QStringLiteral("LogicalHostName=other"), QStringLiteral("Compression=1")});
+    CHECK(D.KnownHostsFile.isEmpty());
+    CHECK(D.LogicalHostName.isEmpty());
+    CHECK(D.Compression);
+    SessionData L;
+    L.LogicalHostName = QStringLiteral("kept");
+    Info = 0;
+    CHECK(L.ParseUrl(QStringLiteral("sftp://u;x-knownhostsfile=%2Fdev%2Fnull;x-logicalhostname=other@h/"), Info));
+    CHECK(L.KnownHostsFile.isEmpty());
+    CHECK_EQ(L.LogicalHostName, QStringLiteral("kept"));
+  }
+  {
+    // RequireDirectories: an ad-hoc URL, and a path after a stored site
+    SessionData D;
+    SessionExtras X;
+    int Info = 0;
+    ParseSessionUrl(QStringLiteral("sftp://u@h/dir/"), nullptr, &Stored, D, X, Info);
+    CHECK(D.RequireDirectories);
+    ParseSessionUrl(QStringLiteral("work/my%20server"), nullptr, &Stored, D, X, Info);
+    CHECK(!D.RequireDirectories);
+    ParseSessionUrl(QStringLiteral("work/my%20server/var/www"), nullptr, &Stored, D, X, Info);
+    CHECK(D.RequireDirectories);
+    // A clicked link: the key it names is the attacker's, the user is still asked
+    {
+      SessionData L;
+      SessionExtras LX;
+      int LInfo = 0;
+      ParseSessionUrl(QStringLiteral("sftp://u;fingerprint=abc@h/"), nullptr, &Stored, L, LX, LInfo, nullptr, true);
+      CHECK(L.HostKey.isEmpty() && !L.HostKeyFromUrl);
+    }
+    // FOverrideCachedHostKey: ";fingerprint=" is not -hostkey
+    ParseSessionUrl(QStringLiteral("sftp://u;fingerprint=abc@h/"), nullptr, &Stored, D, X, Info);
+    CHECK_EQ(D.HostKey, QStringLiteral("abc"));
+    CHECK(D.HostKeyFromUrl);
+    Options O;
+    O.SetSwitchMarks(QStringLiteral("-"));
+    O.Parse(QStringLiteral("sftp://u;fingerprint=abc@h/ -hostkey=def"));
+    ParseSessionUrl(O.Param(1), &O, &Stored, D, X, Info);
+    CHECK_EQ(D.HostKey, QStringLiteral("def"));
+    CHECK(!D.HostKeyFromUrl);
+  }
+  {
+    // A URL outranks nothing: the fingerprint of a raw setting is that of a URL,
+    // in both parsers; "*" and "acceptnew" do not come from any URL at all
+    struct { const char * Url; const char * HostKey; const char * TunnelHostKey; bool FromUrl; bool TunnelFromUrl; } Urls[] = {
+      {"sftp://u;x-SshHostKey=abc@h/", "abc", "", true, false},
+      {"sftp://u;x-sshhostkey=abc@h/", "abc", "", true, false},
+      {"sftp://u;x-TunnelHostKey=abc@h/", "", "abc", false, true},
+      {"sftp://u;fingerprint=*@h/", "", "", true, false},
+      {"sftp://u;fingerprint=%2A@h/", "", "", true, false},
+      {"sftp://u;fingerprint=acceptnew@h/", "", "", true, false},
+      {"sftp://u;FINGERPRINT=AcceptNew@h/", "", "", true, false},
+      {"sftp://u;fingerprint=abc%3B*@h/", "abc", "", true, false},
+      {"sftp://u;x-SshHostKey=*@h/", "", "", true, false},
+      {"sftp://u;x-SshHostKey=acceptnew@h/", "", "", true, false},
+      {"sftp://u;x-SshHostKey=abc%3B*@h/", "abc", "", true, false},
+      {"sftp://u;x-TunnelHostKey=*@h/", "", "", false, true},
+      {"sftp://u;x-TunnelHostKey=acceptnew@h/", "", "", false, true},
+      {"ftpes://u;fingerprint=*@h/", "", "", true, false},
+      {"davs://u;x-SshHostKey=*@h/", "", "", true, false},
+    };
+    for (const auto & U : Urls)
+    {
+      QString Url = QString::fromLatin1(U.Url);
+      SessionData D;
+      SessionExtras X;
+      int Info = 0;
+      ParseSessionUrl(Url, nullptr, nullptr, D, X, Info);
+      SessionData L;
+      CHECK_MSG(L.ParseUrl(Url, Info), Url);
+      for (const SessionData * Parsed : {&D, &L})
+      {
+        CHECK_MSG(Parsed->HostKey == QString::fromLatin1(U.HostKey), Url + QLatin1Char(' ') + Parsed->HostKey);
+        CHECK_MSG(Parsed->TunnelHostKey == QString::fromLatin1(U.TunnelHostKey), Url + QLatin1Char(' ') + Parsed->TunnelHostKey);
+        CHECK_MSG(Parsed->HostKeyFromUrl == U.FromUrl, Url);
+        CHECK_MSG(Parsed->TunnelHostKeyFromUrl == U.TunnelFromUrl, Url);
+      }
+    }
+    // the switches are what a script author has written, and stay as they are
+    struct { const char * Command; const char * HostKey; const char * TunnelHostKey; bool FromUrl; } Switches[] = {
+      {"sftp://u@h/ -hostkey=*", "*", "", false},
+      {"sftp://u@h/ -hostkey=acceptnew", "acceptnew", "", false},
+      {"ftpes://u@h/ -certificate=*", "*", "", false},
+      {"sftp://u;fingerprint=abc@h/ -hostkey=*", "*", "", false},
+      {"sftp://u;x-SshHostKey=abc@h/ -hostkey=*", "*", "", false},
+      {"sftp://u@h/ -rawsettings SshHostKey=*", "*", "", false},
+      {"sftp://u;fingerprint=abc@h/ -rawsettings SshHostKey=*", "*", "", false},
+      {"sftp://u@h/ -rawsettings TunnelHostKey=*", "", "*", false},
+    };
+    for (const auto & S : Switches)
+    {
+      Options O;
+      O.SetSwitchMarks(QStringLiteral("-"));
+      O.Parse(QString::fromLatin1(S.Command));
+      SessionData D;
+      SessionExtras X;
+      int Info = 0;
+      ParseSessionUrl(O.Param(1), &O, nullptr, D, X, Info);
+      CHECK_MSG(D.HostKey == QString::fromLatin1(S.HostKey), QString::fromLatin1(S.Command) + QLatin1Char(' ') + D.HostKey);
+      CHECK_MSG(D.TunnelHostKey == QString::fromLatin1(S.TunnelHostKey), QString::fromLatin1(S.Command) + QLatin1Char(' ') + D.TunnelHostKey);
+      CHECK_MSG(!D.HostKeyFromUrl && !D.TunnelHostKeyFromUrl, QString::fromLatin1(S.Command));
+    }
+    // what a URL says about keys is for that connection: saved, it would
+    // be a configured key, also when it came with the raw settings
+    SessionData D;
+    SessionExtras X;
+    int Info = 0;
+    ParseSessionUrl(QStringLiteral("sftp://u;x-SshHostKey=abc;x-TunnelHostKey=def;x-Compression=1@h/"), nullptr, nullptr, D, X, Info);
+    IniFile File;
+    IniStorage Storage(&File);
+    Storage.OpenSubKey(QStringLiteral("Site"), true);
+    D.Save(Storage);
+    SessionData Back;
+    Back.Load(Storage);
+    CHECK(Back.HostKey.isEmpty() && Back.TunnelHostKey.isEmpty());
+    CHECK(Back.Compression);
+    SessionData Plain;
+    Plain.HostKey = QStringLiteral("abc");
+    Plain.TunnelHostKey = QStringLiteral("def");
+    IniFile PlainFile;
+    IniStorage PlainStorage(&PlainFile);
+    PlainStorage.OpenSubKey(QStringLiteral("Site"), true);
+    Plain.Save(PlainStorage);
+    SessionData PlainBack;
+    PlainBack.Load(PlainStorage);
+    CHECK_EQ(PlainBack.HostKey, QStringLiteral("abc"));
+    CHECK_EQ(PlainBack.TunnelHostKey, QStringLiteral("def"));
+    // TrustedHostKey: for the certificate checks of FTPS, WebDAV and S3
+    SessionData T;
+    T.HostKey = QStringLiteral("*");
+    CHECK_EQ(T.TrustedHostKey(), QStringLiteral("*"));
+    T.HostKeyFromUrl = true;
+    CHECK(T.TrustedHostKey().isEmpty());
+    T.HostKey = QStringLiteral("aa:bb;*;acceptnew;cc:dd");
+    CHECK_EQ(T.TrustedHostKey(), QStringLiteral("aa:bb;cc:dd"));
+  }
+  {
+    // Agent access and forwarded ports are granted in NixSCP only: not from a
+    // URL, and not from -rawsettings or /batchsettings either, in both parsers
+    const QString Url = QStringLiteral("sftp://u;x-AgentAccess=1;x-AgentPermissions=7;x-AgentName=evil;x-AgentAllow=*;x-AgentDeny=x;"
+      "x-AgentRecord=1;x-PortForwards=L1234%20h%205678;x-Compression=1@h/");
+    SessionData Factory;
+    SessionData D;
+    SessionExtras X;
+    int Info = 0;
+    ParseSessionUrl(Url, nullptr, nullptr, D, X, Info);
+    SessionData L;
+    CHECK(L.ParseUrl(Url, Info));
+    CHECK((Info & SessionData::ParsedUnsafeSettings) != 0);
+    SessionData R;
+    ApplySessionRawSettings(R, X, {QStringLiteral("AgentAccess=1"), QStringLiteral("AgentPermissions=7"), QStringLiteral("AgentName=evil"),
+      QStringLiteral("AgentAllow=*"), QStringLiteral("AgentDeny=x"), QStringLiteral("AgentRecord=1"), QStringLiteral("PortForwards=L1234 h 5678"),
+      QStringLiteral("Compression=1")});
+    for (const SessionData * Parsed : {&D, &L, &R})
+    {
+      CHECK(Parsed->Compression);
+      CHECK(Parsed->AgentAccess == Factory.AgentAccess);
+      CHECK(Parsed->AgentPermissions == Factory.AgentPermissions);
+      CHECK(Parsed->AgentName.isEmpty());
+      CHECK(Parsed->AgentAllow == Factory.AgentAllow);
+      CHECK(Parsed->AgentDeny == Factory.AgentDeny);
+      CHECK(Parsed->AgentRecord == Factory.AgentRecord);
+      CHECK(Parsed->PortForwards.isEmpty());
+    }
+  }
+  {
+    // What is on the list: nothing about trust, commands, the target or local files
+    for (const char * Key : {"SshHostKey", "TunnelHostKey", "HostName", "PortNumber", "UserName", "Password", "PasswordPlain", "FSProtocol", "Ftps",
+      "PublicKeyFile", "DetachedCertificate", "TlsCertificateFile", "LocalDirectory", "OtherLocalDirectory", "RemoteDirectory", "Shell", "ListingCommand",
+      "PostLoginCommands", "ReturnVar", "SftpServer", "ProxyMethod", "ProxyHost", "ProxyTelnetCommand", "ProxyLocalCommand", "Tunnel", "TunnelHostName",
+      "TunnelPublicKeyFile", "AgentFwd", "AuthGSSAPI", "GSSAPIFwdTGT", "GssapiFwd", "SSPIFwdTGT", "TryAgent", "SshNoUserAuth", "Cipher", "KEX", "HostKey",
+      "Ssh2DES", "MinTlsVersion", "MaxTlsVersion", "SslSessionReuse", "CompleteTlsShutdown", "FtpForcePasvIp2", "FtpProxyLogonType", "FtpAccount",
+      "WebDavAuthLegacy", "WebDavCrossDomainRedirects", "WebDavUnencryptedRedirects", "GSSLibs", "S3CredentialsEnv", "S3Profile", "S3RoleArn", "S3SessionToken",
+      "S3RoleSessionName", "S3RequesterPays", "DeleteToRecycleBin", "OverwrittenToRecycleBin", "RecycleBinPath", "AgentAccess", "AgentAllow", "PortForwards",
+      "KnownHostsFile", "LogicalHostName", "GSSAPIServerRealm", "KerbPrincipal", "NoExpansion", "IsWorkspace", "Link", "NameOverride", "Special", "SourceAddress",
+      "SynchronizeBrowsing", "Passphrase", "EncryptKey", "NoSuchSetting"})
+    {
+      CHECK_MSG(!SessionData::IsUrlSetting(QString::fromLatin1(Key)), QString::fromLatin1(Key));
+    }
+    CHECK(SessionData::IsUrlSetting(QStringLiteral("Compression")));
+    CHECK(SessionData::IsUrlSetting(QStringLiteral("compression")));
+    // pasted, anything else takes a confirmation
+    int Info = 0;
+    SessionData Safe;
+    CHECK(Safe.ParseUrl(QStringLiteral("sftp://u;x-Compression=1;x-Timeout=9@h/"), Info));
+    CHECK((Info & SessionData::ParsedUnsafeSettings) == 0);
+    for (const char * Url : {"sftp://u;x-AgentFwd=1@h/", "sftp://u;x-SshHostKey=abc@h/", "sftp://u;x-TunnelHostName=evil@h/",
+      "sftp://u;x-ProxyMethod=cmd;x-ProxyTelnetCommand=id@h/", "s3://u;x-S3CredentialsEnv=1@h/", "ftpes://u;x-Ftps=0@h/"})
+    {
+      SessionData U;
+      CHECK(U.ParseUrl(QString::fromLatin1(Url), Info));
+      CHECK_MSG((Info & SessionData::ParsedUnsafeSettings) != 0, QString::fromLatin1(Url));
+    }
+  }
+  {
+    // L1, L2: S3 services behind dav/http(s) URLs, in both parsers
+    struct { const char * Url; bool S3; } Urls[] = {
+      {"https://s3.amazonaws.com/bucket/", true},
+      {"https://s3.eu-west-1.amazonaws.com/", true},
+      {"davs://nyc3.digitaloceanspaces.com/", true},
+      {"https://storage.googleapis.com/", true},
+      {"https://bucket.storage.googleapis.com/", true},
+      {"https://acct.r2.cloudflarestorage.com/", true},
+      {"https://ns.compat.objectstorage.eu-frankfurt-1.oraclecloud.com/", true},
+      {"https://www.oraclecloud.com/", false},
+      {"https://notamazonaws.com/", false},
+      {"https://s3.amazonaws.com:8443/", false},
+      {"https://dav.example.com/", false},
+    };
+    for (const auto & U : Urls)
+    {
+      SessionData D;
+      SessionExtras X;
+      int Info = 0;
+      ParseSessionUrl(QString::fromLatin1(U.Url), nullptr, &Stored, D, X, Info);
+      CHECK_MSG((D.FSProtocol == fsS3) == U.S3, QString::fromLatin1(U.Url));
+      SessionData L;
+      CHECK(L.ParseUrl(QString::fromLatin1(U.Url), Info));
+      CHECK_MSG((L.FSProtocol == fsS3) == U.S3, QString::fromLatin1(U.Url));
+    }
+  }
+  {
+    // S3: a pasted URL stays literal, what was in the dialog is expanded as ever
+    qputenv("NIXSCP_TEST_SECRET", "wJalrFAKEsecret");
+    SessionData L;
+    L.PublicKeyFile = QStringLiteral("$NIXSCP_TEST_SECRET/key");
+    int Info = 0;
+    CHECK(L.ParseUrl(QStringLiteral("ftp://$NIXSCP_TEST_SECRET@evil.example/"), Info));
+    CHECK(L.NoExpansion);
+    L.ExpandEnvironmentVariables();
+    CHECK_EQ(L.UserName, QStringLiteral("$NIXSCP_TEST_SECRET"));
+    CHECK_EQ(L.UserNameExpanded(), QStringLiteral("$NIXSCP_TEST_SECRET"));
+    CHECK_EQ(L.PublicKeyFile, QStringLiteral("wJalrFAKEsecret/key"));
+    // and a URL cannot turn it back on
+    SessionData U;
+    CHECK(U.ParseUrl(QStringLiteral("ftp://u;x-NoExpansion=0@$NIXSCP_TEST_SECRET/"), Info));
+    CHECK(U.NoExpansion);
+    CHECK_EQ(U.HostNameExpanded(), QStringLiteral("$NIXSCP_TEST_SECRET"));
+    SessionExtras X;
+    ApplySessionRawSettings(U, X, {QStringLiteral("NoExpansion=0")});
+    CHECK(U.NoExpansion);
   }
   CHECK_EQ(DecodeUrlChars(QStringLiteral("a+b%C3%A9%2F")), QString::fromUtf8("a b\xC3\xA9/"));
 }
@@ -292,7 +543,12 @@ static RunResult RunCli(const QStringList & Args, const QByteArray & Input = QBy
   QProcessEnvironment Env = QProcessEnvironment::systemEnvironment();
   Env.insert(QStringLiteral("XDG_CONFIG_HOME"), ScratchDir + QStringLiteral("/xdg"));
   Env.insert(QStringLiteral("NIXSCP_KNOWN_HOSTS"), KnownHosts.isEmpty() ? (ScratchDir + QStringLiteral("/known_hosts")) : KnownHosts);
+#ifdef Q_OS_MACOS
+  // no C.UTF-8 there, and Qt says so on stderr
+  Env.insert(QStringLiteral("LC_ALL"), QStringLiteral("en_US.UTF-8"));
+#else
   Env.insert(QStringLiteral("LC_ALL"), QStringLiteral("C.UTF-8"));
+#endif
   Env.remove(QStringLiteral("SSH_AUTH_SOCK"));
   P.setProcessEnvironment(Env);
   P.setWorkingDirectory(WorkDir.isEmpty() ? ScratchDir : WorkDir);

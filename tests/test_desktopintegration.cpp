@@ -39,24 +39,36 @@ int main()
 #include <QAction>
 #include <QApplication>
 #include <QClipboard>
+#include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QLocalSocket>
 #include <QMainWindow>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QProcess>
+#include <QStandardPaths>
 #include <QSystemTrayIcon>
+#include <QThread>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QTimer>
 #include <QUrl>
 
 #include <cstdio>
+#include <cstdlib>
+#include <fcntl.h>
 #include <functional>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#ifdef Q_OS_LINUX
+#include "testsshserver.h"
+#endif
 
 static int Failures = 0;
 static int Checks = 0;
@@ -165,6 +177,153 @@ static SessionData SshSession()
   return Data;
 }
 
+// FetchAskPassPassword blocks, and the offer needs the event loop of this thread
+static QByteArray FetchInThread(const QString & Socket, const QString & Token)
+{
+  QByteArray Result;
+  QThread * Reader = QThread::create([&Result, Socket, Token]() { Result = DesktopIntegration::FetchAskPassPassword(Socket, Token); });
+  Reader->start();
+  while (!Reader->isFinished())
+  {
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+  }
+  Reader->wait();
+  delete Reader;
+  return Result;
+}
+
+// A terminal that does not pass on its environment leaves the helper without the
+// token: it asks in the terminal, as ssh would, and nothing else reads that
+static void TestAskPassInTerminal()
+{
+#ifdef Q_OS_LINUX
+  QString Program = QCoreApplication::applicationDirPath() + QStringLiteral("/nixscp");
+  if (!QFile::exists(Program))
+  {
+    return;
+  }
+  int Master = posix_openpt(O_RDWR | O_NOCTTY);
+  CHECK((Master >= 0) && (grantpt(Master) == 0) && (unlockpt(Master) == 0));
+  QByteArray Slave = ptsname(Master);
+  QString Token;
+  QString Socket = DesktopIntegration::OfferAskPassPassword(QStringLiteral("not for this one"), Token);
+  QProcess Process;
+  QProcessEnvironment Environment = QProcessEnvironment::systemEnvironment();
+  Environment.insert(QStringLiteral("SSH_ASKPASS"), Program);
+  Environment.insert(QStringLiteral("NIXSCP_ASKPASS_SOCKET"), Socket);
+  Environment.insert(QStringLiteral("NIXSCP_ASKPASS_HOST"), QStringLiteral("target.example.com"));
+  Process.setProcessEnvironment(Environment);
+  Process.setChildProcessModifier([Slave]()
+  {
+    setsid();
+    int Terminal = open(Slave.constData(), O_RDWR);
+    ioctl(Terminal, TIOCSCTTY, 0);
+  });
+  Process.start(Program, {QStringLiteral("joe@target.example.com's password: ")});
+  QElapsedTimer Timer;
+  Timer.start();
+  QByteArray Shown;
+  bool Answered = false;
+  fcntl(Master, F_SETFL, O_NONBLOCK);
+  while ((Process.state() != QProcess::NotRunning) && (Timer.elapsed() < 15000))
+  {
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    Process.waitForFinished(10);
+    char Buffer[256];
+    ssize_t Size = read(Master, Buffer, sizeof(Buffer));
+    if (Size > 0)
+    {
+      Shown.append(Buffer, Size);
+    }
+    if (!Answered && Shown.contains("password: "))
+    {
+      CHECK(write(Master, "typed in terminal\n", 18) == 18);
+      Answered = true;
+    }
+  }
+  CHECK_MSG(Answered, QString::fromUtf8(Shown));
+  CHECK_MSG(Process.readAllStandardOutput() == "typed in terminal\n", QString::number(Process.exitCode()));
+  CHECK(Process.exitCode() == 0);
+  // it does not echo, and the offer is still there for who has the token
+  CHECK_MSG(!Shown.contains("typed in"), QString::fromUtf8(Shown));
+  CHECK(QFileInfo::exists(Socket));
+  DesktopIntegration::WithdrawAskPassPassword(Socket);
+  close(Master);
+#endif
+}
+
+#ifdef Q_OS_LINUX
+// The whole way, with what the program does for real: NixSCP starts a terminal
+// with the token in its environment, the terminal runs env(1) and ssh, ssh runs
+// the helper, the helper asks the socket, and a server takes that password only
+static void TestAskPassWithRealSsh(const QString & Folder)
+{
+  QString Ssh = QStandardPaths::findExecutable(QStringLiteral("ssh"));
+  QString Helper = QCoreApplication::applicationDirPath() + QStringLiteral("/nixscp");
+  if (Ssh.isEmpty() || !QFile::exists(Helper))
+  {
+    std::printf("SKIP askpass with real ssh: no ssh, or no nixscp next to the test\n");
+    return;
+  }
+  QString Dir = Folder + QStringLiteral("/askpass");
+  CHECK(QDir().mkpath(Dir));
+  qputenv("TESTSSH_PASSWORD", "s3cret pw");
+  TestSshServer Server;
+  CHECK(Server.Start(Dir, 22800 + static_cast<int>(QCoreApplication::applicationPid() % 90)));
+  qunsetenv("TESTSSH_PASSWORD");
+
+  Configuration & Config = Configuration::Instance();
+  QString SavedPath = Config.PuttyPath;
+  bool SavedPassword = Config.PuttyPassword;
+  Config.PuttyPassword = true;
+  DesktopIntegration::SetCommandRunner(nullptr);
+  SessionData Data;
+  Data.FSProtocol = fsSFTP;
+  Data.HostName = QStringLiteral("127.0.0.1");
+  Data.PortNumber = Server.Port();
+  Data.UserName = QStringLiteral("joe");
+  auto Run = [&](const QString & Name, const QByteArray & Start, const QString & Password)
+  {
+    QString Terminal = Dir + QLatin1Char('/') + Name;
+    QByteArray Base = Terminal.toUtf8();
+    // a terminal emulator: "-e <command>", with no terminal, as the helper must not ask
+    WriteFile(Terminal, "#!/bin/sh\nshift\nenv > '" + Base + ".env'\nprintf '%s\\n' \"$*\" > '" + Base + ".args'\n" + Start +
+      " \"$@\" > '" + Base + ".out' 2>&1 < /dev/null\necho $? > '" + Base + ".done'\n");
+    QFile::setPermissions(Terminal, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    Config.PuttyPath = QStringLiteral("%1 -e ssh -F /dev/null -o UserKnownHostsFile=%2 -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes "
+      "-o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10").arg(Terminal, Server.KnownHosts());
+    CHECK(DesktopIntegration::OpenSessionInTerminal(nullptr, Data, Password, QStringLiteral("/tmp"), true));
+    QElapsedTimer Timer;
+    Timer.start();
+    while (!QFile::exists(Terminal + QStringLiteral(".done")) && (Timer.elapsed() < 30000))
+    {
+      QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    }
+    // (it may be written only just now)
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+    return ReadFile(Terminal + QStringLiteral(".done")).trimmed();
+  };
+  QByteArray Code = Run(QStringLiteral("terminal"), QByteArray(), QStringLiteral("s3cret pw"));
+  CHECK_MSG(Code == "0", QString::fromUtf8(Code + " " + ReadFile(Dir + QStringLiteral("/terminal.out"))));
+  QByteArray Environment = ReadFile(Dir + QStringLiteral("/terminal.env"));
+  QByteArray Arguments = ReadFile(Dir + QStringLiteral("/terminal.args"));
+  CHECK(Environment.contains("NIXSCP_ASKPASS_TOKEN="));
+  CHECK(Arguments.contains("NIXSCP_ASKPASS_SOCKET=") && !Arguments.contains("NIXSCP_ASKPASS_TOKEN"));
+  QByteArray Token = Environment.mid(Environment.indexOf("NIXSCP_ASKPASS_TOKEN=") + 21, 32);
+  CHECK_MSG(Token.size() == 32, QString::fromUtf8(Token));
+  CHECK(!Arguments.contains(Token));
+  // the server takes nothing else, so this is what proves the password arrived
+  Code = Run(QStringLiteral("wrong"), QByteArray(), QStringLiteral("another password"));
+  CHECK_MSG(Code == "255", QString::fromUtf8(Code));
+  // a terminal that does not pass on its environment: no password from the socket
+  Code = Run(QStringLiteral("forgetful"), "env -u NIXSCP_ASKPASS_TOKEN", QStringLiteral("s3cret pw"));
+  CHECK_MSG(Code == "255", QString::fromUtf8(Code + " " + ReadFile(Dir + QStringLiteral("/forgetful.out"))));
+  Config.PuttyPath = SavedPath;
+  Config.PuttyPassword = SavedPassword;
+  InstallRunner();
+}
+#endif
+
 static void TestTerminalCommand(const QString & Scratch)
 {
   std::printf("- terminal client command\n");
@@ -181,7 +340,7 @@ static void TestTerminalCommand(const QString & Scratch)
   CHECK(Command.Program == QStringLiteral("x-terminal-emulator"));
   CHECK_MSG(Command.Arguments == (QStringList{QStringLiteral("-e"), QStringLiteral("ssh"), QStringLiteral("-p"),
     QStringLiteral("2222"), QStringLiteral("joe@example.com")}), Command.Arguments.join(QLatin1Char('|')));
-  CHECK(Command.AskPassFile.isEmpty());
+  CHECK(Command.AskPassSocket.isEmpty());
 
   // OpenSSH options from the site settings
   QString Key = Scratch + QStringLiteral("/id_test");
@@ -249,7 +408,7 @@ static void TestTerminalCommand(const QString & Scratch)
   CHECK(A.contains(QStringLiteral("joe@example.com")));
   CHECK(A.last() == QStringLiteral("!"));
   // !P in the command: no SSH_ASKPASS
-  CHECK(Command.AskPassFile.isEmpty());
+  CHECK(Command.AskPassSocket.isEmpty());
 
   // cancelled prompt: nothing to run, no error
   CHECK(!DesktopIntegration::BuildTerminalCommand(Data, QString(), QString(), false, Command, Error,
@@ -263,17 +422,163 @@ static void TestTerminalCommand(const QString & Scratch)
   // remembered password passed as SSH_ASKPASS (PuttyPassword)
   CHECK(DesktopIntegration::BuildTerminalCommand(Data, QStringLiteral("typed"), QString(), false, Command, Error));
   A = Command.Arguments;
-  CHECK(!Command.AskPassFile.isEmpty());
-  CHECK(ReadFile(Command.AskPassFile) == "typed");
-  CHECK((QFile::permissions(Command.AskPassFile) & (QFileDevice::ReadGroup | QFileDevice::ReadOther)) == 0);
+  CHECK(!Command.AskPassSocket.isEmpty());
+  CHECK(ReadFile(Command.AskPassSocket).isEmpty());
+  CHECK((QFile::permissions(Command.AskPassSocket) & (QFileDevice::ReadGroup | QFileDevice::ReadOther)) == 0);
   int Env = A.indexOf(QStringLiteral("env"));
   CHECK(Env == 1);
   CHECK(A.value(Env + 5) == QStringLiteral("ssh"));
-  CHECK(A.contains(QStringLiteral("NIXSCP_ASKPASS_FILE=") + Command.AskPassFile));
-  QFile::remove(Command.AskPassFile);
+  CHECK(A.contains(QStringLiteral("NIXSCP_ASKPASS_SOCKET=") + Command.AskPassSocket));
+  // what opens the socket travels in the environment alone, away from the
+  // process list and from anyone listing the folder of the socket
+  CHECK((Command.Environment.size() == 1) && Command.Environment.value(0).startsWith(QStringLiteral("NIXSCP_ASKPASS_TOKEN=")));
+  QString OfferedToken = Command.Environment.value(0).section(QLatin1Char('='), 1);
+  CHECK(OfferedToken.size() >= 32);
+  CHECK(!A.join(QLatin1Char(' ')).contains(OfferedToken));
+  CHECK(!Command.AskPassSocket.contains(OfferedToken));
+  // withdrawn (the terminal could not be started)
+  DesktopIntegration::WithdrawAskPassPassword(Command.AskPassSocket);
+  CHECK(!QFileInfo::exists(Command.AskPassSocket));
+  CHECK(DesktopIntegration::FetchAskPassPassword(Command.AskPassSocket, OfferedToken).isEmpty());
+  // S28: the one reader gets the password; nothing is left for a second one
+  {
+    QString Token;
+    QString Socket = DesktopIntegration::OfferAskPassPassword(QStringLiteral("typed \u00e9"), Token);
+    CHECK(!Socket.isEmpty());
+    CHECK(FetchInThread(Socket, Token) == QStringLiteral("typed \u00e9").toUtf8());
+    QCoreApplication::processEvents();
+    CHECK(!QFileInfo::exists(Socket));
+    CHECK(DesktopIntegration::FetchAskPassPassword(Socket, Token).isEmpty());
+  }
+  // finding 11 of the review: a program that finds the socket gets nothing, and
+  // takes nothing away from who has the token
+  {
+    QString Token;
+    QString Socket = DesktopIntegration::OfferAskPassPassword(QStringLiteral("s3cret"), Token);
+    CHECK(!Socket.isEmpty());
+    // listed the folder and connected: no token at all
+    {
+      QLocalSocket Probe;
+      Probe.connectToServer(Socket);
+      CHECK(Probe.waitForConnected(3000));
+      for (int I = 0; I < 20; I++)
+      {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        Probe.waitForReadyRead(10);
+      }
+      CHECK(Probe.readAll().isEmpty());
+    }
+    QString Wrong = Token;
+    Wrong[0] = (Wrong.at(0) == QLatin1Char('0')) ? QLatin1Char('1') : QLatin1Char('0');
+    for (const QString & Guess : {QString(), Wrong, Token.left(Token.size() - 1), Token + QLatin1Char('0'), QString(Token.size() * 4, QLatin1Char('x'))})
+    {
+      CHECK(FetchInThread(Socket, Guess).isEmpty());
+      CHECK(QFileInfo::exists(Socket));
+    }
+    CHECK(FetchInThread(Socket, Token) == "s3cret");
+    QCoreApplication::processEvents();
+    CHECK(!QFileInfo::exists(Socket));
+  }
+  // S28: the real helper, as ssh runs it: a jump host gets nothing, the target the password
+  {
+    QString Program = QCoreApplication::applicationDirPath() + QStringLiteral("/nixscp");
+    if (QFile::exists(Program))
+    {
+      QString Token;
+      QString Socket = DesktopIntegration::OfferAskPassPassword(QStringLiteral("s3cret"), Token);
+      CHECK(!Socket.isEmpty());
+      QString GivenToken = Token;
+      auto AskPass = [&](const QString & Prompt, int & ExitCode)
+      {
+        QProcess Process;
+        QProcessEnvironment Environment = QProcessEnvironment::systemEnvironment();
+        Environment.insert(QStringLiteral("SSH_ASKPASS"), Program);
+        Environment.insert(QStringLiteral("NIXSCP_ASKPASS_SOCKET"), Socket);
+        Environment.insert(QStringLiteral("NIXSCP_ASKPASS_HOST"), QStringLiteral("target.example.com"));
+        Environment.insert(QStringLiteral("NIXSCP_ASKPASS_TOKEN"), GivenToken);
+        Process.setProcessEnvironment(Environment);
+        // no controlling terminal: the helper must not ask whoever runs the tests
+        Process.setChildProcessModifier([]() { setsid(); });
+        Process.start(Program, {Prompt});
+        QElapsedTimer Timer;
+        Timer.start();
+        while ((Process.state() != QProcess::NotRunning) && (Timer.elapsed() < 15000))
+        {
+          QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+          Process.waitForFinished(10);
+        }
+        ExitCode = Process.exitCode();
+        return Process.readAllStandardOutput();
+      };
+      int ExitCode = -1;
+      CHECK(AskPass(QStringLiteral("deploy@jump.example.com's password: "), ExitCode).isEmpty());
+      CHECK(ExitCode == 1);
+      CHECK(AskPass(QStringLiteral("Are you sure you want to continue connecting?"), ExitCode).isEmpty());
+      CHECK(ExitCode == 1);
+      CHECK(QFileInfo::exists(Socket));
+      // the helper itself, run by anyone who found the socket
+      GivenToken.clear();
+      CHECK(AskPass(QStringLiteral("deploy@target.example.com's password: "), ExitCode).isEmpty());
+      CHECK(ExitCode == 1);
+      CHECK(QFileInfo::exists(Socket));
+      GivenToken = Token;
+      CHECK(AskPass(QStringLiteral("deploy@target.example.com's password: "), ExitCode) == "s3cret\n");
+      CHECK(ExitCode == 0);
+      QCoreApplication::processEvents();
+      CHECK(!QFileInfo::exists(Socket));
+      CHECK(AskPass(QStringLiteral("deploy@target.example.com's password: "), ExitCode).isEmpty());
+      CHECK(ExitCode == 1);
+    }
+  }
+  TestAskPassInTerminal();
+  // what Terminal.app gets on macOS: quoted, removed at once, the token in it
+  {
+    QString Script = Scratch + QStringLiteral("/terminal.command");
+    QString Out = Scratch + QStringLiteral("/terminal.out");
+    WriteFile(Script, DesktopIntegration::TerminalScript({QStringLiteral("/bin/sh"), QStringLiteral("-c"),
+      QStringLiteral("printf '%s|%s' \"$NIXSCP_ASKPASS_TOKEN\" \"$1\" > '") + Out + QLatin1Char('\''), QStringLiteral("x"), QStringLiteral("it's $HOME")},
+      {QStringLiteral("NIXSCP_ASKPASS_TOKEN=a'b c=$d")}));
+    QProcess Process;
+    Process.start(QStringLiteral("/bin/sh"), {Script});
+    CHECK(Process.waitForFinished(10000));
+    CHECK_MSG(ReadFile(Out) == "a'b c=$d|it's $HOME", QString::fromUtf8(ReadFile(Out)));
+    CHECK(!QFileInfo::exists(Script));
+  }
+  // S28: what a crash left behind goes at the next start, a fresh one stays
+  {
+    QString Dir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+    if (Dir.isEmpty())
+    {
+      Dir = QDir::tempPath();
+    }
+    QString Stale = QDir(Dir).filePath(QStringLiteral("nixscp-askpass-staletest"));
+    QString Fresh = QDir(Dir).filePath(QStringLiteral("nixscp-askpass-freshtest"));
+    for (const QString & Name : {Stale, Fresh})
+    {
+      QFile File(Name);
+      CHECK(File.open(QIODevice::WriteOnly));
+      File.write("left behind");
+    }
+    QFile StaleFile(Stale);
+    CHECK(StaleFile.open(QIODevice::ReadWrite));
+    CHECK(StaleFile.setFileTime(QDateTime::currentDateTimeUtc().addSecs(-3600), QFileDevice::FileModificationTime));
+    StaleFile.close();
+    DesktopIntegration::RemoveStaleAskPassFiles();
+    CHECK(!QFileInfo::exists(Stale));
+    CHECK(QFileInfo::exists(Fresh));
+    QFile::remove(Fresh);
+  }
   Config.PuttyPassword = false;
   CHECK(DesktopIntegration::BuildTerminalCommand(Data, QStringLiteral("typed"), QString(), false, Command, Error));
-  CHECK(Command.AskPassFile.isEmpty());
+  CHECK(Command.AskPassSocket.isEmpty());
+
+  // PuTTY itself: its switches, no OpenSSH appended
+  Config.PuttyPath = QStringLiteral("/opt/putty/putty");
+  CHECK(DesktopIntegration::BuildTerminalCommand(Data, QString(), QString(), false, Command, Error));
+  CHECK(Command.Program == QStringLiteral("/opt/putty/putty"));
+  CHECK(Command.Arguments.first() == QStringLiteral("-ssh"));
+  CHECK(!Command.Arguments.contains(QStringLiteral("ssh")));
+  CHECK(Command.Arguments.last() == Data.HostName);
 
   // command without site patterns: the destination is added (as PuTTY -load)
   Config.PuttyPath = QStringLiteral("x-terminal-emulator -e ssh");
@@ -856,6 +1161,17 @@ static void TestCommanderLocalDrop(const QString & Scratch)
 
 int main(int argc, char ** argv)
 {
+#ifdef Q_OS_LINUX
+  TestSshServer::RunIfAsked(argc, argv);
+  // ssh runs what names itself SSH_ASKPASS, here this program: on to the real one
+  if (qEnvironmentVariableIsSet("NIXSCP_ASKPASS_SOCKET"))
+  {
+    QByteArray Helper = QFileInfo(QString::fromLocal8Bit(argv[0])).absolutePath().toLocal8Bit() + "/nixscp";
+    qputenv("SSH_ASKPASS", Helper);
+    execv(Helper.constData(), argv);
+    return 1;
+  }
+#endif
   QTemporaryDir Scratch;
   qputenv("XDG_CONFIG_HOME", Scratch.filePath(QStringLiteral("config")).toUtf8());
   qputenv("XDG_DATA_HOME", Scratch.filePath(QStringLiteral("data")).toUtf8());
@@ -871,6 +1187,9 @@ int main(int argc, char ** argv)
 
   QString Path = Scratch.path();
   TestTerminalCommand(Path);
+#ifdef Q_OS_LINUX
+  TestAskPassWithRealSsh(Path);
+#endif
   TestExploreAndPlaces(Path);
   TestAttention(Path);
   TestDesktopIcon(Path);

@@ -200,6 +200,7 @@ struct ConfigurationData
   int LocalPortNumberMin = 0;                  // LocalPortNumberMin
   int LocalPortNumberMax = 0;                  // LocalPortNumberMax
   bool TryFtpWhenSshFails = true;              // TryFtpWhenSshFails
+  QString MimeTypes;                           // MimeTypes: "<mask>=<type>,..." overriding the system's
 
   // ---- Security ----
   // (UseMasterPassword / MasterPasswordVerifier are kept by core/Security.h)
@@ -269,7 +270,8 @@ public:
   // and replacing it (the root policies section of Data is ignored)
   IniFile ExportData();
   bool ImportData(IniFile Data, QString * Error = nullptr);
-  // Machine-wide files (for tests; default: nixscp/nixscp.ini in $XDG_CONFIG_DIRS)
+  // Machine-wide files (for tests; default: nixscp/nixscp.ini in $XDG_CONFIG_DIRS,
+  // on macOS also /Library/Application Support/NixSCP/nixscp.ini)
   QStringList SystemIniFileNames() const;
   void SetSystemIniFileNames(const QStringList & FileNames);
 
@@ -298,6 +300,11 @@ public:
   // Whole WinSCP.ini compatible file, for components keeping their own
   // sections (bookmarks, history...); saved by Save()
   IniFile & Ini() { return FIni; }
+  // Interface\LastStoredSession: what the Login dialog had selected or, after
+  // the main window was closed, the workspace saved then (written straight to
+  // the ini file, as the Login dialog does; saved by Save())
+  QString LastStoredSession();
+  void SetLastStoredSession(const QString & Name);
   CopyParam & DefaultCopyParam() { return FCopyParam; }
 
   // Editor to use for FileName (remote or local name; matched against the

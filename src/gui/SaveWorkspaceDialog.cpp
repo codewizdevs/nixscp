@@ -1,6 +1,7 @@
 // Port of WinSCP source/forms/Custom.cpp (TSaveWorkspaceDialog) and
 // source/forms/CustomScpExplorer.cpp (SaveWorkspace, DoSaveWorkspace)
 #include "gui/SaveWorkspaceDialog.h"
+#include "gui/DesktopIntegration.h"
 #include "gui/HelpSystem.h"
 
 #include "core/Configuration.h"
@@ -50,6 +51,10 @@ SaveWorkspaceDialog::SaveWorkspaceDialog(QWidget * Parent, const StoredSessionLi
   Layout->addWidget(SavePasswordsCheck);
 
   CreateShortcutCheck = new QCheckBox(QStringLiteral("&Create desktop shortcut"), this);
+  if (!DesktopIntegration::CanCreateSessionShortcut())
+  {
+    CreateShortcutCheck->hide();
+  }
   Layout->addWidget(CreateShortcutCheck);
 
   EnableAutoSaveCheck = new QCheckBox(QStringLiteral("Enable &automatic saving of this workspace"), this);

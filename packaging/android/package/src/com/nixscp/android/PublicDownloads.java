@@ -19,17 +19,19 @@ import java.io.OutputStream;
 
 public class PublicDownloads
 {
-    // Copies a downloaded file; returns where it went ("" on failure)
-    public static String save(Context context, String path, String mimeType)
+    // Copies a downloaded file, into a folder of Downloads/NixSCP when one is
+    // given ("a/b"); returns where it went ("" on failure)
+    public static String save(Context context, String path, String mimeType, String folder)
     {
         File source = new File(path);
+        String place = "NixSCP" + (folder.isEmpty() ? "" : "/" + folder);
         try {
             if (Build.VERSION.SDK_INT >= 29) {
                 ContentResolver resolver = context.getContentResolver();
                 ContentValues values = new ContentValues();
                 values.put(MediaStore.MediaColumns.DISPLAY_NAME, source.getName());
                 values.put(MediaStore.MediaColumns.MIME_TYPE, mimeType);
-                values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/NixSCP");
+                values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/" + place);
                 values.put(MediaStore.MediaColumns.IS_PENDING, 1);
                 Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
                 if (uri == null)
@@ -40,9 +42,9 @@ public class PublicDownloads
                 values.clear();
                 values.put(MediaStore.MediaColumns.IS_PENDING, 0);
                 resolver.update(uri, values, null, null);
-                return Environment.DIRECTORY_DOWNLOADS + "/NixSCP/" + source.getName();
+                return Environment.DIRECTORY_DOWNLOADS + "/" + place + "/" + source.getName();
             }
-            File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "NixSCP");
+            File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), place);
             dir.mkdirs();
             File target = new File(dir, source.getName());
             try (InputStream in = new FileInputStream(source); OutputStream out = new FileOutputStream(target)) {

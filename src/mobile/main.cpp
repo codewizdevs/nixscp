@@ -2,6 +2,7 @@
 // Saved sites (search, favourites), the phone's and the server's files side
 // by side (or as tabs), transfers with progress. The encrypted configuration
 // and NixSCP Pro sign-in follow.
+#include "core/ConfigVault.h"
 #include "core/Configuration.h"
 #include "core/CloudSync.h"
 #include "core/TeamSync.h"
@@ -13,6 +14,7 @@
 #include "mobile/LocalBrowser.h"
 #include "mobile/MobileSettings.h"
 #include "mobile/MobileUserInterface.h"
+#include "mobile/PrivateState.h"
 #include "mobile/RemoteSession.h"
 #include "mobile/SessionManager.h"
 #include "mobile/SiteChecker.h"
@@ -20,11 +22,13 @@
 #include "mobile/SitesModel.h"
 #include "mobile/SystemInsets.h"
 
+#include <QElapsedTimer>
 #include <QFontDatabase>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
+#include <QStandardPaths>
 
 #include <libssh/libssh.h>
 
@@ -41,6 +45,23 @@ static bool RunningInEmulator()
 }
 #endif
 
+namespace
+{
+// Before everything that uses libssh is created, so after it is gone
+struct SshLibrary
+{
+  bool Finalize = true;
+  SshLibrary() { ssh_init(); }
+  ~SshLibrary()
+  {
+    if (Finalize)
+    {
+      ssh_finalize();
+    }
+  }
+};
+}
+
 int main(int argc, char * argv[])
 {
 #ifdef Q_OS_ANDROID
@@ -53,12 +74,24 @@ int main(int argc, char * argv[])
   QGuiApplication::setApplicationName(QStringLiteral("NixSCP"));
   QGuiApplication::setOrganizationName(QStringLiteral("NixSCP"));
   QGuiApplication::setApplicationVersion(QStringLiteral(PROJECT_VERSION));
-  ssh_init();
+  // file lists, terminals and keys stay out of screenshots and the recents
+  // screen; debug builds on request (tests take screenshots)
+#ifndef QT_NO_DEBUG
+  if (!qEnvironmentVariableIsSet("NIXSCP_ALLOW_SCREENSHOTS"))
+#endif
+  {
+    AndroidFiles::SecureWindow();
+  }
+  SshLibrary Ssh;
 
   // loaded by the lock: an encrypted configuration (NixSCP Pro) is opened first
   Configuration & Config = Configuration::Instance();
-  // decrypted SSH keys of an earlier run
-  KeyStore::CleanTemporary();
+  // the SSH keys follow a new data key, like the configuration: known before the
+  // first unlock, which finishes what a crash left of such a change
+  ConfigVault::AddSealedFolder(KeyStore::Folder());
+  // what a killed app left: server files in the cache, a host name just accepted
+  MobileCache::Clean(ConfigVault::IsSealedFile(Config.IniFileName()));
+  KeyStore::HashKnownHosts(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/.ssh/known_hosts"));
 
   QQuickStyle::setStyle(QStringLiteral("Material"));
   MobileUserInterface UI;
@@ -77,6 +110,8 @@ int main(int argc, char * argv[])
   AppLock Lock(Config.IniFileName(), [&]()
   {
     Config.Load();
+    Settings.Private().Load();
+    Sites.LoadState();
     Settings.ApplyToConfiguration();
     // NixSCP Pro: settings sync and teams (inactive until signed in)
     CloudSync::Instance().Initialize(Config);
@@ -87,9 +122,20 @@ int main(int argc, char * argv[])
     Teams.Start();
     KeyStore::SealAll();
   });
-  // pulled settings, team sites: the list again; a key just set up: the SSH keys encrypted
+  // pulled settings, team sites: the list again; a key just set up: what the
+  // phone keeps encrypted, and no thumbnails of server files left behind
   QObject::connect(&Pro, &ProAccount::sitesChanged, &Sites, &SitesModel::reload);
-  QObject::connect(&Pro, &ProAccount::changed, &Keys, []() { KeyStore::SealAll(); });
+  QObject::connect(&TeamSync::Instance(), &TeamSync::SiteMoved, &Sites, &SitesModel::SiteMoved);
+  QObject::connect(&Pro, &ProAccount::sitesChanged, &Settings, &MobileSettings::ApplyToConfiguration);
+  QObject::connect(&Pro, &ProAccount::changed, &Keys, [&Settings]()
+  {
+    KeyStore::SealAll();
+    Settings.Private().Reseal();
+    if (ConfigVault::Enabled())
+    {
+      MobileCache::RemoveSharedThumbnails();
+    }
+  });
 
   QQmlApplicationEngine Engine;
   Engine.rootContext()->setContextProperty(QStringLiteral("ui"), &UI);
@@ -133,6 +179,16 @@ int main(int argc, char * argv[])
   // the intent NixSCP was started with (shared files, a site's shortcut)
   Files.Start();
   int Result = QGuiApplication::exec();
-  ssh_finalize();
+  // every connection ends before libssh does: closing them only starts that
+  Sessions.CloseAll();
+  QElapsedTimer Waited;
+  Waited.start();
+  while ((RemoteSession::Closing() > 0) && !Waited.hasExpired(5000))
+  {
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+  }
+  // one still stuck in the network: libssh stays, the process is ending anyway
+  Ssh.Finalize = (RemoteSession::Closing() == 0);
   return Result;
 }

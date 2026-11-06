@@ -192,7 +192,7 @@ public:
   // Closes the Authenticate window (connected, failed or aborted). GUI thread.
   void EndConnecting();
   // TTerminal::Information: adds a line to the connection log; any thread
-  void Information(const QString & Message);
+  void Information(const QString & Message) override;
   AuthenticateDialog * Authenticate() const;
 
   // Password last entered at a password prompt; background (queue) connections

@@ -152,6 +152,13 @@ Page {
             enabled: !session.busy
             bottomMargin: 96 + page.keyboardHeight
             onMovementStarted: Qt.inputMethod.hide()
+            // the list is rebuilt for a star, a folded section or new sites: it stays where it was
+            property real keptY: 0
+            Connections {
+                target: sites
+                function onModelAboutToBeReset() { list.keptY = list.contentY }
+                function onModelReset() { Qt.callLater(function() { list.contentY = Math.min(list.keptY, Math.max(list.originY, list.originY + list.contentHeight - list.height)) }) }
+            }
             delegate: Item {
                 id: row
                 required property bool isHeader

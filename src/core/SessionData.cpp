@@ -6,8 +6,10 @@
 #include <QCollator>
 #include <QDir>
 #include <QRegularExpression>
+#include <QSet>
 #include <QUrl>
 
+#include <algorithm>
 #include <cstring>
 
 static const QString SessionsKey = QStringLiteral("Sessions");
@@ -220,6 +222,7 @@ void SessionData::Default()
   MinTlsVersion = tlsDefaultMin;
   MaxTlsVersion = tlsMax;
   CompleteTlsShutdown = asAuto;
+  ProtocolFeatures.clear();
 
   S3DefaultRegion.clear();
   S3SessionToken.clear();
@@ -258,6 +261,7 @@ void SessionData::Default()
   TunnelUserName.clear();
   TunnelPassword.clear();
   TunnelPublicKeyFile.clear();
+  TunnelPassphrase.clear();
   TunnelLocalPortNumber = 0;
   TunnelHostKey.clear();
 
@@ -290,6 +294,10 @@ void SessionData::Default()
   }
 
   KnownHostsFile.clear();
+  RequireDirectories = false;
+  HostKeyFromUrl = false;
+  TunnelHostKeyFromUrl = false;
+  NoExpansion = false;
   FRawValues.clear();
 }
 
@@ -539,6 +547,20 @@ void SessionData::Load(IniStorage & Storage)
     TunnelPassword = Security::DecryptPassword(Storage.ReadStringRaw(QStringLiteral("TunnelPassword"), QString()).toLatin1(), TunnelUserName + TunnelHostName);
   }
   TunnelPublicKeyFile = Storage.ReadString(QStringLiteral("TunnelPublicKeyFile"), TunnelPublicKeyFile);
+  // Contrary to main session passphrase (which has -passphrase switch in scripting),
+  // the tunnel passphrase is loaded, as there's no other way to provide it in scripting
+  if (!LoadPasswords)
+  {
+    // see Password
+  }
+  else if (Storage.ValueExists(QStringLiteral("TunnelPassphrasePlain")))
+  {
+    TunnelPassphrase = Storage.ReadString(QStringLiteral("TunnelPassphrasePlain"), TunnelPassphrase);
+  }
+  else if (Storage.ValueExists(QStringLiteral("TunnelPassphrase")))
+  {
+    TunnelPassphrase = Security::DecryptPassword(Storage.ReadStringRaw(QStringLiteral("TunnelPassphrase"), QString()).toLatin1(), TunnelPublicKeyFile);
+  }
   TunnelLocalPortNumber = Storage.ReadInteger(QStringLiteral("TunnelLocalPortNumber"), TunnelLocalPortNumber);
   TunnelHostKey = Storage.ReadString(QStringLiteral("TunnelHostKey"), TunnelHostKey);
 
@@ -560,7 +582,9 @@ void SessionData::Load(IniStorage & Storage)
   MinTlsVersion = static_cast<TTlsVersion>(Storage.ReadInteger(QStringLiteral("MinTlsVersion"), MinTlsVersion));
   MaxTlsVersion = static_cast<TTlsVersion>(Storage.ReadInteger(QStringLiteral("MaxTlsVersion"), MaxTlsVersion));
   CompleteTlsShutdown = ReadAutoSwitch(Storage, QStringLiteral("CompleteTlsShutdown"), CompleteTlsShutdown);
+  ProtocolFeatures = Storage.ReadString(QStringLiteral("ProtocolFeatures"), ProtocolFeatures);
 
+  NoExpansion = Storage.ReadBool(QStringLiteral("NoExpansion"), NoExpansion);
   WebDavLiberalEscaping = Storage.ReadBool(QStringLiteral("WebDavLiberalEscaping"), WebDavLiberalEscaping);
   WebDavAuthLegacy = Storage.ReadBool(QStringLiteral("WebDavAuthLegacy"), WebDavAuthLegacy);
 
@@ -610,7 +634,15 @@ void SessionData::Save(IniStorage & Storage, const SessionData * Default) const
   WRITE_DATA(Bool, AgentFwd);
   WRITE_DATA(Bool, AuthKI);
   WRITE_DATA(Bool, AuthKIPassword);
-  WRITE_DATA_EX(String, "SshHostKey", HostKey);
+  // Saved, what a URL said would be a configured key, which outranks known_hosts
+  if (HostKeyFromUrl)
+  {
+    Storage.DeleteValue(QStringLiteral("SshHostKey"));
+  }
+  else
+  {
+    WRITE_DATA_EX(String, "SshHostKey", HostKey);
+  }
   WRITE_DATA(String, Note);
   WRITE_DATA(Integer, AgentAccess);
   WRITE_DATA(Integer, AgentPermissions);
@@ -752,7 +784,14 @@ void SessionData::Save(IniStorage & Storage, const SessionData * Default) const
   WRITE_DATA(String, TunnelUserName);
   WRITE_DATA(String, TunnelPublicKeyFile);
   WRITE_DATA(Integer, TunnelLocalPortNumber);
-  WRITE_DATA(String, TunnelHostKey);
+  if (TunnelHostKeyFromUrl)
+  {
+    Storage.DeleteValue(QStringLiteral("TunnelHostKey"));
+  }
+  else
+  {
+    WRITE_DATA(String, TunnelHostKey);
+  }
 
   WRITE_DATA(Bool, FtpPasvMode);
   WRITE_DATA_EX(Integer, "FtpForcePasvIp2", FtpForcePasvIp);
@@ -769,6 +808,8 @@ void SessionData::Save(IniStorage & Storage, const SessionData * Default) const
   WRITE_DATA(Bool, SslSessionReuse);
   WRITE_DATA(String, TlsCertificateFile);
   WRITE_DATA(Integer, FtpProxyLogonType);
+  WRITE_DATA(String, ProtocolFeatures);
+  WRITE_DATA(Bool, NoExpansion);
   WRITE_DATA(Integer, MinTlsVersion);
   WRITE_DATA(Integer, MaxTlsVersion);
   WRITE_DATA(Integer, CompleteTlsShutdown);
@@ -810,6 +851,15 @@ void SessionData::Save(IniStorage & Storage, const SessionData * Default) const
   else
   {
     Storage.WriteStringRaw(QStringLiteral("TunnelPassword"), QString::fromLatin1(Security::EncryptPassword(TunnelPassword, TunnelUserName + TunnelHostName)));
+  }
+  Storage.DeleteValue(QStringLiteral("TunnelPassphrasePlain"));
+  if (TunnelPassphrase.isEmpty() || DisablePasswordStoring)
+  {
+    Storage.DeleteValue(QStringLiteral("TunnelPassphrase"));
+  }
+  else
+  {
+    Storage.WriteStringRaw(QStringLiteral("TunnelPassphrase"), QString::fromLatin1(Security::EncryptPassword(TunnelPassphrase, TunnelPublicKeyFile)));
   }
 }
 
@@ -1094,6 +1144,10 @@ QString SessionData::ExpandEnvironmentVariables(const QString & Str)
 
 void SessionData::ExpandEnvironmentVariables()
 {
+  if (NoExpansion)
+  {
+    return;
+  }
   // TSessionData::ExpandEnvironmentVariables, plus the other local paths
   // WinSCP reads through Get*Expanded
   HostName = ExpandEnvironmentVariables(HostName);
@@ -1106,6 +1160,38 @@ void SessionData::ExpandEnvironmentVariables()
   TlsCertificateFile = ExpandEnvironmentVariables(TlsCertificateFile);
   LocalDirectory = ExpandEnvironmentVariables(LocalDirectory);
   OtherLocalDirectory = ExpandEnvironmentVariables(OtherLocalDirectory);
+}
+
+void SessionData::ProtectFromExpansion(const SessionData & Base)
+{
+  for (QString SessionData::* Field : {&SessionData::HostName, &SessionData::UserName, &SessionData::PublicKeyFile,
+         &SessionData::DetachedCertificate, &SessionData::TunnelHostName, &SessionData::TunnelUserName,
+         &SessionData::TunnelPublicKeyFile, &SessionData::TlsCertificateFile, &SessionData::LocalDirectory,
+         &SessionData::OtherLocalDirectory})
+  {
+    if (!Base.NoExpansion && (this->*Field == Base.*Field))
+    {
+      this->*Field = ExpandEnvironmentVariables(this->*Field);
+    }
+  }
+  NoExpansion = true;
+}
+
+bool SessionData::IsS3HostName(const QString & HostName)
+{
+  // IsDomainOrSubdomain, as TSessionData::ParseUrl. Any amazonaws.com host
+  // rather than only s3.amazonaws.com, so that regional endpoints are included.
+  auto IsDomainOrSubdomain = [&HostName](const QString & Domain)
+  {
+    return (HostName.compare(Domain, Qt::CaseInsensitive) == 0) ||
+      HostName.endsWith(QLatin1Char('.') + Domain, Qt::CaseInsensitive);
+  };
+  return
+    IsDomainOrSubdomain(QStringLiteral("amazonaws.com")) ||
+    IsDomainOrSubdomain(QStringLiteral("digitaloceanspaces.com")) ||
+    IsDomainOrSubdomain(QStringLiteral("storage.googleapis.com")) ||
+    IsDomainOrSubdomain(QStringLiteral("r2.cloudflarestorage.com")) ||
+    (IsDomainOrSubdomain(QStringLiteral("oraclecloud.com")) && HostName.contains(QStringLiteral(".compat.objectstorage."), Qt::CaseInsensitive));
 }
 
 static bool IsHexChar(QChar C)
@@ -1204,6 +1290,7 @@ bool SessionData::IsIPv6Literal(const QString & HostName)
 bool SessionData::ParseUrl(const QString & AUrl, int & ParsedInfo)
 {
   // TSessionData::ParseUrl with pufPreferProtocol, no stored sites, no options
+  const SessionData Original = *this;
   QString Url = AUrl.trimmed();
   ParsedInfo = 0;
   bool ProtocolDefined = true;
@@ -1335,11 +1422,7 @@ bool SessionData::ParseUrl(const QString & AUrl, int & ParsedInfo)
     }
     else if (ProtocolDefined)
     {
-      if ((AFSProtocol == fsWebDAV) &&
-          (HostName.endsWith(QStringLiteral("amazonaws.com"), Qt::CaseInsensitive) ||
-           HostName.endsWith(QStringLiteral("digitaloceanspaces.com"), Qt::CaseInsensitive) ||
-           (HostName.compare(QStringLiteral("storage.googleapis.com"), Qt::CaseInsensitive) == 0) ||
-           HostName.endsWith(QStringLiteral(".r2.cloudflarestorage.com"), Qt::CaseInsensitive)))
+      if ((AFSProtocol == fsWebDAV) && IsS3HostName(HostName))
       {
         AFSProtocol = fsS3;
       }
@@ -1361,14 +1444,15 @@ bool SessionData::ParseUrl(const QString & AUrl, int & ParsedInfo)
       QString ConnectionParamName = CutToChar(ConnectionParam, QLatin1Char('='), false);
       if (ConnectionParamName.compare(QStringLiteral("fingerprint"), Qt::CaseInsensitive) == 0)
       {
-        HostKey = DecodeUrlChars(ConnectionParam);
+        HostKey = UrlHostKeys(DecodeUrlChars(ConnectionParam));
+        HostKeyFromUrl = true;
       }
       else if (ConnectionParamName.startsWith(QStringLiteral("x-"), Qt::CaseInsensitive))
       {
         RawSettings.append(DecodeUrlChars(ConnectionParamName.mid(2)) + QLatin1Char('=') + DecodeUrlChars(ConnectionParam));
       }
     }
-    if (!RawSettings.isEmpty() && ApplyRawSettings(RawSettings))
+    if (!RawSettings.isEmpty() && ApplyUrlSettings(RawSettings))
     {
       ParsedInfo |= ParsedUnsafeSettings;
     }
@@ -1388,6 +1472,8 @@ bool SessionData::ParseUrl(const QString & AUrl, int & ParsedInfo)
   {
     FSProtocol = AFSProtocol;
   }
+  // What the URL has set is never expanded (host and user names go to the server)
+  ProtectFromExpansion(Original);
   return true;
 }
 
@@ -1396,8 +1482,53 @@ static bool IsRawSettingKey(const QString & Key)
 {
   static const QStringList RawKeys = {
     QStringLiteral("ProxyTelnetCommand"), QStringLiteral("TimeDifference"), QStringLiteral("Password"),
-    QStringLiteral("ProxyPasswordEnc"), QStringLiteral("TunnelPassword"), QStringLiteral("EncryptKey") };
+    QStringLiteral("ProxyPasswordEnc"), QStringLiteral("TunnelPassword"), QStringLiteral("TunnelPassphrase"),
+    QStringLiteral("EncryptKey") };
   return RawKeys.contains(Key, Qt::CaseInsensitive);
+}
+
+QStringList SessionData::RawSettingsForUrl() const
+{
+  SessionData FactoryDefaults;
+  SessionData Copy = *this;
+  Copy.FSProtocol = FactoryDefaults.FSProtocol;
+  Copy.HostName = FactoryDefaults.HostName;
+  Copy.PortNumber = FactoryDefaults.PortNumber;
+  Copy.UserName = FactoryDefaults.UserName;
+  Copy.Password = FactoryDefaults.Password;
+  Copy.Ftps = FactoryDefaults.Ftps;
+  Copy.HostKey = FactoryDefaults.HostKey;
+  // TSessionData::ResetNonCoreData
+  Copy.RemoteDirectory = FactoryDefaults.RemoteDirectory;
+  Copy.LocalDirectory = FactoryDefaults.LocalDirectory;
+  Copy.OtherLocalDirectory = FactoryDefaults.OtherLocalDirectory;
+  Copy.SynchronizeBrowsing = FactoryDefaults.SynchronizeBrowsing;
+  Copy.Color = FactoryDefaults.Color;
+  Copy.UpdateDirectories = FactoryDefaults.UpdateDirectories;
+  Copy.Note = FactoryDefaults.Note;
+  Copy.AgentAccess = FactoryDefaults.AgentAccess;
+  Copy.AgentPermissions = FactoryDefaults.AgentPermissions;
+  Copy.AgentName = FactoryDefaults.AgentName;
+  Copy.AgentAllow = FactoryDefaults.AgentAllow;
+  Copy.AgentDeny = FactoryDefaults.AgentDeny;
+  Copy.AgentRecord = FactoryDefaults.AgentRecord;
+  Copy.PortForwards = FactoryDefaults.PortForwards;
+  Copy.NoExpansion = FactoryDefaults.NoExpansion;
+  QStringList Result = Copy.SaveToOptions(&FactoryDefaults);
+  // SaveName: HasSessionName() && (Name != DefaultSessionName)
+  if (!Name.isEmpty() && (Name != DefaultSessionName()) && !IsWorkspace)
+  {
+    bool HasName = false;
+    for (const QString & S : Result)
+    {
+      HasName = HasName || S.startsWith(QStringLiteral("Name="), Qt::CaseInsensitive);
+    }
+    if (!HasName)
+    {
+      Result.prepend(QStringLiteral("Name=") + Name);
+    }
+  }
+  return Result;
 }
 
 QStringList SessionData::SaveToOptions(const SessionData * Default) const
@@ -1427,6 +1558,11 @@ QStringList SessionData::SaveToOptions(const SessionData * Default) const
       OutKey = QStringLiteral("TunnelPasswordPlain");
       Value = TunnelPassword;
     }
+    else if (Key == QStringLiteral("TunnelPassphrase"))
+    {
+      OutKey = QStringLiteral("TunnelPassphrasePlain");
+      Value = TunnelPassphrase;
+    }
     else if (IsRawSettingKey(Key))
     {
       Value = Storage.ReadStringRaw(Key, QString());
@@ -1438,6 +1574,77 @@ QStringList SessionData::SaveToOptions(const SessionData * Default) const
     Result.append(OutKey + QLatin1Char('=') + Value);
   }
   return Result;
+}
+
+bool SessionData::IsUrlSetting(const QString & Key)
+{
+  static const QStringList Keys = {
+    // connection
+    QStringLiteral("PingType"), QStringLiteral("PingInterval"), QStringLiteral("PingIntervalSecs"), QStringLiteral("PingIntervalSec"),
+    QStringLiteral("Timeout"), QStringLiteral("AddressFamily"), QStringLiteral("TcpNoDelay"), QStringLiteral("SendBuf"),
+    QStringLiteral("SshSendBuf"), QStringLiteral("SshSimple"), QStringLiteral("Compression"), QStringLiteral("RekeyBytes"),
+    QStringLiteral("RekeyTime"),
+    // directories and listings
+    QStringLiteral("UpdateDirectories"), QStringLiteral("CacheDirectories"), QStringLiteral("CacheDirectoryChanges"),
+    QStringLiteral("PreserveDirectoryChanges"), QStringLiteral("ResolveSymlinks"), QStringLiteral("FollowDirectorySymlinks"),
+    QStringLiteral("ConsiderDST"), QStringLiteral("TimeDifference"), QStringLiteral("TimeDifferenceAuto"), QStringLiteral("EOLType"),
+    QStringLiteral("TrimVMSVersions"), QStringLiteral("VMSAllRevisions"), QStringLiteral("Utf"), QStringLiteral("SFTPUtfBug"),
+    // SCP
+    QStringLiteral("ClearAliases"), QStringLiteral("UnsetNationalVars"), QStringLiteral("IgnoreLsWarnings"),
+    QStringLiteral("SCPLsFullTime"), QStringLiteral("Scp1Compatibility"), QStringLiteral("LookupUserGroups2"),
+    QStringLiteral("ExitCode1IsError"),
+    // SFTP
+    QStringLiteral("SFTPSymlinkBug"), QStringLiteral("SFTPSignedTSBug"), QStringLiteral("SFTPMaxVersion"),
+    QStringLiteral("SFTPMaxPacketSize"), QStringLiteral("SFTPDownloadQueue"), QStringLiteral("SFTPUploadQueue"),
+    QStringLiteral("SFTPListingQueue"), QStringLiteral("SFTPRealPath"), QStringLiteral("UsePosixRename"),
+    // FTP
+    QStringLiteral("FtpPasvMode"), QStringLiteral("FtpUseMlsd"), QStringLiteral("FtpPingInterval"), QStringLiteral("FtpPingType"),
+    QStringLiteral("FtpTransferActiveImmediately2"), QStringLiteral("FtpListAll"), QStringLiteral("FtpHost"),
+    QStringLiteral("FtpWorkFromCwd"), QStringLiteral("FtpDeleteFromCwd"), QStringLiteral("FtpAnyCodeForPwd"),
+    // WebDAV and S3
+    QStringLiteral("WebDavLiberalEscaping"), QStringLiteral("S3DefaultRegion"), QStringLiteral("S3UrlStyle"), QStringLiteral("S3MaxKeys") };
+  return Keys.contains(Key.trimmed(), Qt::CaseInsensitive);
+}
+
+QString SessionData::UrlHostKeys(const QString & Keys)
+{
+  QStringList Result;
+  for (const QString & Entry : Keys.split(QLatin1Char(';'), Qt::SkipEmptyParts))
+  {
+    QString Key = Entry.trimmed();
+    if ((Key != QStringLiteral("*")) && (Key.compare(QStringLiteral("acceptnew"), Qt::CaseInsensitive) != 0))
+    {
+      Result.append(Key);
+    }
+  }
+  return Result.join(QLatin1Char(';'));
+}
+
+QString SessionData::TrustedHostKey() const
+{
+  return HostKeyFromUrl ? UrlHostKeys(HostKey) : HostKey;
+}
+
+bool SessionData::ApplyUrlSettings(const QStringList & Settings)
+{
+  QString OldHostKey = HostKey;
+  QString OldTunnelHostKey = TunnelHostKey;
+  bool Unsafe = ApplyRawSettings(Settings);
+  for (const QString & Setting : Settings)
+  {
+    Unsafe = Unsafe || !IsUrlSetting(Setting.left(Setting.indexOf(QLatin1Char('='))));
+  }
+  if (HostKey != OldHostKey)
+  {
+    HostKey = UrlHostKeys(HostKey);
+    HostKeyFromUrl = true;
+  }
+  if (TunnelHostKey != OldTunnelHostKey)
+  {
+    TunnelHostKey = UrlHostKeys(TunnelHostKey);
+    TunnelHostKeyFromUrl = true;
+  }
+  return Unsafe;
 }
 
 bool SessionData::ApplyRawSettings(const QStringList & Settings)
@@ -1474,10 +1681,12 @@ bool SessionData::ApplyRawSettings(const QStringList & Settings)
   SessionData Before = *this;
   QMap<QString, QString> OldRawValues = FRawValues;
   QString AName = Name;
-  QString AKnownHostsFile = KnownHostsFile;
   Load(Storage);
   Name = AName;
-  KnownHostsFile = AKnownHostsFile;
+  // The trust store of the session is not for a URL or raw settings to choose
+  KnownHostsFile = Before.KnownHostsFile;
+  LogicalHostName = Before.LogicalHostName;
+  NoExpansion = Before.NoExpansion;
   // Agent access is granted in NixSCP only, never by a URL or raw settings
   AgentAccess = Before.AgentAccess;
   AgentPermissions = Before.AgentPermissions;
@@ -1486,6 +1695,9 @@ bool SessionData::ApplyRawSettings(const QStringList & Settings)
   AgentDeny = Before.AgentDeny;
   AgentRecord = Before.AgentRecord;
   PortForwards = Before.PortForwards;
+  // What is written here is meant: a key of the URL it replaces is no longer one
+  HostKeyFromUrl = HostKeyFromUrl && (HostKey == Before.HostKey);
+  TunnelHostKeyFromUrl = TunnelHostKeyFromUrl && (TunnelHostKey == Before.TunnelHostKey);
   for (auto It = OldRawValues.cbegin(); It != OldRawValues.cend(); ++It)
   {
     if (!FRawValues.contains(It.key()))
@@ -1627,6 +1839,29 @@ int StoredSessionList::CompareLogicalText(const QString & A, const QString & B)
     C.setCaseSensitivity(Qt::CaseInsensitive);
     return C;
   }();
+  // Without ICU (Android) the collator compares code points and ignores the
+  // case setting, so uppercase sorts first: the text is folded by hand there
+  static thread_local const bool Collating =
+    !qEnvironmentVariableIsSet("NIXSCP_NO_COLLATOR") && (Collator.compare(QStringLiteral("a"), QStringLiteral("B")) < 0);
+  auto IsAscii = [](QStringView Text)
+  {
+    return std::all_of(Text.begin(), Text.end(), [](QChar C) { return C.unicode() < 0x80; });
+  };
+  // the letter without its case and accents: "Č" as "c", "Đ" (which has no decomposition) as "d"
+  auto Folded = [](QStringView Text)
+  {
+    QString Result = Text.toString().normalized(QString::NormalizationForm_D);
+    Result.removeIf([](QChar C) { return C.category() == QChar::Mark_NonSpacing; });
+    return Result.toCaseFolded().replace(QChar(0x0111), QLatin1Char('d'));
+  };
+  auto CompareText = [&](QStringView X, QStringView Y) -> int
+  {
+    if (Collating)
+    {
+      return Collator.compare(X, Y);
+    }
+    return (IsAscii(X) && IsAscii(Y)) ? X.compare(Y, Qt::CaseInsensitive) : QStringView(Folded(X)).compare(Folded(Y));
+  };
   auto IsDigit = [](QChar C) { return (C >= QLatin1Char('0')) && (C <= QLatin1Char('9')); };
   int Result = 0;
   qsizetype IA = 0, IB = 0;
@@ -1645,7 +1880,7 @@ int StoredSessionList::CompareLogicalText(const QString & A, const QString & B)
     }
     else if (DigitA != IsDigit(B[IB]))
     {
-      Result = Collator.compare(QStringView(A).sliced(IA), QStringView(B).sliced(IB));
+      Result = CompareText(QStringView(A).sliced(IA), QStringView(B).sliced(IB));
       if (Result == 0)
       {
         Result = DigitA ? -1 : 1;
@@ -1653,7 +1888,7 @@ int StoredSessionList::CompareLogicalText(const QString & A, const QString & B)
     }
     else
     {
-      Result = Collator.compare(QStringView(A).sliced(IA, EA - IA), QStringView(B).sliced(IB, EB - IB));
+      Result = CompareText(QStringView(A).sliced(IA, EA - IA), QStringView(B).sliced(IB, EB - IB));
     }
     IA = EA;
     IB = EB;
@@ -1717,6 +1952,7 @@ void StoredSessionList::SetDefaultSettings(const SessionData & Value)
     Rebased->Password = Data->Password;
     Rebased->ProxyPassword = Data->ProxyPassword;
     Rebased->TunnelPassword = Data->TunnelPassword;
+    Rebased->TunnelPassphrase = Data->TunnelPassphrase;
     *Data = *Rebased;
   }
   FDefaultSettings = NewDefaults;
@@ -1763,7 +1999,7 @@ bool StoredSessionList::CanOpen(const SessionData & Data) const
     }
     Resolved = Linked.get();
   }
-  return Resolved->CanLogin();
+  return Resolved->CanOpen();
 }
 
 std::shared_ptr<SessionData> StoredSessionList::FindByName(const QString & Name) const
@@ -1798,6 +2034,39 @@ void StoredSessionList::Remove(const QString & Name)
       return;
     }
   }
+}
+
+void StoredSessionList::Replace(const QStringList & Names, const QList<std::shared_ptr<SessionData>> & Items)
+{
+  // The fold of Qt::CaseInsensitive, as Remove and Add compare
+  QSet<QString> Gone;
+  for (const QString & Name : Names)
+  {
+    Gone.insert(Name.toCaseFolded());
+  }
+  QSet<QString> Added;
+  for (const auto & Data : Items)
+  {
+    Gone.insert(Data->Name.toCaseFolded());
+    Added.insert(Data->Name);
+  }
+  QList<std::shared_ptr<SessionData>> Kept;
+  for (const auto & Data : FSessions)
+  {
+    if (Gone.contains(Data->Name.toCaseFolded()))
+    {
+      FDeleted.append(Data->Name);
+    }
+    else
+    {
+      Kept.append(Data);
+    }
+  }
+  FDeleted.removeIf([&Added](const QString & Name) { return Added.contains(Name); });
+  Kept.append(Items);
+  FSessions = Kept;
+  std::sort(FSessions.begin(), FSessions.end(),
+    [](const auto & A, const auto & B) { return A->Name.compare(B->Name, Qt::CaseInsensitive) < 0; });
 }
 
 void StoredSessionList::RenameFolder(const QString & From, const QString & To)

@@ -13,7 +13,7 @@
 //   size and time conditions: "*.txt>10K", "<1M", ">=2024-01-01", "<2024-01-01 12:00",
 //   ">1D" (modified in the last day; S, N, H, D, Y units, "today", "yesterday",
 //   "1DS"-like start-of-period forms).
-// Not ported: relative "./" path masks with SetRoots (used by synchronization).
+//   "./dir/*.txt" is relative to the roots of the transfer (SetRoots).
 #pragma once
 
 #include "core/FileSystem.h"
@@ -78,6 +78,9 @@ public:
   bool operator!=(const FileMasks & Other) const { return FStr != Other.FStr; }
   bool operator==(const QString & Other) const { return FStr == Other; }
 
+  // "./" masks are relative to these: the directories of a transfer or synchronization
+  void SetRoots(const QString & LocalRoot, const QString & RemoteRoot);
+
   QString Masks() const { return FStr; }
   void SetMasks(const QString & Value);   // throws FileMasksException, keeps previous masks then
   void SetMask(const QString & Mask);     // single mask, delimiters are not interpreted
@@ -111,7 +114,8 @@ private:
     Kind FileNameMaskKind = Any;
     std::shared_ptr<WildcardMask> FileNameMask;
     Kind DirectoryMaskKind = Any;
-    std::shared_ptr<WildcardMask> DirectoryMask;
+    std::shared_ptr<WildcardMask> DirectoryMask;       // remote side
+    std::shared_ptr<WildcardMask> LocalDirectoryMask;  // differs for "./" masks
 
     Boundary HighSizeMask = None;
     qint64 HighSize = 0;
@@ -130,6 +134,9 @@ private:
 
   QString FStr;
   MaskList FMasks[4];
+  bool FAnyRelative = false;
+  QString FLocalRoot;
+  QString FRemoteRoot;
 
   static int MaskIndex(bool Directory, bool Include) { return (Directory ? 2 : 0) + (Include ? 0 : 1); }
   QStringList MasksStr(bool Directory, bool Include) const;
@@ -138,10 +145,10 @@ private:
   void CreateMaskMask(const QString & AMask, int Start, int End, bool Ex,
     Mask::Kind & MaskKind, std::shared_ptr<WildcardMask> & MaskMask);
   [[noreturn]] void ThrowError(int Start, int End) const;
-  static bool MatchesMasks(const QString & FileName, bool Directory, const QString & Path,
+  static bool MatchesMasks(const QString & FileName, bool Local, bool Directory, const QString & Path,
     const Params * AParams, const MaskList & Masks, bool Recurse);
   static bool MatchesMaskMask(Mask::Kind MaskKind, const WildcardMask * MaskMask, const QString & Str);
-  bool DoMatches(const QString & FileName, bool Directory, const QString & Path, const Params * AParams,
+  bool DoMatches(const QString & FileName, bool Local, bool Directory, const QString & Path, const Params * AParams,
     bool RecurseInclude, bool & ImplicitMatch) const;
 };
 

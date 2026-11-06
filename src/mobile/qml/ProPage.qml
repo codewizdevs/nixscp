@@ -12,10 +12,22 @@ Page {
     objectName: "pro"
     // needKey: the cloud has data (unlock) or not (create); -1 = not known yet
     property int cloudHasData: -1
+    // the data is from NixSCP 1.2.3 or older: no password opens it, it can only be replaced
+    property bool cloudOldFormat: false
     property string keyError: ""
     property bool keyBusy: false
+    // The recovery key of a running setup is shown once, by this page: not left until it is
+    function back() {
+        if (page.keyBusy || page.keyChangeBusy) {
+            app.toast(qsTr("Please wait: your recovery key is being created."))
+            return true
+        }
+        return false
+    }
     property bool recoveryMode: false
+    property bool keyChangeBusy: false
     property var account: ({})
+    readonly property var strengthNames: [qsTr("too weak"), qsTr("acceptable"), qsTr("good"), qsTr("strong")]
 
     Component.onCompleted: refresh()
     function refresh() {
@@ -29,8 +41,9 @@ Page {
             if (!ok && error) app.toast(error)
             else page.refresh()
         }
-        function onProbed(ok, hasData, error) {
-            page.cloudHasData = ok ? (hasData ? 1 : 0) : -1
+        function onProbed(ok, hasData, oldFormat, error) {
+            page.cloudHasData = ok ? ((hasData && !oldFormat) ? 1 : 0) : -1
+            page.cloudOldFormat = ok && oldFormat
             if (!ok) page.keyError = error
         }
         function onKeyFinished(ok, result) {
@@ -42,9 +55,19 @@ Page {
             if (result.length > 0 && page.cloudHasData === 0) { recoveryDialog.key = result; recoveryDialog.open() }
             pro.fetchAccount()
         }
-        function onPasswordChanged(ok, error) {
-            app.toast(ok ? qsTr("The NixSCP password was changed. Turn fingerprint unlock on again with it.") : error)
-            if (ok && lock.biometricEnabled) lock.disableBiometric()
+        function onPasswordChanged(ok, result) {
+            page.keyChangeBusy = false
+            if (!ok) { app.toast(result); return }
+            app.toast(qsTr("The NixSCP password was changed. Turn fingerprint unlock on again with it."))
+            if (lock.biometricEnabled) lock.disableBiometric()
+            // a new data key comes with a new recovery key, shown once
+            if (result.length > 0) { recoveryDialog.key = result; recoveryDialog.open() }
+        }
+        function onRecoveryKeyChanged(ok, result) {
+            page.keyChangeBusy = false
+            if (!ok) { app.toast(result); return }
+            recoveryDialog.key = result
+            recoveryDialog.open()
         }
         function onAccount(data) { page.account = data }
         function onChanged() { if (pro.state === "needKey" && page.cloudHasData < 0) pro.probe() }
@@ -62,7 +85,7 @@ Page {
         Material.foreground: "white"
         RowLayout {
             anchors.fill: parent
-            ToolButton { icon.source: "icons/back.svg"; icon.color: "white"; Accessible.name: qsTr("Back"); onClicked: page.StackView.view.pop() }
+            ToolButton { icon.source: "icons/back.svg"; icon.color: "white"; Accessible.name: qsTr("Back"); onClicked: if (!page.back()) page.StackView.view.pop() }
             Label { text: qsTr("NixSCP Pro"); font.pixelSize: 18; font.bold: true; Layout.fillWidth: true }
             ToolButton {
                 visible: pro.hasKey
@@ -173,9 +196,18 @@ Page {
                 }
                 BusyIndicator { visible: page.cloudHasData < 0 && page.keyError.length === 0; running: visible }
                 Hint {
+                    visible: page.cloudOldFormat
+                    text: qsTr("Your cloud data was encrypted by NixSCP 1.2.3 or older. This version cannot read that format, so no "
+                               + "password opens it here. You can start over: choose a new password, and this phone's settings "
+                               + "replace the cloud data. Nothing is replaced until you confirm. Your other devices then need "
+                               + "the new password.")
+                }
+                Hint {
                     visible: page.cloudHasData === 0
                     text: qsTr("It encrypts everything NixSCP syncs and the configuration on this phone. Nobody can reset it: "
-                               + "without it (or the recovery key) the data cannot be decrypted. At least 8 characters.")
+                               + "without it (or the recovery key) the data cannot be decrypted. Whoever holds the encrypted data, "
+                               + "the server included, can try guesses at it offline, so make it long and unique. "
+                               + "Do not reuse your account password: the website sees that one when you sign in.")
                 }
                 Hint {
                     visible: page.cloudHasData === 1
@@ -190,6 +222,10 @@ Page {
                     placeholderText: page.recoveryMode ? qsTr("Recovery key") : qsTr("NixSCP password")
                     inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
                 }
+                Hint {
+                    visible: page.cloudHasData === 0 && password1.text.length > 0
+                    text: qsTr("Strength: %1").arg(page.strengthNames[pro.passwordScore(password1.text)])
+                }
                 TextField {
                     id: password2
                     Layout.fillWidth: true
@@ -197,6 +233,18 @@ Page {
                     echoMode: TextInput.Password
                     placeholderText: qsTr("Repeat the password")
                     inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
+                }
+                Button {
+                    visible: page.cloudHasData === 0
+                    flat: true
+                    text: qsTr("Generate a passphrase")
+                    onClicked: {
+                        const passphrase = pro.generatePassphrase()
+                        password1.echoMode = TextInput.Normal
+                        password1.text = passphrase
+                        password2.text = passphrase
+                        page.keyError = qsTr("Save this passphrase in a password manager before you continue.")
+                    }
                 }
                 CheckBox {
                     id: withRecovery
@@ -216,12 +264,15 @@ Page {
                     highlighted: true
                     visible: page.cloudHasData >= 0
                     enabled: !page.keyBusy && password1.text.length > 0
-                    text: page.keyBusy ? qsTr("Working…") : (page.cloudHasData === 0 ? qsTr("Set up") : qsTr("Unlock"))
+                    text: page.keyBusy ? qsTr("Working…") : (page.cloudOldFormat ? qsTr("Replace the cloud data…")
+                                                             : (page.cloudHasData === 0 ? qsTr("Set up") : qsTr("Unlock")))
                     onClicked: {
                         page.keyError = ""
                         if (page.cloudHasData === 0) {
-                            if (password1.text.length < 8) { page.keyError = qsTr("Use at least 8 characters."); return }
+                            const problem = pro.passwordProblem(password1.text)
+                            if (problem.length > 0) { page.keyError = problem; return }
                             if (password1.text !== password2.text) { page.keyError = qsTr("The passwords do not match."); return }
+                            if (page.cloudOldFormat) { replaceCloudDialog.open(); return }
                             page.keyBusy = true
                             pro.createKey(password1.text, withRecovery.checked)
                         } else {
@@ -313,7 +364,8 @@ Page {
                 Button { text: qsTr("Teams…"); onClicked: page.StackView.view.push(Qt.resolvedUrl("TeamsPage.qml")) }
 
                 Heading { text: qsTr("Account") }
-                Button { text: qsTr("Change NixSCP password…"); flat: true; onClicked: changeDialog.open() }
+                Button { text: qsTr("Change NixSCP password…"); flat: true; enabled: !page.keyChangeBusy; onClicked: changeDialog.open() }
+                Button { text: qsTr("New recovery key…"); flat: true; enabled: !page.keyChangeBusy; onClicked: recoveryKeyDialog.open() }
                 Button { text: qsTr("Manage account on nixscp.com"); flat: true; onClicked: Qt.openUrlExternally(pro.accountUrl) }
                 Button { text: qsTr("Sign out"); flat: true; onClicked: signOutDialog.open() }
             }
@@ -352,7 +404,24 @@ Page {
             }
         }
         footer: DialogButtonBox {
-            Button { text: qsTr("I saved it"); flat: true; highlighted: true; onClicked: { recoveryDialog.key = ""; recoveryDialog.close() } }
+            Button { text: qsTr("I saved it"); flat: true; highlighted: true; onClicked: { recoveryDialog.key = ""; pro.recoveryKeySaved(); recoveryDialog.close() } }
+        }
+    }
+
+    // only the user decides this: the server's word that the data is old is no reason
+    Dialog {
+        id: replaceCloudDialog
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 32, 440)
+        modal: true
+        title: qsTr("Replace the cloud data")
+        standardButtons: Dialog.Cancel | Dialog.Ok
+        onAccepted: { page.keyBusy = true; pro.replaceOldCloud(password1.text, withRecovery.checked) }
+        Label {
+            width: replaceCloudDialog.availableWidth
+            wrapMode: Text.Wrap
+            text: qsTr("Replace the data in the NixSCP cloud with this phone's settings? The old data was made by NixSCP 1.2.3 or older "
+                       + "and will not be used again.")
         }
     }
 
@@ -391,18 +460,48 @@ Page {
         modal: true
         title: qsTr("Change NixSCP password")
         standardButtons: Dialog.Cancel | Dialog.Ok
-        onOpened: { new1.text = ""; new2.text = ""; new1.forceActiveFocus() }
+        onOpened: { current1.text = ""; currentIsRecovery.checked = false; rotate1.checked = false; new1.text = ""; new2.text = ""; current1.forceActiveFocus() }
         onAccepted: {
-            if (new1.text.length < 8) app.toast(qsTr("Use at least 8 characters."))
+            const problem = pro.passwordProblem(new1.text)
+            if (problem.length > 0) app.toast(problem)
             else if (new1.text !== new2.text) app.toast(qsTr("The passwords do not match."))
-            else pro.changePassword(new1.text)
-            new1.text = ""; new2.text = ""
+            else { page.keyChangeBusy = true; pro.changePassword(current1.text, currentIsRecovery.checked, new1.text, rotate1.checked) }
+            current1.text = ""; new1.text = ""; new2.text = ""
         }
         ColumnLayout {
             width: changeDialog.availableWidth
             Label { Layout.fillWidth: true; wrapMode: Text.Wrap; opacity: 0.7; text: qsTr("Your other devices keep working; they ask for the new password when they start next. The recovery key stays valid.") }
+            TextField { id: current1; Layout.fillWidth: true; echoMode: TextInput.Password; placeholderText: currentIsRecovery.checked ? qsTr("Recovery key") : qsTr("Current password"); inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText }
+            CheckBox { id: currentIsRecovery; text: qsTr("This is my recovery key") }
             TextField { id: new1; Layout.fillWidth: true; echoMode: TextInput.Password; placeholderText: qsTr("New password"); inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText }
+            Hint { visible: new1.text.length > 0; text: qsTr("Strength: %1").arg(page.strengthNames[pro.passwordScore(new1.text)]) }
             TextField { id: new2; Layout.fillWidth: true; echoMode: TextInput.Password; placeholderText: qsTr("Repeat it"); inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText }
+            CheckBox { id: rotate1; text: qsTr("Also replace the data key and the recovery key") }
+            Hint { text: qsTr("Do this if a password or recovery key may have leaked: the old one otherwise still opens the data key from any old copy of your encrypted data. Your other devices then ask for the new password once.") }
+        }
+    }
+
+    Dialog {
+        id: recoveryKeyDialog
+        anchors.centerIn: undefined
+        x: (parent.width - width) / 2
+        y: Math.max(8, Math.min((parent.height - height) / 2, parent.height - app.keyboardHeight - height - 8))
+        width: Math.min(parent.width - 32, 440)
+        modal: true
+        title: qsTr("New recovery key")
+        standardButtons: Dialog.Cancel | Dialog.Ok
+        onOpened: { current2.text = ""; current2IsRecovery.checked = false; rotate2.checked = true; current2.forceActiveFocus() }
+        onAccepted: {
+            page.keyChangeBusy = true
+            pro.newRecoveryKey(current2.text, current2IsRecovery.checked, rotate2.checked)
+            current2.text = ""
+        }
+        ColumnLayout {
+            width: recoveryKeyDialog.availableWidth
+            Label { Layout.fillWidth: true; wrapMode: Text.Wrap; opacity: 0.7; text: qsTr("A new recovery key, shown once, replaces the old one. If the old key may have leaked, keep the data key replaced: a new recovery key alone leaves the old one able to open the data key from any old copy of your encrypted data.") }
+            TextField { id: current2; Layout.fillWidth: true; echoMode: TextInput.Password; placeholderText: current2IsRecovery.checked ? qsTr("Recovery key") : qsTr("Current password"); inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText }
+            CheckBox { id: current2IsRecovery; text: qsTr("This is my recovery key") }
+            CheckBox { id: rotate2; text: qsTr("Also replace the data key") }
         }
     }
 

@@ -2,7 +2,11 @@
 
 #include "core/ConfigVault.h"
 
+#include <QDateTime>
+#include <QFile>
 #include <QStandardPaths>
+
+#include <time.h>
 
 #ifdef Q_OS_ANDROID
 #include <QCoreApplication>
@@ -52,7 +56,8 @@ AppLock::AppLock(const QString & ConfigFile, std::function<void()> Startup, QObj
 
 void AppLock::Begin()
 {
-  if (ConfigVault::IsSealedFile(FConfigFile))
+  FProblem = ConfigVault::ConfigProblem(FConfigFile);
+  if (!FProblem.isEmpty() || ConfigVault::IsSealedFile(FConfigFile))
   {
     FLocked = true;
     emit changed();
@@ -61,6 +66,21 @@ void AppLock::Begin()
   {
     Finish();
   }
+}
+
+void AppLock::startOver()
+{
+  if (FProblem.isEmpty())
+  {
+    return;
+  }
+  const QStringList Files = ConfigVault::StartOverFiles(FConfigFile);
+  for (const QString & File : Files)
+  {
+    QFile::remove(File);
+  }
+  FProblem.clear();
+  Finish();
 }
 
 void AppLock::Finish()
@@ -222,7 +242,7 @@ void AppLock::background()
   if (!FAway)
   {
     FAway = true;
-    FAwaySince.start();
+    FAwaySince = BootTime();
   }
 }
 
@@ -234,8 +254,20 @@ void AppLock::foreground()
   }
   FAway = false;
   int Minutes = autoLockMinutes();
-  if ((Minutes > 0) && FStarted && encrypted() && (FAwaySince.elapsed() >= qint64(Minutes) * 60 * 1000))
+  if ((Minutes > 0) && FStarted && encrypted() && (BootTime() - FAwaySince >= qint64(Minutes) * 60 * 1000))
   {
     lockNow();
   }
+}
+
+qint64 AppLock::BootTime()
+{
+#ifdef CLOCK_BOOTTIME
+  timespec Now{};
+  if (clock_gettime(CLOCK_BOOTTIME, &Now) == 0)
+  {
+    return qint64(Now.tv_sec) * 1000 + Now.tv_nsec / 1000000;
+  }
+#endif
+  return QDateTime::currentMSecsSinceEpoch();
 }

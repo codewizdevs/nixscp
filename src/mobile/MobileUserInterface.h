@@ -2,22 +2,60 @@
 // touch interface: each becomes a signal that QML shows as a sheet; the
 // asking thread (a Terminal's worker) waits until QML answers. Asked on the
 // GUI thread itself, a local event loop waits instead.
+//
+// There is one sheet for all connections, so questions are shown one at a
+// time, in order: an answer always goes to the connection that asked. A
+// session's connections ask through its Asker; when the session closes its
+// questions end with "no", shown or waiting, so nothing waits for a dialog
+// that no longer matters.
 #pragma once
 
 #include "core/FileSystem.h"
 
+#include <QList>
 #include <QMutex>
 #include <QObject>
 #include <QStringList>
+#include <QThread>
 #include <QVariantList>
 #include <QWaitCondition>
+
+#include <atomic>
+#include <memory>
 
 class MobileUserInterface : public QObject, public UserInterface
 {
   Q_OBJECT
 
 public:
+  // The questions of one session: its connections and shell. The key's
+  // passphrase is typed once for all of them
+  class Asker : public UserInterface
+  {
+  public:
+    explicit Asker(MobileUserInterface * Owner) : FOwner(Owner) {}
+    // Ends what this session asked and everything it asks from now on
+    void Cancel();
+
+    HostKeyAnswer VerifyHostKey(const QString & Host, int Port, const QString & KeyType,
+      const QString & FingerprintSHA256, const QString & FingerprintMD5, HostKeyState State) override;
+    bool PromptUser(PromptKind Kind, const QString & Name, const QString & Instructions, QList<Prompt> & Prompts) override;
+    void DisplayBanner(const QString & SessionName, const QString & Banner) override;
+    unsigned int QueryUser(const QString & Query, const QString & MoreMessages, unsigned int Answers) override;
+
+  private:
+    MobileUserInterface * FOwner;
+    std::atomic<bool> FCancelled{false};
+    QMutex FMutex;
+    QString FPassphrase;
+    // the connection the remembered passphrase was given to: asked again, it was wrong
+    quint64 FPassphraseThread = 0;
+  };
+
   explicit MobileUserInterface(QObject * Parent = nullptr);
+
+  // For a new session; the connections keep it (they may outlive the session)
+  std::shared_ptr<Asker> NewAsker() { return std::make_shared<Asker>(this); }
 
   HostKeyAnswer VerifyHostKey(const QString & Host, int Port, const QString & KeyType,
     const QString & FingerprintSHA256, const QString & FingerprintMD5, HostKeyState State) override;
@@ -43,15 +81,33 @@ signals:
   void promptRequested(int kind, const QString & name, const QString & instructions, const QVariantList & prompts);
   void queryRequested(const QString & query, const QString & moreMessages, const QVariantList & buttons);
   void bannerShown(const QString & sessionName, const QString & banner);
+  // the session of the question shown closed: its sheet goes, without an answer
+  void questionCancelled();
 
 private:
+  struct Question
+  {
+    const void * Owner = nullptr;
+    std::function<void()> Show;
+    bool Answered = false;
+    bool Cancelled = false;
+    int Answer = 0;
+    bool PromptOk = false;
+    QStringList Values;
+  };
+
   QMutex FMutex;
   QWaitCondition FAnswered;
-  bool FHasAnswer = false;
-  int FAnswer = 0;
-  bool FPromptOk = false;
-  QStringList FValues;
+  QList<std::shared_ptr<Question>> FWaiting;
+  std::shared_ptr<Question> FShown;
 
-  // Emits the request on the GUI thread and waits for the answer
-  void Ask(const std::function<void()> & Emit);
+  void Ask(const std::shared_ptr<Question> & Item);
+  void ShowNext();
+  void Finish(const std::function<void(Question &)> & Fill);
+  void CancelQuestions(const void * Owner);
+
+  HostKeyAnswer AskHostKey(const void * Owner, const QString & Host, int Port, const QString & KeyType,
+    const QString & Fingerprint, HostKeyState State);
+  bool AskPrompt(const void * Owner, PromptKind Kind, const QString & Name, const QString & Instructions, QList<Prompt> & Prompts);
+  unsigned int AskQuery(const void * Owner, const QString & Query, const QString & MoreMessages, unsigned int Answers);
 };

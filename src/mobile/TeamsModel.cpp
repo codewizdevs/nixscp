@@ -32,10 +32,10 @@ QVariantList TeamsModel::teams() const
   });
   for (const TeamSync::Team & T : List)
   {
-    Result.append(QVariantMap{{QStringLiteral("uuid"), T.Uuid}, {QStringLiteral("name"), T.Name},
+    Result.append(QVariantMap{{QStringLiteral("uuid"), T.Uuid}, {QStringLiteral("name"), T.Name}, {QStringLiteral("folder"), T.Folder},
       {QStringLiteral("role"), T.Role}, {QStringLiteral("canEdit"), T.CanEdit()},
       {QStringLiteral("members"), T.MemberCount}, {QStringLiteral("needsRotation"), T.NeedsRotation},
-      {QStringLiteral("keyReady"), !T.Key.isEmpty()}});
+      {QStringLiteral("keyReady"), !T.Key.IsEmpty()}, {QStringLiteral("error"), T.Error}, {QStringLiteral("conflict"), T.Conflict}});
   }
   return Result;
 }
@@ -63,6 +63,7 @@ void TeamsModel::create(const QString & Name) { Teams().CreateTeam(Name.trimmed(
 void TeamsModel::rename(const QString & Uuid, const QString & Name) { Teams().Rename(Uuid, Name.trimmed(), Done(QStringLiteral("rename"))); }
 void TeamsModel::remove(const QString & Uuid) { Teams().DeleteTeam(Uuid, Done(QStringLiteral("delete"))); }
 void TeamsModel::leave(const QString & Uuid) { Teams().Leave(Uuid, Done(QStringLiteral("leave"))); }
+void TeamsModel::forget(const QString & Uuid, bool KeepSites) { Teams().Forget(Uuid, KeepSites, Done(QStringLiteral("forget"))); }
 void TeamsModel::join(const QString & Code) { Teams().JoinWithCode(Code.trimmed(), Done(QStringLiteral("join"))); }
 void TeamsModel::shareFolder(const QString & Uuid, const QString & Folder) { Teams().ShareFolder(Uuid, Folder, Done(QStringLiteral("share"))); }
 void TeamsModel::revokeInvite(const QString & Uuid, const QString & Id) { Teams().RevokeInvite(Uuid, Id, Done(QStringLiteral("revoke"))); }
@@ -83,18 +84,41 @@ void TeamsModel::invite(const QString & Uuid, const QString & Role, int Days)
 
 void TeamsModel::invites(const QString & Uuid)
 {
-  Teams().Invites(Uuid, [this](bool Ok, const QString & Error, const QJsonArray & List)
+  Teams().Invites(Uuid, [this, Uuid](bool Ok, const QString & Error, const QJsonArray & List)
   {
-    emit finished(QStringLiteral("invites"), Ok, Error, List.toVariantList());
+    emit finished(QStringLiteral("invites"), Ok, Error, QVariantMap{{QStringLiteral("uuid"), Uuid}, {QStringLiteral("list"), List.toVariantList()}});
   });
 }
 
 void TeamsModel::members(const QString & Uuid)
 {
-  Teams().Members(Uuid, [this](bool Ok, const QString & Error, const QJsonArray & List)
+  Teams().Members(Uuid, [this, Uuid](bool Ok, const QString & Error, const QJsonArray & List)
   {
-    emit finished(QStringLiteral("members"), Ok, Error, List.toVariantList());
+    emit finished(QStringLiteral("members"), Ok, Error, QVariantMap{{QStringLiteral("uuid"), Uuid}, {QStringLiteral("list"), List.toVariantList()}});
   });
+}
+
+void TeamsModel::history(const QString & Uuid)
+{
+  Teams().History(Uuid, [this, Uuid](bool Ok, const QString & Error, const QJsonArray & List)
+  {
+    emit finished(QStringLiteral("history"), Ok, Error, QVariantMap{{QStringLiteral("uuid"), Uuid}, {QStringLiteral("list"), List.toVariantList()}});
+  });
+}
+
+void TeamsModel::restore(const QString & Uuid, double Version)
+{
+  Teams().Restore(Uuid, static_cast<qint64>(Version), Done(QStringLiteral("restore")));
+}
+
+void TeamsModel::resolveConflict(const QString & Uuid, bool KeepLocal)
+{
+  Teams().ResolveConflict(Uuid, KeepLocal, Done(QStringLiteral("resolve")));
+}
+
+QString TeamsModel::fingerprint() const
+{
+  return Teams().Fingerprint();
 }
 
 QStringList TeamsModel::localFolders() const
@@ -152,14 +176,11 @@ void TeamsModel::unshare(const QString & Uuid, const QStringList & Names, bool K
 
 QVariantMap TeamsModel::siteTeam(const QString & Site) const
 {
-  for (const TeamSync::Team & T : Teams().Teams())
+  const TeamSync::Team * T = Teams().TeamOfSite(Site);
+  if (T == nullptr)
   {
-    QString Prefix = TeamSync::FolderName(T.Name) + QLatin1Char('/');
-    if (Site.startsWith(Prefix))
-    {
-      return QVariantMap{{QStringLiteral("uuid"), T.Uuid}, {QStringLiteral("name"), T.Name},
-        {QStringLiteral("relative"), Site.mid(Prefix.size())}, {QStringLiteral("canEdit"), T.CanEdit()}};
-    }
+    return QVariantMap();
   }
-  return QVariantMap();
+  return QVariantMap{{QStringLiteral("uuid"), T->Uuid}, {QStringLiteral("name"), T->Name},
+    {QStringLiteral("relative"), Site.mid(T->Folder.size() + 1)}, {QStringLiteral("canEdit"), T->CanEdit()}};
 }

@@ -13,9 +13,10 @@ ARM); not on Google Play yet.
   FTP, FTPS, WebDAV, WebDAVS, S3), import a `WinSCP.ini` (menu). Passwords
   are stored as on desktop (WinSCP format); an empty password is asked for
   when connecting. Favourites, recent sites and folded folders are the
-  phone's own (`mobile.ini`).
-- Connecting with host key verification (the app's own `known_hosts`),
-  password / passphrase / keyboard-interactive prompts, and Cancel.
+  phone's own (`sites.dat`).
+- Connecting with host key verification (the app's own `known_hosts`, with
+  the host names hashed), password / passphrase / keyboard-interactive
+  prompts, and Cancel.
 - Two panes, the phone and the server: side by side from 600 dp wide
   (unfolded Fold, tablets), as Phone / Server tabs on phones. The phone pane
   needs "All files access" (Android 11+; the storage permission on 9/10) and
@@ -32,8 +33,10 @@ ARM); not on Google Play yet.
   first "connection lost" question after the app was away is answered with
   Retry.
 - Server files: Edit (the built-in editor, or an editor app chosen in
-  Settings; saved changes are uploaded back), Download as archive (the
-  selection packed on the server with tar or zip and saved to Download;
+  Settings; saved changes are uploaded back; the built-in editor asks for
+  the encoding of a file that is not UTF-8, and keeps its encoding and line
+  endings), Download as archive (the selection packed on the server with
+  tar or zip and saved to Download;
   servers without commands or without zip: packed on the phone as .zip),
   Extract here (.tar.*, .zip, with tar / unzip on the server), Properties
   (rights as checkboxes or octal, owner, group, recursively).
@@ -70,21 +73,32 @@ ARM); not on Google Play yet.
 - Android 9+ (API 28), edge-to-edge on Android 15.
 
 - NixSCP Pro: sign-in in the browser, back to the app through a loopback
-  callback (as on desktop, no server change); the NixSCP password (first
-  device: created, with a recovery key; others: unlocked); settings sync
+  callback (as on desktop, no server change) and the page's "Back to
+  NixSCP" link (`nixscp://signed-in`, as browsers open only BROWSABLE
+  targets); the NixSCP password (first device: created, with a recovery
+  key; others: unlocked); settings sync
   (core/CloudSync, end-to-end encrypted; the phone's open tabs are not
   synced), conflicts, license notices. The device is named by its model.
-- The encrypted configuration: with Pro, nixscp.ini and the phone's SSH
-  private keys are encrypted (core/ConfigVault). NixSCP asks for the NixSCP
-  password (or the recovery key, or the fingerprint) at start and after 5
-  minutes in the background (1 / 5 / 15 / 60, or only at start). A
-  connection uses a decrypted copy of its key in a private temporary file,
-  removed when it closes. Fingerprint unlock keeps the password encrypted
-  with an Android Keystore key that only a fingerprint releases.
+- The encrypted configuration: with Pro, nixscp.ini, `sites.dat` and the
+  phone's SSH private keys are encrypted (core/ConfigVault). NixSCP asks
+  for the NixSCP password (or the recovery key, or the fingerprint) at start
+  and after 5 minutes in the background (1 / 5 / 15 / 60, or only at
+  start). A key is decrypted in memory only. Fingerprint unlock keeps the
+  password encrypted with an Android Keystore key that only a fingerprint
+  releases. Still plain text at rest: `mobile.ini` (theme, lock), key file
+  names and `.pub` files, thumbnails and Open / Share copies until the
+  session ends or the next start, and copies for other apps' editors until
+  the session ends. See `docs/encryption.md`. When no password can open the
+  configuration (replaced, damaged, or encrypted by NixSCP 1.2.3 or older),
+  the lock page says so and offers "Start over…": it deletes the
+  configuration and its companion files; what was synced stays in the cloud.
+  Cloud data from 1.2.3 or older: "Replace the cloud data…" on the Pro page.
+- The app's screens are blocked from screen capture and from the recent
+  apps list.
 - Teams: create, rename, delete, leave, join with an invite code; members
-  (roles, remove), invites (create, share the code, revoke); share a site
-  folder.
-- A site's SSH key on the phone is the phone's own choice (mobile.ini): the
+  (roles, remove, key fingerprints), invites (create, share the code,
+  revoke); share a site folder; restore from history.
+- A site's SSH key on the phone is the phone's own choice (`sites.dat`): the
   site's key file is synced and is another device's path; the phone always
   uses its own known_hosts.
 
@@ -112,7 +126,13 @@ NIXSCP_ANDROID_KEYSTORE=/path/to/nixscp-release.jks NIXSCP_ANDROID_KEYSTORE_PASS
 On Android the CMake project builds only the core and `src/mobile` (no desktop
 windows, CLI or desktop tests). `packaging/android/package/` holds the
 manifest (no Android backup of the configuration, keyboard handling, the
-transfer service, FileProvider paths) and the launcher icon.
+transfer service, FileProvider paths, the `nixscp://signed-in` link) and the
+launcher icon.
+
+The app's logic (not its pages, which need a device) is tested on the desktop
+by `test_mobile`, part of the desktop test build on Linux. Real sessions run
+only with `NIXSCP_TEST_SSH_PORT` and `NIXSCP_TEST_FTP_PORT` set; without them
+those parts are skipped.
 
 ## Try it in the emulator
 

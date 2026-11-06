@@ -32,17 +32,27 @@ int main()
 #include <QFile>
 #include <QFontMetrics>
 #include <QHeaderView>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QKeyEvent>
+#include <QLabel>
 #include <QLineEdit>
 #include <QLocale>
+#include <QMenu>
+#include <QMimeData>
 #include <QMouseEvent>
+#include <QPushButton>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QThread>
+#include <QTimer>
 #include <QTreeView>
+#include <QUrl>
 
 #include <cstdio>
 #include <functional>
+#include <pwd.h>
 #include <typeinfo>
 #include <unistd.h>
 
@@ -798,6 +808,340 @@ public:
   unsigned int QueryUser(const QString &, const QString &, unsigned int) override { return qaCancel; }
 };
 
+// F-10: marks and focus differ (Norton-like): only the *Focused commands of the
+// popups turn to the focused file, whatever is marked
+static void TestFocusedTarget(const QString & Root)
+{
+  std::printf("[focused target]\n");
+  QString Dir = Root + QStringLiteral("/focused");
+  QDir().mkpath(Dir);
+  for (const char * Name : {"a.txt", "b.txt", "c.txt"})
+  {
+    QFile File(Dir + QLatin1Char('/') + QString::fromLatin1(Name));
+    CHECK(File.open(QIODevice::WriteOnly));
+  }
+  LocalDirectoryProvider Provider;
+  FilePanel Panel(false);
+  Panel.resize(800, 400);
+  Panel.show();
+  Panel.SetProvider(&Provider);
+  Panel.ChangeDirectory(Dir);
+  CHECK(WaitFor([&]() { return !Panel.IsLoading() && Panel.FocusFile(QStringLiteral("a.txt")); }));
+  Panel.SelectFiles({QStringLiteral("a.txt"), QStringLiteral("b.txt")});
+  Panel.FocusFile(QStringLiteral("c.txt"));
+  QString A = Panel.FullPath(QStringLiteral("a.txt"));
+  QString B = Panel.FullPath(QStringLiteral("b.txt"));
+  QString C = Panel.FullPath(QStringLiteral("c.txt"));
+  // F8, the Files menu
+  CHECK_EQ(Panel.SelectedPaths(), QStringList({A, B}));
+  // the popup: the focused file, not marked
+  CHECK_EQ(Panel.SelectedPaths(true), QStringList{C});
+  CHECK_EQ(Panel.SelectedFiles(true).size(), 1);
+  CHECK_EQ(Panel.SelectedFiles(true).value(0).FileName, QStringLiteral("c.txt"));
+  // the focused file is marked: all the marks
+  Panel.FocusFile(QStringLiteral("a.txt"));
+  CHECK_EQ(Panel.SelectedPaths(true), QStringList({A, B}));
+  // ".." focused: a focused file that does not count
+  Key(Panel.View(), Qt::Key_Home);
+  CHECK_EQ(Panel.SelectedPaths(true), QStringList({A, B}));
+  // F-31: what was dragged, not what is marked
+  QList<RemoteFile> Files = Panel.FilesOfPaths({C});
+  CHECK_EQ(Files.size(), 1);
+  CHECK_EQ(Files.value(0).FileName, QStringLiteral("c.txt"));
+  CHECK(Panel.FilesOfPaths({QStringLiteral("/no/such/file")}).isEmpty());
+  // F-23: what is shown
+  CHECK_EQ(Panel.VisibleFiles().size(), 3);
+  Panel.SetFilterMask(QStringLiteral("a*"));
+  CHECK_EQ(Panel.VisibleFiles().size(), 1);
+  Panel.SetFilterMask(QString());
+  // Explorer-style selection, nothing marked: the Menu key offers the panel popup
+  TNortonLikeMode Saved = Configuration::Instance().NortonLikeMode;
+  Configuration::Instance().NortonLikeMode = nlOff;
+  Panel.ApplyConfiguration();
+  Panel.ClearSelection();
+  Panel.FocusFile(QStringLiteral("c.txt"));
+  bool OnItem = true;
+  QObject::connect(&Panel, &FilePanel::ContextMenuRequested, [&OnItem](const QPoint &, bool Item) { OnItem = Item; });
+  Key(Panel.View(), Qt::Key_Menu);
+  CHECK(!OnItem);
+  Configuration::Instance().NortonLikeMode = Saved;
+  Panel.ApplyConfiguration();
+  // F-09: searching starts without a typed letter
+  Panel.StartIncrementalSearch();
+  QString Status;
+  for (QLabel * Label : Panel.findChildren<QLabel *>())
+  {
+    if (Label->text().startsWith(QStringLiteral("Search:"))) Status = Label->text();
+  }
+  CHECK(Status.contains(QStringLiteral("start typing")));
+  Key(Panel.View(), Qt::Key_B, Qt::NoModifier, QStringLiteral("b"));
+  CHECK_EQ(Panel.FocusedFile().FileName, QStringLiteral("b.txt"));
+  Key(Panel.View(), Qt::Key_Escape);
+  // D-01: state forgotten, sorting and filter from the panel left
+  Panel.SelectFiles({QStringLiteral("b.txt")});
+  Panel.ChangeDirectory(Root);
+  CHECK(WaitFor([&]() { return !Panel.IsLoading() && Panel.CanBack(); }));
+  FilePanel Other(false);
+  Other.SetSort(FileListModel::ColSize, false);
+  Other.SetFilterMask(QStringLiteral("*.none"));
+  Panel.ResetState(&Other);
+  CHECK(!Panel.CanBack());
+  CHECK_EQ(Panel.MarkedCount(), 0);
+  CHECK_EQ(Panel.SortColumn(), static_cast<int>(FileListModel::ColSize));
+  CHECK(!Panel.SortAscending());
+  CHECK_EQ(Panel.FilterMask(), QStringLiteral("*.none"));
+  Panel.SetFilterMask(QString());
+  Panel.SetSort(FileListModel::ColName, true);
+}
+
+// D-09: a double click on a link of a session that does not resolve links
+class UnresolvedLinksProvider : public DirectoryProvider
+{
+public:
+  bool IsRemote() const override { return true; }
+  void Load(const QString & Path, LoadCallback Callback) override
+  {
+    RemoteFile Link;
+    Link.FileName = QStringLiteral("link");
+    Link.IsSymLink = true;
+    RemoteFile Plain;
+    Plain.FileName = QStringLiteral("plain");
+    Loaded.append(Path);
+    Callback(true, Path, RemoteFileList{Link, Plain}, QString(), QString());
+  }
+  QString HomeDirectory() const override { return QStringLiteral("/"); }
+  bool ResolvingSymlinks() const override { return false; }
+  QStringList Loaded;
+};
+
+static void TestUnresolvedLinks()
+{
+  std::printf("[double click on an unresolved link]\n");
+  Configuration & Config = Configuration::Instance();
+  UnresolvedLinksProvider Provider;
+  FilePanel Panel(true);
+  Panel.resize(600, 300);
+  Panel.show();
+  Panel.SetProvider(&Provider);
+  Panel.ChangeDirectory(QStringLiteral("/top"));
+  CHECK(WaitFor([&]() { return !Panel.IsLoading() && Panel.FocusFile(QStringLiteral("link")); }));
+  int Edits = 0;
+  QObject::connect(&Panel, &FilePanel::EditRequested, [&Edits](const RemoteFile &, const QString &) { Edits++; });
+  // a plain file: the double-click action
+  Panel.FocusFile(QStringLiteral("plain"));
+  Key(Panel.View(), Qt::Key_Return);
+  CHECK_EQ(Edits, 1);
+  CHECK_EQ(Panel.CurrentDirectory(), QStringLiteral("/top"));
+  // the hidden AlwaysRespectDoubleClickAction
+  Config.AlwaysRespectDoubleClickAction = true;
+  Panel.FocusFile(QStringLiteral("link"));
+  Key(Panel.View(), Qt::Key_Return);
+  CHECK_EQ(Edits, 2);
+  CHECK_EQ(Panel.CurrentDirectory(), QStringLiteral("/top"));
+  // by default the link is entered, it may be a directory
+  Config.AlwaysRespectDoubleClickAction = false;
+  Key(Panel.View(), Qt::Key_Return);
+  CHECK(WaitFor([&]() { return !Panel.IsLoading() && (Panel.CurrentDirectory() == QStringLiteral("/top/link")); }));
+  CHECK_EQ(Edits, 2);
+}
+
+// F-25: remote paths mean nothing to another session; such a drop goes through
+// the URLs the source offers (it downloads when asked), and hovering asks for nothing
+class CountingMimeData : public QMimeData
+{
+public:
+  mutable int UrlRequests = 0;
+  QStringList Local;
+
+  bool hasFormat(const QString & MimeType) const override
+  {
+    return (MimeType == QStringLiteral("text/uri-list")) || QMimeData::hasFormat(MimeType);
+  }
+  QStringList formats() const override
+  {
+    return QMimeData::formats() << QStringLiteral("text/uri-list");
+  }
+
+protected:
+  QVariant retrieveData(const QString & MimeType, QMetaType Type) const override
+  {
+    if (MimeType == QStringLiteral("text/uri-list"))
+    {
+      UrlRequests++;
+      QVariantList Urls;
+      for (const QString & File : Local)
+      {
+        Urls.append(QUrl::fromLocalFile(File));
+      }
+      return Urls;
+    }
+    return QMimeData::retrieveData(MimeType, Type);
+  }
+};
+
+static void TestDropFromOtherSession(const QString & Root)
+{
+  std::printf("[drop from another session]\n");
+  QString Dir = Root + QStringLiteral("/drop");
+  QDir().mkpath(Dir);
+  LocalDirectoryProvider Provider;
+  FilePanel Panel(false);
+  Panel.resize(800, 400);
+  Panel.show();
+  Panel.SetProvider(&Provider);
+  Panel.ChangeDirectory(Dir);
+  CHECK(WaitFor([&]() { return !Panel.IsLoading() && !Panel.CurrentDirectory().isEmpty(); }));
+  Panel.SetSessionId(QStringLiteral("1234/session-a"));
+  CHECK_EQ(Panel.SessionId(), QStringLiteral("1234/session-a"));
+  QStringList Dropped;
+  bool FromRemote = true;
+  int Drops = 0;
+  QObject::connect(&Panel, &FilePanel::DropRequested,
+    [&](const QStringList & Paths, bool Remote, const QString &, Qt::DropAction)
+    {
+      Dropped = Paths;
+      FromRemote = Remote;
+      Drops++;
+    });
+  QWidget * Viewport = Panel.View()->viewport();
+  QPoint Pos(20, Viewport->height() - 5);
+  auto Remote = [](const QString & Session)
+  {
+    QJsonObject Obj;
+    Obj.insert(QStringLiteral("remote"), true);
+    Obj.insert(QStringLiteral("session"), Session);
+    Obj.insert(QStringLiteral("paths"), QJsonArray::fromStringList({QStringLiteral("/srv/remote.txt")}));
+    return QJsonDocument(Obj).toJson(QJsonDocument::Compact);
+  };
+  auto DragDrop = [&](QMimeData & Mime, bool & Accepted)
+  {
+    QDragEnterEvent Enter(Pos, Qt::CopyAction | Qt::MoveAction, &Mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(Viewport, &Enter);
+    Accepted = Enter.isAccepted();
+    QDragMoveEvent Move(Pos, Qt::CopyAction | Qt::MoveAction, &Mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(Viewport, &Move);
+    QDropEvent Drop(QPointF(Pos), Qt::CopyAction | Qt::MoveAction, &Mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(Viewport, &Drop);
+  };
+  bool Accepted = false;
+
+  // the own session: the remote paths
+  {
+    QMimeData Mime;
+    Mime.setData(QStringLiteral("application/x-nixscp-files"), Remote(QStringLiteral("1234/session-a")));
+    DragDrop(Mime, Accepted);
+    CHECK(Accepted);
+    CHECK_EQ(Drops, 1);
+    CHECK(FromRemote);
+    CHECK_EQ(Dropped, QStringList{QStringLiteral("/srv/remote.txt")});
+  }
+  // another session or window: the downloaded copies, asked for at the drop only
+  {
+    CountingMimeData Mime;
+    Mime.Local = {QStringLiteral("/tmp/downloaded/remote.txt")};
+    Mime.setData(QStringLiteral("application/x-nixscp-files"), Remote(QStringLiteral("5678/session-b")));
+    QDragEnterEvent Enter(Pos, Qt::CopyAction | Qt::MoveAction, &Mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(Viewport, &Enter);
+    CHECK(Enter.isAccepted());
+    QDragMoveEvent Move(Pos, Qt::CopyAction | Qt::MoveAction, &Mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(Viewport, &Move);
+    CHECK_EQ(Mime.UrlRequests, 0);
+    QDropEvent Drop(QPointF(Pos), Qt::CopyAction | Qt::MoveAction, &Mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(Viewport, &Drop);
+    CHECK_EQ(Mime.UrlRequests, 1);
+    CHECK_EQ(Drops, 2);
+    CHECK(!FromRemote);
+    CHECK_EQ(Dropped, QStringList{QStringLiteral("/tmp/downloaded/remote.txt")});
+  }
+  // nothing to fall back on: refused, never the same-named paths of this session
+  {
+    QMimeData Mime;
+    Mime.setData(QStringLiteral("application/x-nixscp-files"), Remote(QStringLiteral("5678/session-b")));
+    DragDrop(Mime, Accepted);
+    CHECK(!Accepted);
+    CHECK_EQ(Drops, 2);
+  }
+  // a drag without identity (an older version) is another session too
+  {
+    QMimeData Mime;
+    Mime.setData(QStringLiteral("application/x-nixscp-files"), Remote(QString()));
+    DragDrop(Mime, Accepted);
+    CHECK_EQ(Drops, 2);
+  }
+  // local files are local everywhere
+  {
+    QMimeData Mime;
+    QJsonObject Obj;
+    Obj.insert(QStringLiteral("remote"), false);
+    Obj.insert(QStringLiteral("paths"), QJsonArray::fromStringList({QStringLiteral("/home/me/local.txt")}));
+    Mime.setData(QStringLiteral("application/x-nixscp-files"), QJsonDocument(Obj).toJson(QJsonDocument::Compact));
+    DragDrop(Mime, Accepted);
+    CHECK_EQ(Drops, 3);
+    CHECK(!FromRemote);
+  }
+}
+
+// F-29: the column popup, as WinSCP's DirViewColumnRightClick
+static QStringList HeaderPopupItems(FilePanel & Panel, int Column)
+{
+  QStringList Result;
+  QTimer::singleShot(100, [&Result]()
+  {
+    auto * Menu = qobject_cast<QMenu *>(QApplication::activePopupWidget());
+    if (Menu == nullptr) return;
+    for (QAction * Action : Menu->actions())
+    {
+      if (!Action->isSeparator()) Result.append(Action->text());
+    }
+    Menu->close();
+  });
+  QHeaderView * Header = Panel.View()->header();
+  emit Header->customContextMenuRequested(QPoint(Header->sectionViewportPosition(Column) + 5, 5));
+  return Result;
+}
+
+static void TestHeaderPopup(const QString & Root)
+{
+  std::printf("[column popup]\n");
+  LocalDirectoryProvider Provider;
+  FilePanel Panel(false);
+  Panel.resize(1000, 300);
+  Panel.show();
+  Panel.SetProvider(&Provider);
+  Panel.ChangeDirectory(Root);
+  CHECK(WaitFor([&]() { return !Panel.IsLoading() && !Panel.CurrentDirectory().isEmpty(); }));
+  QStringList OnName = HeaderPopupItems(Panel, FileListModel::ColName);
+  CHECK(OnName.contains(QStringLiteral("Sort &Ascending")));
+  CHECK(!OnName.contains(QStringLiteral("Show File Si&zes In")));
+  CHECK(!OnName.contains(QStringLiteral("&Calculate Directory Sizes")));
+  QStringList OnSize = HeaderPopupItems(Panel, FileListModel::ColSize);
+  CHECK(OnSize.contains(QStringLiteral("Show File Si&zes In")));
+  CHECK(OnSize.contains(QStringLiteral("&Calculate Directory Sizes")));
+}
+
+// F-28: what the panel of a tab without session offers
+static void TestDisconnectedPanel()
+{
+  std::printf("[disconnected panel]\n");
+  FilePanel Panel(true);
+  Panel.resize(400, 300);
+  Panel.show();
+  auto * Reconnect = Panel.findChild<QPushButton *>(QStringLiteral("ReconnectItem"));
+  auto * Message = Panel.findChild<QLabel *>(QStringLiteral("ReconnectLabel"));
+  CHECK((Reconnect != nullptr) && (Message != nullptr));
+  if ((Reconnect == nullptr) || (Message == nullptr)) return;
+  CHECK(!Reconnect->isVisible() && !Message->isVisible());
+  int Requested = 0;
+  QObject::connect(&Panel, &FilePanel::ReconnectRequested, [&Requested]() { Requested++; });
+  Panel.SetDisconnected(true, QStringLiteral("Connection lost."));
+  CHECK(Reconnect->isVisible() && Message->isVisible());
+  CHECK_EQ(Message->text(), QStringLiteral("Connection lost."));
+  Reconnect->click();
+  CHECK_EQ(Requested, 1);
+  Panel.SetDisconnected(false);
+  CHECK(!Reconnect->isVisible() && !Message->isVisible());
+}
+
 static void TestRemotePanel(const QString & Root)
 {
   QByteArray Port = qgetenv("NIXSCP_TEST_SSH_PORT");
@@ -858,8 +1202,10 @@ static void TestRemotePanel(const QString & Root)
   // ... and the real home directory without it
   Config.DefaultDirIsHome = false;
   Panel.HomeDirectory();
+  // of the account: a test server may give $HOME instead ("sftp-server -d")
   QString Home = QFileInfo(QDir::homePath()).canonicalFilePath();
-  CHECK(WaitFor([&]() { return !Panel.IsLoading() && (Panel.CurrentDirectory() == Home); }, 10000));
+  QString AccountHome = QFileInfo(QString::fromLocal8Bit(getpwuid(getuid())->pw_dir)).canonicalFilePath();
+  CHECK(WaitFor([&]() { return !Panel.IsLoading() && ((Panel.CurrentDirectory() == Home) || (Panel.CurrentDirectory() == AccountHome)); }, 10000));
   Config.DefaultDirIsHome = true;
 
   // Refresh remote panel every N seconds
@@ -897,6 +1243,11 @@ int main(int argc, char ** argv)
   TestLocalListing(Root.path());
   TestPanel(Root.path());
   TestPathLabel(Root.path());
+  TestFocusedTarget(Root.path());
+  TestDropFromOtherSession(Root.path());
+  TestHeaderPopup(Root.path());
+  TestDisconnectedPanel();
+  TestUnresolvedLinks();
   TestRemotePanel(Root.path());
 
   std::printf("%d checks, %d failures\n", Checks, Failures);

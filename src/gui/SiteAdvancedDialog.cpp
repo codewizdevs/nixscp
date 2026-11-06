@@ -33,6 +33,7 @@
 #include <QToolButton>
 #include <QWidgetAction>
 #include <QSpinBox>
+#include <QStandardItemModel>
 #include <QStackedWidget>
 #include <QThread>
 #include <QTreeWidget>
@@ -147,9 +148,6 @@ struct SiteAdvancedDialog::Private
   QSpinBox * TimeDifferenceMinutesEdit;
   QCheckBox * TimeDifferenceAutoCheck;
   QCheckBox * TrimVMSVersionsCheck;
-  QGroupBox * DSTModeGroup;
-  QRadioButton * DSTModeUnixCheck;
-  QRadioButton * DSTModeWinCheck;
   // Directories
   QLineEdit * LocalDirectoryEdit;
   QLineEdit * RemoteDirectoryEdit;
@@ -168,7 +166,6 @@ struct SiteAdvancedDialog::Private
   // SFTP
   QComboBox * SFTPBugSymlinkCombo;
   QComboBox * SFTPBugSignedTSCombo;
-  QComboBox * SFTPMaxVersionCombo;
   QComboBox * SftpServerEdit;
   QCheckBox * AllowScpFallbackCheck;
   QComboBox * SFTPRealPathCombo;
@@ -251,8 +248,6 @@ struct SiteAdvancedDialog::Private
   QSpinBox * TunnelPortNumberEdit;
   QLineEdit * TunnelUserNameEdit;
   QLineEdit * TunnelPasswordEdit;
-  QGroupBox * TunnelOptionsGroup;
-  QComboBox * TunnelLocalPortNumberEdit;
   QGroupBox * TunnelAuthenticationParamsGroup;
   QLineEdit * TunnelPrivateKeyEdit;
   // TLS/SSL
@@ -266,14 +261,11 @@ struct SiteAdvancedDialog::Private
   QListWidget * CipherListBox;
   QPushButton * CipherUpButton;
   QPushButton * CipherDownButton;
-  QCheckBox * Ssh2LegacyDESCheck;
   // Key exchange
   QListWidget * KexListBox;
   QPushButton * KexUpButton;
   QPushButton * KexDownButton;
-  QCheckBox * AuthGSSAPIKEXCheck;
   QGroupBox * KexReexchangeGroup;
-  QSpinBox * RekeyTimeEdit;
   QLineEdit * RekeyDataEdit;
   // Authentication
   QCheckBox * SshNoUserAuthCheck;
@@ -387,14 +379,6 @@ SiteAdvancedDialog::SiteAdvancedDialog(SessionData & Data, QWidget * Parent) :
     d->TrimVMSVersionsCheck = new QCheckBox(QStringLiteral("&Trim VMS version numbers"));
     Grid->addWidget(d->TrimVMSVersionsCheck, 4, 0, 1, 2);
     L->addWidget(G);
-
-    d->DSTModeGroup = new QGroupBox(QStringLiteral("Daylight saving time"));
-    auto * V = new QVBoxLayout(d->DSTModeGroup);
-    d->DSTModeUnixCheck = new QRadioButton(QStringLiteral("Adjust remote timestamp to local co&nventions"));
-    d->DSTModeWinCheck = new QRadioButton(QStringLiteral("Adjust remote timestamp with &DST"));
-    V->addWidget(d->DSTModeUnixCheck);
-    V->addWidget(d->DSTModeWinCheck);
-    L->addWidget(d->DSTModeGroup);
     L->addStretch();
   }
 
@@ -458,14 +442,9 @@ SiteAdvancedDialog::SiteAdvancedDialog(SessionData & Data, QWidget * Parent) :
     d->SftpServerEdit->addItems({QStringLiteral("Default"), QStringLiteral("/bin/sftp-server"), QStringLiteral("sudo su -c /bin/sftp-server")});
     Grid->addWidget(Buddy(QStringLiteral("SFTP ser&ver:"), d->SftpServerEdit), 0, 0);
     Grid->addWidget(d->SftpServerEdit, 0, 1);
-    d->SFTPMaxVersionCombo = new QComboBox();
-    d->SFTPMaxVersionCombo->addItem(QStringLiteral("Auto"));
-    for (int V = 0; V <= 6; V++)
-    {
-      d->SFTPMaxVersionCombo->addItem(QString::number(V));
-    }
-    Grid->addWidget(Buddy(QStringLiteral("&Preferred SFTP protocol version:"), d->SFTPMaxVersionCombo), 1, 0);
-    Grid->addWidget(d->SFTPMaxVersionCombo, 1, 1);
+    // libssh speaks version 3 only (WinSCP: "Preferred SFTP protocol version")
+    Grid->addWidget(new QLabel(QStringLiteral("SFTP protocol version:")), 1, 0);
+    Grid->addWidget(new QLabel(QStringLiteral("3 (the only version NixSCP uses)")), 1, 1);
     d->SFTPRealPathCombo = AutoSwitchCombo();
     Grid->addWidget(Buddy(QStringLiteral("Ca&nonicalize paths on the server"), d->SFTPRealPathCombo), 2, 0);
     Grid->addWidget(d->SFTPRealPathCombo, 2, 1);
@@ -693,11 +672,27 @@ SiteAdvancedDialog::SiteAdvancedDialog(SessionData & Data, QWidget * Parent) :
     {
       d->ProxyMethodCombo->addItems({QStringLiteral("None"), QStringLiteral("SOCKS4"), QStringLiteral("SOCKS5"),
         QStringLiteral("HTTP"), QStringLiteral("Telnet"), QStringLiteral("Local")});
+#ifdef Q_OS_WIN
+      // libssh for Windows has no proxy command: a site could not connect.
+      // Disabled, not removed, so a site that has it still shows what it has
+      if (auto * Items = qobject_cast<QStandardItemModel *>(d->ProxyMethodCombo->model()))
+      {
+        Items->item(pmCmd)->setEnabled(false);
+      }
+#endif
     }
     else
     {
-      // FtpProxyMethodCombo/NeonProxyMethodCombo; FTP logon types are n/a
+      // FtpProxyMethodCombo/NeonProxyMethodCombo
       d->ProxyMethodCombo->addItems({QStringLiteral("None"), QStringLiteral("SOCKS4"), QStringLiteral("SOCKS5"), QStringLiteral("HTTP")});
+      if (FData.FSProtocol == fsFTP)
+      {
+        // SessionData::FtpProxyLogonType 1.. after the proxy methods
+        d->ProxyMethodCombo->addItems({QStringLiteral("SITE %host"), QStringLiteral("USER %proxyuser, USER %user@%host"),
+          QStringLiteral("OPEN %host"), QStringLiteral("USER %proxyuser, USER %user"), QStringLiteral("USER %user@%host"),
+          QStringLiteral("USER %proxyuser@%host"), QStringLiteral("USER %user@%host %proxyuser"),
+          QStringLiteral("USER %user@%proxyuser@%host")});
+      }
     }
     Grid->addWidget(Buddy(QStringLiteral("Proxy &type:"), d->ProxyMethodCombo), 0, 0, 1, 2);
     Grid->addWidget(d->ProxyMethodCombo, 1, 0);
@@ -713,7 +708,7 @@ SiteAdvancedDialog::SiteAdvancedDialog(SessionData & Data, QWidget * Parent) :
       {
         d->ProxyHostEdit->setText(Host);
         d->ProxyPortEdit->setValue(Port);
-        d->ProxyMethodCombo->setCurrentIndex(qMin(static_cast<int>(Method), d->ProxyMethodCombo->count() - 1));
+        d->ProxyMethodCombo->setCurrentIndex(static_cast<int>(Method));
         UpdateControls();
       }
     });
@@ -799,21 +794,6 @@ SiteAdvancedDialog::SiteAdvancedDialog(SessionData & Data, QWidget * Parent) :
     Grid->setColumnStretch(0, 1);
     L->addWidget(d->TunnelSessionGroup);
 
-    d->TunnelOptionsGroup = new QGroupBox(QStringLiteral("Tunnel options"));
-    auto * ORow = new QHBoxLayout(d->TunnelOptionsGroup);
-    d->TunnelLocalPortNumberEdit = new QComboBox();
-    d->TunnelLocalPortNumberEdit->setEditable(true);
-    d->TunnelLocalPortNumberEdit->addItem(QStringLiteral("Autoselect"));
-    // TunnelLocalPortNumberLow..High of Configuration (50000..50099)
-    for (int Port = 50000; Port <= 50099; Port++)
-    {
-      d->TunnelLocalPortNumberEdit->addItem(QString::number(Port));
-    }
-    ORow->addWidget(Buddy(QStringLiteral("&Local tunnel port:"), d->TunnelLocalPortNumberEdit));
-    ORow->addWidget(d->TunnelLocalPortNumberEdit);
-    ORow->addStretch();
-    L->addWidget(d->TunnelOptionsGroup);
-
     d->TunnelAuthenticationParamsGroup = new QGroupBox(QStringLiteral("Tunnel authentication parameters"));
     auto * AV = new QVBoxLayout(d->TunnelAuthenticationParamsGroup);
     d->TunnelPrivateKeyEdit = new QLineEdit();
@@ -868,8 +848,6 @@ SiteAdvancedDialog::SiteAdvancedDialog(SessionData & Data, QWidget * Parent) :
     Grid->addWidget(d->CipherUpButton, 1, 1);
     Grid->addWidget(d->CipherDownButton, 2, 1);
     Grid->setRowStretch(3, 1);
-    d->Ssh2LegacyDESCheck = new QCheckBox(QStringLiteral("Enable legacy use of single-&DES"));
-    Grid->addWidget(d->Ssh2LegacyDESCheck, 4, 0, 1, 2);
     L->addWidget(G2);
     L->addStretch();
   }
@@ -887,18 +865,13 @@ SiteAdvancedDialog::SiteAdvancedDialog(SessionData & Data, QWidget * Parent) :
     Grid->addWidget(d->KexUpButton, 1, 1);
     Grid->addWidget(d->KexDownButton, 2, 1);
     Grid->setRowStretch(3, 1);
-    d->AuthGSSAPIKEXCheck = new QCheckBox(QStringLiteral("Attempt &GSSAPI key exchange"));
-    Grid->addWidget(d->AuthGSSAPIKEXCheck, 4, 0, 1, 2);
     L->addWidget(G);
     d->KexReexchangeGroup = new QGroupBox(QStringLiteral("Options controlling key re-exchange"));
     auto * Grid2 = new QGridLayout(d->KexReexchangeGroup);
-    d->RekeyTimeEdit = new QSpinBox();
-    d->RekeyTimeEdit->setRange(0, 1440);
+    // Only by data: a time limit slows every request down in libssh (SecureShell.cpp)
     d->RekeyDataEdit = new QLineEdit();
-    Grid2->addWidget(Buddy(QStringLiteral("Max &minutes before rekey (0 for no limit):"), d->RekeyTimeEdit), 0, 0);
-    Grid2->addWidget(d->RekeyTimeEdit, 0, 1);
-    Grid2->addWidget(Buddy(QStringLiteral("Ma&x data before rekey (0 for no limit):"), d->RekeyDataEdit), 1, 0);
-    Grid2->addWidget(d->RekeyDataEdit, 1, 1);
+    Grid2->addWidget(Buddy(QStringLiteral("Ma&x data before rekey (0 for no limit):"), d->RekeyDataEdit), 0, 0);
+    Grid2->addWidget(d->RekeyDataEdit, 0, 1);
     L->addWidget(d->KexReexchangeGroup);
     L->addStretch();
   }
@@ -969,15 +942,11 @@ SiteAdvancedDialog::SiteAdvancedDialog(SessionData & Data, QWidget * Parent) :
   {
     auto * G = new QGroupBox(QStringLiteral("Detection of known bugs in SSH servers"));
     auto * Grid = new QGridLayout(G);
+    // Only the workarounds that are possible with libssh; the stored values
+    // of the others are kept
     struct { TSshBug Bug; const char * Caption; } Bugs[] = {
-      { sbHMAC2, "Miscomputes SSH H&MAC keys:" },
-      { sbDeriveKey2, "Miscomputes SSH &encryption keys:" },
-      { sbRSAPad2, "Requires &padding on SSH RSA signatures:" },
-      { sbPKSessID2, "Misuses the sessio&n ID in SSH PK auth:" },
       { sbRekey2, "Handles SSH &key re-exchange badly:" },
-      { sbMaxPkt2, "Ignores SSH ma&ximum packet size:" },
       { sbIgnore2, "Chokes on SSH i&gnore messages:" },
-      { sbWinAdj, "Chokes on WinSCP's SSH '&winadj' requests" },
     };
     int Row = 0;
     for (const auto & B : Bugs)
@@ -1166,7 +1135,6 @@ void SiteAdvancedDialog::LoadSession()
   d->FollowDirectorySymlinksCheck->setChecked(S.FollowDirectorySymlinks);
 
   // Environment page
-  (S.DSTMode == dstmWin ? d->DSTModeWinCheck : d->DSTModeUnixCheck)->setChecked(true);
   d->EOLTypeCombo->setCurrentIndex((S.EOLType == eolLF) ? 0 : 1);
   switch (S.NotUtf)
   {
@@ -1190,7 +1158,6 @@ void SiteAdvancedDialog::LoadSession()
   d->SftpServerEdit->setCurrentText(S.SftpServer.isEmpty() ? d->SftpServerEdit->itemText(0) : S.SftpServer);
   d->AllowScpFallbackCheck->setChecked(S.FSProtocol == fsSFTP);
   d->UsePosixRenameCheck->setChecked(S.UsePosixRename);
-  d->SFTPMaxVersionCombo->setCurrentIndex((S.SFTPMaxVersion < 0) ? 0 : qMin(S.SFTPMaxVersion + 1, 7));
   ComboAutoSwitchLoad(d->SFTPRealPathCombo, S.SFTPRealPath);
   ComboAutoSwitchLoad(d->SFTPBugSymlinkCombo, S.SFTPBug[sbSymlink]);
   ComboAutoSwitchLoad(d->SFTPBugSignedTSCombo, S.SFTPBug[sbSignedTS]);
@@ -1222,7 +1189,6 @@ void SiteAdvancedDialog::LoadSession()
   d->DetachedCertificateEdit->setText(S.DetachedCertificate);
 
   // SSH page
-  d->Ssh2LegacyDESCheck->setChecked(S.Ssh2DES);
   d->CompressionCheck->setChecked(S.Compression);
   d->CipherListBox->clear();
   for (const QString & Name : S.Ciphers())
@@ -1238,8 +1204,6 @@ void SiteAdvancedDialog::LoadSession()
     auto * Item = new QListWidgetItem(KexDisplayName(Name), d->KexListBox);
     Item->setData(Qt::UserRole, Name);
   }
-  d->AuthGSSAPIKEXCheck->setChecked(S.AuthGSSAPIKEX);
-  d->RekeyTimeEdit->setValue(S.RekeyTime);
   d->RekeyDataEdit->setText(S.RekeyData);
 
   // Connection page
@@ -1282,7 +1246,9 @@ void SiteAdvancedDialog::LoadSession()
   d->SCPLsFullTimeAutoCheck->setChecked(S.SCPLsFullTime != asOff);
 
   // Proxy page
-  d->ProxyMethodCombo->setCurrentIndex(qMin(static_cast<int>(S.ProxyMethod), d->ProxyMethodCombo->count() - 1));
+  // GetFtpProxyLogonType: a logon type rules out a proxy method
+  int ProxyIndex = ((S.FSProtocol == fsFTP) && (S.FtpProxyLogonType > 0)) ? (pmHTTP + S.FtpProxyLogonType) : static_cast<int>(S.ProxyMethod);
+  d->ProxyMethodCombo->setCurrentIndex(qMin(ProxyIndex, d->ProxyMethodCombo->count() - 1));
   d->ProxyHostEdit->setText(S.ProxyHost);
   d->ProxyPortEdit->setValue(S.ProxyPort);
   d->ProxyUsernameEdit->setText(S.ProxyUsername);
@@ -1308,8 +1274,6 @@ void SiteAdvancedDialog::LoadSession()
   d->TunnelHostNameEdit->setText(S.TunnelHostName);
   d->TunnelPasswordEdit->setText(S.TunnelPassword);
   d->TunnelPrivateKeyEdit->setText(S.TunnelPublicKeyFile);
-  d->TunnelLocalPortNumberEdit->setCurrentText(
-    (S.TunnelLocalPortNumber <= 0) ? d->TunnelLocalPortNumberEdit->itemText(0) : QString::number(S.TunnelLocalPortNumber));
 
   // TLS/SSL page
   d->MinTlsVersionCombo->setCurrentIndex(TlsVersionToIndex(S.MinTlsVersion));
@@ -1332,7 +1296,6 @@ void SiteAdvancedDialog::SaveSession(SessionData & S)
 {
   // SSH page
   S.Compression = d->CompressionCheck->isChecked();
-  S.Ssh2DES = d->Ssh2LegacyDESCheck->isChecked();
   QStringList Ciphers;
   for (int Index = 0; Index < d->CipherListBox->count(); Index++)
   {
@@ -1347,8 +1310,6 @@ void SiteAdvancedDialog::SaveSession(SessionData & S)
     Kexes.append(d->KexListBox->item(Index)->data(Qt::UserRole).toString());
   }
   S.KexList = Kexes.join(QLatin1Char(','));
-  S.AuthGSSAPIKEX = d->AuthGSSAPIKEXCheck->isChecked();
-  S.RekeyTime = d->RekeyTimeEdit->value();
   S.RekeyData = d->RekeyDataEdit->text().trimmed();
 
   // Authentication page
@@ -1387,7 +1348,6 @@ void SiteAdvancedDialog::SaveSession(SessionData & S)
   S.FollowDirectorySymlinks = d->FollowDirectorySymlinksCheck->isChecked();
 
   // Environment page
-  S.DSTMode = d->DSTModeWinCheck->isChecked() ? dstmWin : dstmUnix;
   S.EOLType = (d->EOLTypeCombo->currentIndex() == 0) ? eolLF : eolCRLF;
   switch (d->UtfCombo->currentIndex())
   {
@@ -1429,7 +1389,6 @@ void SiteAdvancedDialog::SaveSession(SessionData & S)
   // SFTP page
   QString SftpServer = d->SftpServerEdit->currentText().trimmed();
   S.SftpServer = (SftpServer.isEmpty() || (SftpServer == d->SftpServerEdit->itemText(0))) ? QString() : SftpServer;
-  S.SFTPMaxVersion = (d->SFTPMaxVersionCombo->currentIndex() == 0) ? SFTPMaxVersionAuto : (d->SFTPMaxVersionCombo->currentIndex() - 1);
   if ((S.FSProtocol == fsSFTP) || (S.FSProtocol == fsSFTPonly))
   {
     // AllowScpFallbackCheck
@@ -1456,7 +1415,13 @@ void SiteAdvancedDialog::SaveSession(SessionData & S)
   S.S3RoleArn = d->S3RoleArnEdit->text().trimmed();
 
   // Proxy page
-  S.ProxyMethod = static_cast<TProxyMethod>(d->ProxyMethodCombo->currentIndex());
+  int ProxyIndex = d->ProxyMethodCombo->currentIndex();
+  bool FtpLogonType = (FData.FSProtocol == fsFTP) && (ProxyIndex > pmHTTP);
+  S.ProxyMethod = FtpLogonType ? pmNone : static_cast<TProxyMethod>(ProxyIndex);
+  if (FData.FSProtocol == fsFTP)
+  {
+    S.FtpProxyLogonType = FtpLogonType ? (ProxyIndex - pmHTTP) : 0;
+  }
   S.ProxyHost = d->ProxyHostEdit->text().trimmed();
   S.ProxyPort = d->ProxyPortEdit->value();
   S.ProxyUsername = d->ProxyUsernameEdit->text();
@@ -1482,8 +1447,6 @@ void SiteAdvancedDialog::SaveSession(SessionData & S)
   S.TunnelHostName = d->TunnelHostNameEdit->text().trimmed();
   S.TunnelPassword = d->TunnelPasswordEdit->text();
   S.TunnelPublicKeyFile = d->TunnelPrivateKeyEdit->text().trimmed();
-  QString LocalPort = d->TunnelLocalPortNumberEdit->currentText().trimmed();
-  S.TunnelLocalPortNumber = (LocalPort == d->TunnelLocalPortNumberEdit->itemText(0)) ? 0 : LocalPort.toInt();
 
   // TLS/SSL page
   S.MinTlsVersion = IndexToTlsVersion(d->MinTlsVersionCombo->currentIndex());
@@ -1521,7 +1484,8 @@ void SiteAdvancedDialog::UpdateControls()
 
   // connection sheet
   Enable(d->FtpPasvModeCheck, FtpProtocol);
-  if (FtpProtocol && (d->ProxyMethodCombo->currentIndex() != pmNone) && !d->FtpPasvModeCheck->isChecked())
+  if (FtpProtocol && (d->ProxyMethodCombo->currentIndex() != pmNone) && (d->ProxyMethodCombo->currentIndex() <= pmHTTP) &&
+      !d->FtpPasvModeCheck->isChecked())
   {
     d->FtpPasvModeCheck->setChecked(true);
     if (isVisible())
@@ -1529,7 +1493,8 @@ void SiteAdvancedDialog::UpdateControls()
       QMessageBox::information(this, windowTitle(), QStringLiteral("Passive mode must be enabled when FTP connection through proxy is selected."));
     }
   }
-  Enable(d->BufferSizeCheck, SshProtocol || FtpProtocol || S3Protocol);
+  // FTP only: for SSH the socket keeps the buffer tuning of the system
+  d->BufferSizeCheck->setVisible(FtpProtocol);
   d->PingGroup->setVisible(!FtpProtocol);
   Enable(d->PingGroup, SshProtocol);
   Enable(d->PingIntervalSecEdit, d->PingGroup->isEnabled() && !d->PingOffButton->isChecked());
@@ -1567,9 +1532,10 @@ void SiteAdvancedDialog::UpdateControls()
   d->Pages[15].Enabled = SshProtocol;
 
   // connection/proxy sheet
-  TProxyMethod ProxyMethod = static_cast<TProxyMethod>(d->ProxyMethodCombo->currentIndex());
+  bool FtpLogonType = FtpProtocol && (d->ProxyMethodCombo->currentIndex() > pmHTTP);
+  TProxyMethod ProxyMethod = FtpLogonType ? pmNone : static_cast<TProxyMethod>(d->ProxyMethodCombo->currentIndex());
   QString ProxyCommand = (ProxyMethod == pmCmd) ? d->ProxyLocalCommandEdit->text() : d->ProxyTelnetCommandEdit->text();
-  bool ProxyHostPort =
+  bool ProxyHostPort = FtpLogonType ||
     (ProxyMethod == pmSocks4) || (ProxyMethod == pmSocks5) || (ProxyMethod == pmHTTP) || (ProxyMethod == pmTelnet);
   Enable(d->ProxyHostEdit, ProxyHostPort ||
     ((ProxyMethod == pmCmd) && ProxyCommand.contains(QStringLiteral("%proxyhost"), Qt::CaseInsensitive)));
@@ -1578,11 +1544,11 @@ void SiteAdvancedDialog::UpdateControls()
     ((ProxyMethod == pmCmd) && ProxyCommand.contains(QStringLiteral("%proxyport"), Qt::CaseInsensitive)));
   Enable(d->ProxyPortLabel, d->ProxyPortEdit->isEnabled());
   bool CommandProxy = (ProxyMethod == pmTelnet) || (ProxyMethod == pmCmd);
-  Enable(d->ProxyUsernameEdit,
+  Enable(d->ProxyUsernameEdit, FtpLogonType ||
     ((ProxyMethod == pmSocks4) && !FtpProtocol) || (ProxyMethod == pmSocks5) || (ProxyMethod == pmHTTP) ||
     (CommandProxy && ProxyCommand.contains(QStringLiteral("%user"), Qt::CaseInsensitive)));
   Enable(d->ProxyUsernameLabel, d->ProxyUsernameEdit->isEnabled());
-  Enable(d->ProxyPasswordEdit, (ProxyMethod == pmSocks5) || (ProxyMethod == pmHTTP) ||
+  Enable(d->ProxyPasswordEdit, FtpLogonType || (ProxyMethod == pmSocks5) || (ProxyMethod == pmHTTP) ||
     (CommandProxy && ProxyCommand.contains(QStringLiteral("%pass"), Qt::CaseInsensitive)));
   Enable(d->ProxyPasswordLabel, d->ProxyPasswordEdit->isEnabled());
   bool ProxySettings = (ProxyMethod != pmNone) && SshProtocol;
@@ -1606,7 +1572,6 @@ void SiteAdvancedDialog::UpdateControls()
   // environment sheet
   Enable(d->EOLTypeCombo, SftpProtocol || ScpProtocol);
   Enable(d->EOLTypeLabel, d->EOLTypeCombo->isEnabled());
-  Enable(d->DSTModeGroup, SftpProtocol || ScpProtocol);
   Enable(d->UtfCombo, SftpProtocol || FtpProtocol || ScpProtocol);
   Enable(d->UtfLabel, d->UtfCombo->isEnabled());
   bool FtpProtocolWithMlsdOff = FtpProtocol && (ComboAutoSwitchSave(d->FtpUseMlsdCombo) == asOff);
@@ -1647,7 +1612,6 @@ void SiteAdvancedDialog::UpdateControls()
   // tunnel sheet
   d->Pages[10].Enabled = SshProtocol;
   Enable(d->TunnelSessionGroup, d->TunnelCheck->isChecked());
-  Enable(d->TunnelOptionsGroup, d->TunnelSessionGroup->isEnabled());
   Enable(d->TunnelAuthenticationParamsGroup, d->TunnelSessionGroup->isEnabled());
 
   // connection/ssl/tls

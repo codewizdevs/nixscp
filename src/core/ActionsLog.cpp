@@ -1,5 +1,6 @@
 // Port of WinSCP source/core/SessionInfo.cpp: TActionLog, TSessionActionRecord, TSessionAction
 #include "core/ActionsLog.h"
+#include "core/Platform.h"
 #include "core/Configuration.h"
 #include "core/FileSystem.h"
 #include "core/SessionData.h"
@@ -62,6 +63,7 @@ namespace
 thread_local std::shared_ptr<ActionsLog> CurrentActionsLog;
 thread_local std::vector<SessionAction *> OpenActions;
 std::atomic<bool> SessionLoggingEnabled{true};
+std::shared_ptr<ActionsLog> ProcessActionsLog;
 
 QMutex SharedLogsMutex;
 QHash<QString, std::weak_ptr<ActionsLog>> & SharedLogs()
@@ -158,7 +160,7 @@ QStringList ActionsLog::ExceptionMessages(const QString & Message, const QString
   return Result;
 }
 
-bool ActionsLog::Open(QString * Error)
+bool ActionsLog::Open(QString * Error, bool DeferHeader)
 {
   QMutexLocker Lock(&FMutex);
   if (FLogging)
@@ -184,14 +186,33 @@ bool ActionsLog::Open(QString * Error)
     }
     return false;
   }
-  FFile.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+  Platform::MakePrivate(FFile);
   FLogging = true;
-  // TActionLog::ReflectSettings
+  FHeaderPending = true;
+  if (!DeferHeader)
+  {
+    AddHeader();
+  }
+  return FLogging;
+}
+
+void ActionsLog::AddHeader()
+{
+  // TActionLog::ReflectSettings; FMutex is locked
+  FHeaderPending = false;
   DoAdd(XmlDeclaration);
   QString SessionName = (FData != nullptr) ? XmlAttributeEscape(FData->SessionName()) : QStringLiteral("nosession");
   DoAdd(QStringLiteral("<session xmlns=\"http://winscp.net/schema/session/1.0\" name=\"%1\" start=\"%2\">")
     .arg(SessionName, StandardTimestamp()));
-  return FLogging;
+}
+
+void ActionsLog::SetSession(const SessionData & Data)
+{
+  QMutexLocker Lock(&FMutex);
+  if (FHeaderPending)
+  {
+    FData = std::make_unique<SessionData>(Data);
+  }
 }
 
 void ActionsLog::Close()
@@ -227,6 +248,12 @@ bool ActionsLog::Logging() const
   return FLogging;
 }
 
+bool ActionsLog::Failed() const
+{
+  QMutexLocker Lock(&FMutex);
+  return FFailed;
+}
+
 QString ActionsLog::CurrentFileName() const
 {
   QMutexLocker Lock(&FMutex);
@@ -246,17 +273,19 @@ void ActionsLog::DoAdd(const QString & Line)
   {
     return;
   }
+  if (FHeaderPending)
+  {
+    AddHeader();
+  }
   QByteArray Data = (Line + QLatin1Char('\n')).toUtf8();
-  if (FFile.write(Data) != Data.size())
+  if ((FFile.write(Data) != Data.size()) || !FFile.flush())
   {
     // LOG_GEN_ERROR: logging is turned off
     FLastError = FFile.errorString();
     FFailed = true;
     FLogging = false;
     FFile.close();
-    return;
   }
-  FFile.flush();
 }
 
 void ActionsLog::Add(const QString & Line)
@@ -445,8 +474,24 @@ void ActionsLog::SetSessionLoggingEnabled(bool Enabled)
   SessionLoggingEnabled = Enabled;
 }
 
+void ActionsLog::SetProcessLog(const std::shared_ptr<ActionsLog> & Log)
+{
+  QMutexLocker Lock(&SharedLogsMutex);
+  ProcessActionsLog = Log;
+}
+
+std::shared_ptr<ActionsLog> ActionsLog::ProcessLog()
+{
+  QMutexLocker Lock(&SharedLogsMutex);
+  return ProcessActionsLog;
+}
+
 std::shared_ptr<ActionsLog> ActionsLog::CreateForSession(const SessionData & Data, const Configuration & Config)
 {
+  if (std::shared_ptr<ActionsLog> Log = ProcessLog())
+  {
+    return Log;
+  }
   if (!SessionLoggingEnabled || !Config.LogActions || Config.ActionsLogFileName.isEmpty())
   {
     return nullptr;

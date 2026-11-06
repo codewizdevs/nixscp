@@ -4,8 +4,10 @@
 // uses QDesktopServices and Share is unavailable.
 #pragma once
 
+#include <QMap>
 #include <QObject>
 #include <QStringList>
+#include <QUrl>
 #include <QVariantList>
 
 class AndroidFiles : public QObject
@@ -42,11 +44,24 @@ public:
   Q_INVOKABLE QVariantList editors() const;
   // While a transfer runs: a foreground service (with a notification) keeps
   // Android from stopping the app and cutting its connection in the background
-  // Percent: of the notification's progress bar, -1 = unknown
-  Q_INVOKABLE void keepAlive(bool Busy, const QString & Text, int Percent = -1);
-  // Copies downloaded files into the public Downloads/NixSCP folder (shown by
-  // the Files app); the places they went, empty where it failed
+  // Percent: of the notification's progress bar, -1 = unknown. Who: what
+  // needs it; the service runs while anything does, so the end of a sign-in
+  // does not stop the transfers, or the other way round
+  Q_INVOKABLE void keepAlive(bool Busy, const QString & Text, int Percent = -1, const QString & Who = QStringLiteral("transfers"));
+  bool KeptAlive() const { return !FKeepers.isEmpty(); }
+  // Copies downloaded files and folders into the public Downloads/NixSCP
+  // folder (shown by the Files app); the places they went, empty where it failed
   Q_INVOKABLE QStringList publish(const QStringList & Paths);
+  // The text as a file in Downloads/NixSCP, in Encoding when it can be
+  // written in it (UTF-8 otherwise); the place, empty on failure
+  Q_INVOKABLE QString saveCopy(const QString & Name, const QString & Text, const QString & Encoding);
+  // For an Image: any file name is a valid URL
+  Q_INVOKABLE QUrl fileUrl(const QString & Path) const { return QUrl::fromLocalFile(Path); }
+  // The files below Path (itself, for a file) with their folders relative to its parent
+  static QList<QPair<QString, QString>> FilesToPublish(const QString & Path);
+
+  // Screen capture and the recents thumbnail show nothing of the app
+  static void SecureWindow();
 
   // The phone's shared storage (/storage/emulated/0), and whether the app
   // may use all of it: "All files access" on Android 11+, the storage
@@ -66,6 +81,12 @@ private:
   IntentListener * FListener = nullptr;
   QStringList FShared;
   QStringList FSharedNames;
+  struct Keeper
+  {
+    QString Text;
+    int Percent = -1;
+  };
+  QMap<QString, Keeper> FKeepers;
   QString FLastText;
   int FLastPercent = -2;
   qint64 FLastUpdate = 0;

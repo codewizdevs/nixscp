@@ -14,6 +14,9 @@ public:
   static bool FromOctal(const QString & Str, unsigned int & Mode);
 };
 
+// TModificationFmt (precision of a timestamp, e.g. of FTP listings)
+enum TModificationFmt { mfNone, mfMDY, mfYMDHM, mfMDHM, mfFull };
+
 struct RemoteFile
 {
   enum Type { File, Directory, Symlink, Other };
@@ -21,6 +24,7 @@ struct RemoteFile
   QString FileName;
   qint64 Size = 0;
   QDateTime Modification;
+  TModificationFmt ModificationFmt = mfFull; // what Modification really holds (seconds of a LIST are made up)
   unsigned int Permissions = 0; // lower 12 bits, as in st_mode
   Type FileType = File;
   bool IsDirectory = false;     // also true for symlinks pointing to directories
@@ -37,11 +41,20 @@ struct RemoteFile
 
 using RemoteFileList = QList<RemoteFile>;
 
+// Read as a Windows path, Name would leave the folder it is stored in: "..\x",
+// "\\server\share", "C:x", ".. ". Any other name with a backslash or a colon
+// stays listed, and CopyParam::ValidLocalFileName encodes it. On any platform,
+// for the tests.
+bool LeavesWindowsFolder(const QString & Name);
+
 // A name from a server listing that is safe to use as a single path
 // component (no traversal through "..", "/" or absolute names)
 inline bool IsValidListingName(const QString & N)
 {
   return !N.isEmpty() && (N != QStringLiteral(".")) && (N != QStringLiteral("..")) &&
+#ifdef Q_OS_WIN
+    !LeavesWindowsFolder(N) &&
+#endif
     !N.contains(QLatin1Char('/')) && !N.contains(QChar(0));
 }
 
@@ -52,4 +65,8 @@ namespace UnixPath
   QString ExtractFileDir(const QString & Path);
   QString Parent(const QString & Path);
   bool IsRoot(const QString & Path);
+  // Can the last component of Path name a file or directory created locally?
+  // A hostile server can list "x/..", and a transfer of a selected entry
+  // names its target after this component. The root has no name to misuse.
+  bool HasValidFileName(const QString & Path);
 }

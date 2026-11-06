@@ -492,8 +492,11 @@ static void TestTeams()
 int main(int argc, char ** argv)
 {
   qputenv("NIXSCP_NO_UPDATE_CHECK", "1");
-  QApplication App(argc, argv);
+  // the tunnel test connects, and libssh reads ~/.ssh
   QTemporaryDir Dir;
+  qputenv("HOME", Dir.path().toUtf8());
+  qputenv("XDG_CONFIG_HOME", (Dir.path() + QStringLiteral("/.config")).toUtf8());
+  QApplication App(argc, argv);
   Configuration & Config = Configuration::Instance();
   Config.SetIniFileName(Dir.path() + QStringLiteral("/nixscp.ini"));
   Config.Load();

@@ -4,6 +4,8 @@
 // file panes' view and the archive format.
 #pragma once
 
+#include "mobile/PrivateState.h"
+
 #include <QObject>
 #include <QSettings>
 
@@ -67,7 +69,11 @@ public:
   QString siteKey(const QString & Site) const;
   void setSiteKey(const QString & Site, const QString & KeyName);
 
-  // the phone's settings kept in the configuration (after it is loaded)
+  // what names sites, folders and keys (encrypted with the configuration)
+  PrivateState & Private() { return FPrivate; }
+
+  // the phone's settings kept in the configuration (after it is loaded, and
+  // after every change of it: a cloud pull brings another device's settings)
   void ApplyToConfiguration();
   // The site as opened on the phone: these settings over its own
   void Apply(SessionData & Data) const;
@@ -77,6 +83,7 @@ signals:
 
 private:
   mutable QSettings FSettings;
+  PrivateState FPrivate;
 
   int Int(const QString & Key, int Default) const;
   bool Bool(const QString & Key, bool Default) const;

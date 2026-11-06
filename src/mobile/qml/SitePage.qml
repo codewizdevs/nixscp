@@ -14,14 +14,9 @@ Page {
     property string original: ""
     property bool hadPassword: false
     // a team's site the user only uses (member): changes are undone by the team
-    readonly property bool teamReadOnly: {
-        if (original.indexOf("Team: ") !== 0) return false
-        var team = original.substring(6, original.indexOf("/") > 0 ? original.indexOf("/") : original.length)
-        var list = teams.teams
-        for (var i = 0; i < list.length; i++)
-            if (list[i].name === team) return !list[i].canEdit
-        return false
-    }
+    readonly property bool teamReadOnly: siteTeam.uuid !== undefined && !siteTeam.canEdit
+    // sharing started on this page; a shared copy leaves the site here, so the form stays
+    property string teamAction: ""
     // the private key's path ("" = none)
     property string keyPath: ""
     // Android's keyboard height (Qt's on Android 9/10)
@@ -242,8 +237,8 @@ Page {
                     id: stopMenu
                     topMargin: insets.top + 4
                     bottomMargin: insets.bottom + 4
-                    MenuItem { text: qsTr("Stop sharing, keep my copy"); onTriggered: teams.unshare(page.siteTeam.uuid, [page.siteTeam.relative], true) }
-                    MenuItem { text: qsTr("Stop sharing and delete"); onTriggered: teams.unshare(page.siteTeam.uuid, [page.siteTeam.relative], false) }
+                    MenuItem { text: qsTr("Stop sharing, keep my copy"); onTriggered: { page.teamAction = "gone"; teams.unshare(page.siteTeam.uuid, [page.siteTeam.relative], true) } }
+                    MenuItem { text: qsTr("Stop sharing and delete"); onTriggered: { page.teamAction = "gone"; teams.unshare(page.siteTeam.uuid, [page.siteTeam.relative], false) } }
                 }
             }
         }
@@ -270,16 +265,23 @@ Page {
             }
             CheckBox { id: shareKeep; text: qsTr("Keep my own copy as well") }
         }
-        onAccepted: teams.shareSite(team.uuid, page.original, "", !shareKeep.checked)
+        onAccepted: {
+            page.teamAction = shareKeep.checked ? "stays" : "gone"
+            teams.shareSite(team.uuid, page.original, "", !shareKeep.checked)
+        }
     }
 
     Connections {
         target: teams
         function onFinished(op, ok, error, data) {
-            if (op !== "shareSite" && op !== "unshare") return
+            // an operation of another page (the team's page) is not this one's
+            if ((op !== "shareSite" && op !== "unshare") || page.teamAction.length === 0) return
+            var action = page.teamAction
+            page.teamAction = ""
             if (!ok) { if (error) app.toast(error); return }
             app.toast(op === "shareSite" ? qsTr("Shared with the team.") : qsTr("No longer shared."))
-            page.StackView.view.pop()
+            // only when the site this page edits is gone, and only this page
+            if (action === "gone" && page.StackView.view && page.StackView.view.currentItem === page) page.StackView.view.pop()
         }
     }
 

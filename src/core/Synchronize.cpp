@@ -6,6 +6,7 @@
 // source/windows/SynchronizeController.cpp, source/forms/CustomScpExplorer.cpp
 // (DoSynchronizeMove) and source/packages/filemng/CustomDirView.pas (ProcessChangedFiles)
 #include "core/Synchronize.h"
+#include "core/ActionsLog.h"
 #include "core/Platform.h"
 
 #include "core/FtpFileSystem.h"
@@ -157,7 +158,8 @@ QString LocalFileChecksum(const QString & FileName, const QString & Alg)
 QHash<QString, QString> ParseChecksumOutput(const QStringList & Lines)
 {
   // "<hex>  <name>" or "<hex> *<name>" (binary mode); with a leading "\" the
-  // name has "\\", "\n" (and "\r") escaped (GNU coreutils)
+  // name has "\\", "\n" (and "\r") escaped (GNU coreutils). "<hex> <name>" with
+  // one space: "md5 -r" of macOS and the BSDs
   QHash<QString, QString> Result;
   for (const QString & ALine : Lines)
   {
@@ -186,12 +188,12 @@ QHash<QString, QString> ParseChecksumOutput(const QStringList & Lines)
         break;
       }
     }
-    QChar Mode = Line.at(Space + 1);
-    if (!Hex || ((Mode != QLatin1Char(' ')) && (Mode != QLatin1Char('*'))))
+    if (!Hex)
     {
       continue;
     }
-    QString Name = Line.mid(Space + 2);
+    QChar Mode = Line.at(Space + 1);
+    QString Name = Line.mid(Space + (((Mode == QLatin1Char(' ')) || (Mode == QLatin1Char('*'))) ? 2 : 1));
     if (Escaped)
     {
       QString Unescaped;
@@ -642,6 +644,7 @@ public:
     FTerm(ATerm), FProgress(AProgress), FMode(AMode), FParam(AParam), FParams(AParams), FOptions(AOptions),
     FStatus(AStatus), FFollowDirectorySymlinks(AFollowDirectorySymlinks), FChecklist(AChecklist)
   {
+    FParam.TrimVMSVersions = ATerm->Data().TrimVMSVersions;
   }
 
   void CollectDirectory(const QString & Directory1, const QString & Directory2, bool FirstLevel);
@@ -686,7 +689,7 @@ private:
   FileSystem & Fs() { return FTerm->WorkerFileSystem(); }
   FileOperationProgress & FProgress;
   SynchronizeMode FMode;
-  const CopyParam & FParam;
+  CopyParam FParam;
   int FParams;
   const SynchronizeOptions & FOptions;
   SynchronizeStatus * FStatus;
@@ -705,7 +708,17 @@ private:
     }
     FProgress.CheckCancel();
   }
-  QString Key(const QString & FileName) const { return Flag(spCaseSensitive) ? FileName : FileName.toLower(); }
+  QString Key(const QString & FileName) const
+  {
+#ifdef Q_OS_MACOS
+    // both Unicode forms of a name are the same file on the disk of macOS, where
+    // a name often has the decomposed one, and a server the composed one
+    QString Name = FileName.normalized(QString::NormalizationForm_C);
+#else
+    const QString & Name = FileName;
+#endif
+    return Flag(spCaseSensitive) ? Name : Name.toLower();
+  }
   bool MatchesFilter(const Level & Data, const QString & FileName) const
   {
     return !Data.FirstLevel || FOptions.MatchesFilter(FileName);
@@ -835,6 +848,7 @@ bool SynchronizeCollector::DownloadSameFileChecksum(const QString & LeftFileName
   {
     throw ExtException(QStringLiteral("Error calculating checksum for file '%1'.").arg(RightFileName), Temp.errorString());
   }
+  Platform::MakeDirectoryPrivate(Temp.path());
   QString TempFileName = Temp.filePath(QStringLiteral("checksum"));
   Fs().Download(RightFileName, TempFileName, FProgress);
   QString Alg = QStringLiteral("sha-256");
@@ -1183,7 +1197,8 @@ void SynchronizeCollector::CollectFile(Level & Data, const RemoteFile & File)
         QString FullLocalFileName = LocalCombine(LocalData->Info.Directory, LocalData->Info.FileName);
         if (!ChecklistItem->IsDirectory)
         {
-          ChecklistItem->Info1.Modification = ReduceToSeconds(ChecklistItem->Info1.Modification);
+          // TTerminal::DoSynchronizeCollectFile: as precise as the remote listing is
+          ChecklistItem->Info1.Modification = ReduceDateTimePrecision(ChecklistItem->Info1.Modification, File.ModificationFmt);
           FileCheckModified(Data, ChecklistItem, FullLocalFileName, LocalData, FullRemoteFileName, File);
         }
         else if (!Flag(spNoRecurse))
@@ -1435,7 +1450,10 @@ void SynchronizeApplier::ApplyTimestamps()
           Progress.SetFile(Item->GetLocalPath(), 0);
           try
           {
+            SessionAction TouchAction(laTouch, Item->GetRemotePath());
+            TouchAction.Modification(Item->LocalLastWriteTime());
             Fs.SetModificationTime(Item->GetRemotePath(), Item->LocalLastWriteTime());
+            TouchAction.Commit();
           }
           catch (const FatalException &)
           {
@@ -1879,7 +1897,7 @@ void SynchronizeMove(Terminal * Term, bool Remote, const QStringList & FileList,
           RemoteFile Existing;
           if (!Fs.FileExists(NewFileName, &Existing))
           {
-            Fs.CreateDirectory(NewFileName, 0755);
+            Fs.CreateDirectory(NewFileName, ServerDefaultMode);
           }
         }
         for (const QString & FileName : FileList)
@@ -1950,10 +1968,12 @@ static void ProcessChangedFiles(const QList<CompareEntry> & Entries, const QList
         QDateTime FileTime = Item.Modification;
         QDateTime MirrorFileTime = MirrorItem->Modification;
         bool SecondPrecision = Item.SecondPrecision || MirrorItem->SecondPrecision;
+        // ModificationFmt: an FTP LIST may give minutes or days only, or no time at all
+        TModificationFmt Precision = LessDateTimePrecision(Item.ModificationFmt, MirrorItem->ModificationFmt);
         if (SecondPrecision)
         {
-          FileTime = ReduceToSeconds(FileTime);
-          MirrorFileTime = ReduceToSeconds(MirrorFileTime);
+          FileTime = ReduceDateTimePrecision(FileTime, Precision);
+          MirrorFileTime = ReduceDateTimePrecision(MirrorFileTime, Precision);
         }
         SameTime = (FileTime == MirrorFileTime);
         if (SecondPrecision)
@@ -1961,7 +1981,7 @@ static void ProcessChangedFiles(const QList<CompareEntry> & Entries, const QList
           // 1 ms more solves the rounding issues
           MirrorFileTime = MirrorFileTime.addMSecs(1001);
         }
-        IsChanged = (FileTime > MirrorFileTime);
+        IsChanged = FileTime.isValid() && MirrorFileTime.isValid() && (FileTime > MirrorFileTime);
       }
       else
       {
@@ -1989,12 +2009,16 @@ void CompareDirectories(const QList<CompareEntry> & Local, const QList<CompareEn
 }
 
 void CompareDirectories(const QString & LocalDirectory, const RemoteFileList & RemoteFiles,
-  bool ByTime, bool BySize, QStringList & LocalChanged, QStringList & RemoteChanged)
+  bool ByTime, bool BySize, QStringList & LocalChanged, QStringList & RemoteChanged, const QSet<QString> * LocalNames)
 {
   QList<CompareEntry> Local;
   const QFileInfoList Entries = QDir(LocalDirectory).entryInfoList(QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot);
   for (const QFileInfo & Info : Entries)
   {
+    if ((LocalNames != nullptr) && !LocalNames->contains(Info.fileName()))
+    {
+      continue;
+    }
     CompareEntry Entry;
     Entry.FileName = Info.fileName();
     Entry.Directory = Info.isDir();
@@ -2014,6 +2038,7 @@ void CompareDirectories(const QString & LocalDirectory, const RemoteFileList & R
     Entry.Directory = File.IsDirectory;
     Entry.Size = File.Size;
     Entry.Modification = File.Modification;
+    Entry.ModificationFmt = File.ModificationFmt;
     Entry.SecondPrecision = true;
     Remote.append(Entry);
   }

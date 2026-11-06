@@ -62,8 +62,12 @@ const int spMirror = 0x1000;
 const int spCaseSensitive = 0x2000;
 const int spByChecksum = 0x4000;    // cannot be combined with spTimestamp and smBoth
 // WinSCP: spNoConfirmation | spPreviewChanges (Windows file systems are case
-// insensitive); Linux: case sensitive by default
+// insensitive, as is the default volume of macOS); Linux: case sensitive by default
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+const int spDefault = spNoConfirmation | spPreviewChanges;
+#else
 const int spDefault = spNoConfirmation | spPreviewChanges | spCaseSensitive;
+#endif
 
 QString SynchronizeModeStr(SynchronizeMode Mode);
 QString SynchronizeParamsStr(int Params);
@@ -298,7 +302,7 @@ void SynchronizeMove(Terminal * Term, bool Remote, const QStringList & FileList,
 // lower case hex. Throws ExtException.
 QString LocalFileChecksum(const QString & FileName, const QString & Alg);
 // Parses the output lines of "sha256sum -- file..." (also sha1sum/md5sum,
-// "shasum -a 256"; GNU escaped names "\hash  name" are decoded) into
+// "shasum -a 256", "md5 -r"; GNU escaped names "\hash  name" are decoded) into
 // file name -> lower case hex checksum
 QHash<QString, QString> ParseChecksumOutput(const QStringList & Lines);
 
@@ -306,7 +310,7 @@ QHash<QString, QString> ParseChecksumOutput(const QStringList & Lines);
 // names of files (not directories) in each panel, that are missing in the
 // other panel (unless ExistingOnly) or newer than their counterpart, or with
 // the same time but different size (BySize). Time is compared with the
-// precision of the less precise side (seconds for SFTP).
+// precision of the less precise side (seconds for SFTP, what a LIST gives for FTP).
 struct CompareEntry
 {
   QString FileName;
@@ -314,12 +318,15 @@ struct CompareEntry
   qint64 Size = 0;
   QDateTime Modification;
   bool SecondPrecision = false;
+  TModificationFmt ModificationFmt = mfFull;  // with SecondPrecision
 };
 void CompareDirectories(const QList<CompareEntry> & Local, const QList<CompareEntry> & Remote,
   bool ByTime, bool BySize, bool ExistingOnly, QStringList & LocalChanged, QStringList & RemoteChanged);
-// Convenience variant listing LocalDirectory (non-recursive)
+// Convenience variant listing LocalDirectory (non-recursive). LocalNames: the
+// local files to compare, the ones shown in the panel (nullptr = all)
 void CompareDirectories(const QString & LocalDirectory, const RemoteFileList & RemoteFiles,
-  bool ByTime, bool BySize, QStringList & LocalChanged, QStringList & RemoteChanged);
+  bool ByTime, bool BySize, QStringList & LocalChanged, QStringList & RemoteChanged,
+  const QSet<QString> * LocalNames = nullptr);
 
 // ---------------------------------------------------------------------------
 // Keep remote directory up to date (windows/SynchronizeController.cpp)

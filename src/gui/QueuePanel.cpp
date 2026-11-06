@@ -15,6 +15,7 @@
 #include "gui/FileListModel.h"
 #include "gui/Icons.h"
 #include "gui/PreferencesDialog.h"
+#include "gui/SystemActions.h"
 
 #include <QAction>
 #include <QActionGroup>
@@ -1324,6 +1325,8 @@ QueuePanel::QueuePanel(QWidget * Parent) :
     OnceEmptyGroup->addAction(Action);
   }
   d->A(QA::IdleOnceEmpty)->setChecked(true);
+  d->A(QA::SuspendOnceEmpty)->setVisible(SystemActions::OperationSupported(SystemActions::odoSuspend));
+  d->A(QA::ShutDownOnceEmpty)->setVisible(SystemActions::OperationSupported(SystemActions::odoShutDown));
   QAction * ToggleShow = d->MakeAction(QA::ToggleShow, QStringLiteral("&Queue"), QStringLiteral("Show/hide queue list"),
     QStringLiteral("QueueToggleShowAction"));
   ToggleShow->setCheckable(true);
@@ -1579,6 +1582,15 @@ QueuePanel::QueuePanel(QWidget * Parent) :
       case odoDisconnect: d->OnceEmpty = odoSuspend; break;
       case odoSuspend: d->OnceEmpty = odoShutDown; break;
       case odoShutDown: d->OnceEmpty = odoIdle; break;
+    }
+    // Only what has a backend (the cycle of the menu items visible)
+    if ((d->OnceEmpty == odoSuspend) && !d->A(QA::SuspendOnceEmpty)->isVisible())
+    {
+      d->OnceEmpty = odoShutDown;
+    }
+    if ((d->OnceEmpty == odoShutDown) && !d->A(QA::ShutDownOnceEmpty)->isVisible())
+    {
+      d->OnceEmpty = odoIdle;
     }
     d->UpdateActions();
   });

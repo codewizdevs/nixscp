@@ -105,6 +105,20 @@ void SessionManager::Watch(RemoteSession * Session)
     // not inside the session's own call
     QTimer::singleShot(0, this, [this, Session]() { Remove(Session); });
   });
+  // a lost connection ends the tab, shown or not: its queue must not wait for ever
+  connect(Session, &RemoteSession::stateChanged, this, [Session]()
+  {
+    if (!Session->connected() && !Session->busy() && !Session->site().isEmpty())
+    {
+      QTimer::singleShot(0, Session, [Session]()
+      {
+        if (!Session->connected() && !Session->busy() && !Session->site().isEmpty())
+        {
+          Session->close();
+        }
+      });
+    }
+  });
   connect(Session, &RemoteSession::error, this, [this, Session](const QString & Message, const QString & Details)
   {
     emit error(Session->site(), Message, Details);
@@ -117,6 +131,10 @@ void SessionManager::Watch(RemoteSession * Session)
   connect(Session, &RemoteSession::editReady, this, [this, Session](const QString & Local, const QString & Remote)
   {
     emit editReady(Session, Local, Remote);
+  });
+  connect(Session, &RemoteSession::editUnsent, this, [this, Session](const QString & Local)
+  {
+    emit editUnsent(FLastSite.value(Session), Local);
   });
   connect(Session, &RemoteSession::archived, this, &SessionManager::archived);
   connect(Session, &RemoteSession::previewReady, this, [this, Session](const QString & Local, const QString & Name)
@@ -133,6 +151,7 @@ void SessionManager::open(const QString & Site)
   auto * Session = new RemoteSession(FUI, FSettings, FQueue, this);
   Watch(Session);
   FSessions.append(Session);
+  FLastSite.insert(Session, Site);
   FCurrent = static_cast<int>(FSessions.size()) - 1;
   emit sessionsChanged();
   emit currentChanged();
@@ -160,8 +179,10 @@ void SessionManager::Remove(RemoteSession * Session)
   {
     return;
   }
+  emit sessionEnded(Session);
   disconnect(Session, nullptr, this, nullptr);
   FSessions.removeAt(Index);
+  FLastSite.remove(Session);
   // the neighbour becomes current (the idle session when none is left)
   bool WasCurrent = (Index == FCurrent);
   if (Index < FCurrent)
@@ -175,7 +196,16 @@ void SessionManager::Remove(RemoteSession * Session)
   emit sessionsChanged();
   emit currentChanged();
   emit transferChanged();
-  Session->deleteLater();
+  // its connections may still end, with callbacks into it
+  Session->DeleteWhenClosed();
+}
+
+void SessionManager::CloseAll()
+{
+  for (RemoteSession * Session : std::as_const(FSessions))
+  {
+    Session->close();
+  }
 }
 
 void SessionManager::checkEdits()

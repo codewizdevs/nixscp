@@ -50,6 +50,8 @@ public:
 signals:
   void directoryChanged();
   void accessChanged();
+  // a folder could not be opened
+  void failed(const QString & message);
 
 private:
   FileListModel FFiles;

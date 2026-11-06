@@ -373,8 +373,30 @@ static void TestCopyParam()
   }
 }
 
+// "./" masks relative to the directories of a transfer (TFileMasks::SetRoots)
+static void TestRoots()
+{
+  FileMasks M(QStringLiteral("./sub/*.txt"));
+  M.SetRoots(QStringLiteral("/local/root"), QStringLiteral("/remote/root/"));
+  CHECK(M.Matches(QStringLiteral("/remote/root/sub/a.txt"), false, false));
+  CHECK(M.Matches(QStringLiteral("/local/root/sub/a.txt"), true, false));
+  CHECK(!M.Matches(QStringLiteral("/local/root/sub/a.txt"), false, false));
+  CHECK(!M.Matches(QStringLiteral("/remote/root/other/a.txt"), false, false));
+  FileMasks Top(QStringLiteral("./*.txt"));
+  Top.SetRoots(QStringLiteral("/l"), QStringLiteral("/r"));
+  CHECK(Top.Matches(QStringLiteral("/r/a.txt"), false, false));
+  CHECK(!Top.Matches(QStringLiteral("/r/sub/a.txt"), false, false));
+  // a root is taken literally
+  FileMasks Literal(QStringLiteral("./*.txt"));
+  Literal.SetRoots(QStringLiteral("/l[1]"), QStringLiteral("/r*x"));
+  CHECK(Literal.Matches(QStringLiteral("/l[1]/a.txt"), true, false));
+  CHECK(!Literal.Matches(QStringLiteral("/l1/a.txt"), true, false));
+  CHECK(!Literal.Matches(QStringLiteral("/rabx/a.txt"), false, false));
+}
+
 int main()
 {
+  TestRoots();
   TestWildcards();
   TestLists();
   TestDirectories();

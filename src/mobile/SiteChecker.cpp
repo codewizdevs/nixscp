@@ -3,7 +3,6 @@
 #include "core/Configuration.h"
 #include "core/SessionData.h"
 
-#include <QHostInfo>
 #include <QTimer>
 
 void SiteChecker::check(const QString & Site)
@@ -19,14 +18,22 @@ void SiteChecker::check(const QString & Site)
   FReport.clear();
   FConnected = false;
   QString Host = Data->HostNameExpanded();
-  quint16 Port = static_cast<quint16>(Data->PortNumber);
-  FReport.append(QStringLiteral("%1, port %2 (%3)").arg(Host).arg(Port).arg(Data->ProtocolStr()));
+  FPort = static_cast<quint16>(Data->PortNumber);
+  FReport.append(QStringLiteral("%1, port %2 (%3)").arg(Host).arg(FPort).arg(Data->ProtocolStr()));
   FTimer.start();
-  QHostInfo Info = QHostInfo::fromName(Host);
+  // in the background: a slow name server must not freeze the app
+  FLookup = QHostInfo::lookupHost(Host, this, [this](const QHostInfo & Info) { Connect(Info); });
+  emit checkingChanged();
+}
+
+void SiteChecker::Connect(const QHostInfo & Info)
+{
+  FLookup = -1;
   if (Info.error() != QHostInfo::NoError)
   {
     FReport.append(QStringLiteral("✗ The name does not resolve: %1").arg(Info.errorString()));
-    emit finished(Site, false, FReport.join(QLatin1Char('\n')));
+    emit checkingChanged();
+    emit finished(FSite, false, FReport.join(QLatin1Char('\n')));
     return;
   }
   QString Address = Info.addresses().value(0).toString();
@@ -71,7 +78,7 @@ void SiteChecker::check(const QString & Site)
       Finish(false);
     }
   });
-  Socket->connectToHost(Info.addresses().value(0), Port);
+  Socket->connectToHost(Info.addresses().value(0), FPort);
 }
 
 void SiteChecker::Finish(bool Ok)
@@ -91,6 +98,12 @@ void SiteChecker::Finish(bool Ok)
 
 void SiteChecker::stop()
 {
+  if (FLookup >= 0)
+  {
+    QHostInfo::abortHostLookup(FLookup);
+    FLookup = -1;
+    emit checkingChanged();
+  }
   if (FSocket != nullptr)
   {
     QTcpSocket * Socket = FSocket;

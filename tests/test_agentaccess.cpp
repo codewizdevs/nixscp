@@ -6,11 +6,16 @@
 // download, approval prompts, and every refusal.
 //
 // Skipped unless these are set:
-//   NIXSCP_TEST_CLOUD_COOKIE       website session cookie of a test account with an active license (or beta)
-//   NIXSCP_TEST_AGENT_SSH_PORT     SSH server on 127.0.0.1 with password authentication
-//   NIXSCP_TEST_AGENT_SSH_USER, NIXSCP_TEST_AGENT_SSH_PASSWORD
+//   NIXSCP_TEST_AGENT_SSH_PORT     SSH server on 127.0.0.1
+//   NIXSCP_TEST_AGENT_SSH_USER
+//   NIXSCP_TEST_AGENT_SSH_PASSWORD or NIXSCP_TEST_AGENT_SSH_KEY (private key file)
 //   NIXSCP_TEST_AGENT_KNOWN_HOSTS  known_hosts file with the server's host key
 //   NIXSCP_AGENT_CLIENT            the nixscp executable
+// Optional:
+//   NIXSCP_TEST_CLOUD_COOKIE       website session cookie of a test account with an active license (or
+//                                  beta): the NixSCP password part. Without it the same steps run with a
+//                                  key set directly, and the account steps are skipped
+//   NIXSCP_TEST_AGENT_TUNNEL_PORT  an SSH port as seen from the server (default 2222)
 // NIXSCP_GUI_TESTS
 #include "core/AgentAccess.h"
 #include "core/CloudSync.h"
@@ -21,13 +26,13 @@
 
 #include <QAbstractButton>
 #include <QApplication>
+#include <QDialog>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QTcpSocket>
 #include <QDir>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QMessageBox>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QProcess>
@@ -136,6 +141,7 @@ static void AddSite(const QString & Name, int Access, int Permissions, const QSt
   Site.PortNumber = qEnvironmentVariableIntValue("NIXSCP_TEST_AGENT_SSH_PORT");
   Site.UserName = qEnvironmentVariable("NIXSCP_TEST_AGENT_SSH_USER");
   Site.Password = qEnvironmentVariable("NIXSCP_TEST_AGENT_SSH_PASSWORD");
+  Site.PublicKeyFile = qEnvironmentVariable("NIXSCP_TEST_AGENT_SSH_KEY");
   Site.FSProtocol = fsSFTP;
   Site.KnownHostsFile = KnownHosts;
   Site.AgentAccess = Access;
@@ -152,10 +158,10 @@ static void AnswerApproval(const QString & Caption)
   {
     for (QWidget * W : QApplication::topLevelWidgets())
     {
-      auto * Box = qobject_cast<QMessageBox *>(W);
+      auto * Box = qobject_cast<QDialog *>(W);
       if ((Box != nullptr) && Box->isVisible() && (Box->windowTitle() == QStringLiteral("NixSCP Agent Access")))
       {
-        for (QAbstractButton * B : Box->buttons())
+        for (QAbstractButton * B : Box->findChildren<QAbstractButton *>())
         {
           if (B->text() == Caption)
           {
@@ -176,8 +182,7 @@ int main(int argc, char ** argv)
   {
     qputenv("QT_QPA_PLATFORM", "offscreen");
   }
-  const char * Required[] = {"NIXSCP_TEST_CLOUD_COOKIE", "NIXSCP_TEST_AGENT_SSH_PORT", "NIXSCP_TEST_AGENT_SSH_USER",
-    "NIXSCP_TEST_AGENT_SSH_PASSWORD", "NIXSCP_TEST_AGENT_KNOWN_HOSTS", "NIXSCP_AGENT_CLIENT"};
+  const char * Required[] = {"NIXSCP_TEST_AGENT_SSH_PORT", "NIXSCP_TEST_AGENT_SSH_USER", "NIXSCP_TEST_AGENT_KNOWN_HOSTS", "NIXSCP_AGENT_CLIENT"};
   for (const char * Name : Required)
   {
     if (qEnvironmentVariableIsEmpty(Name))
@@ -186,9 +191,18 @@ int main(int argc, char ** argv)
       return 0;
     }
   }
+  if (qEnvironmentVariableIsEmpty("NIXSCP_TEST_AGENT_SSH_PASSWORD") && qEnvironmentVariableIsEmpty("NIXSCP_TEST_AGENT_SSH_KEY"))
+  {
+    std::printf("SKIP: set NIXSCP_TEST_AGENT_SSH_PASSWORD or NIXSCP_TEST_AGENT_SSH_KEY\n");
+    return 0;
+  }
+  bool HaveAccount = !qEnvironmentVariableIsEmpty("NIXSCP_TEST_CLOUD_COOKIE");
+  int TunnelPort = qEnvironmentVariableIsEmpty("NIXSCP_TEST_AGENT_TUNNEL_PORT") ? 2222 : qEnvironmentVariableIntValue("NIXSCP_TEST_AGENT_TUNNEL_PORT");
   QTemporaryDir Dir;
-  // the broker's socket and the client's lookup use this folder
+  // the broker's socket and the client's lookup use this folder; libssh reads ~/.ssh otherwise
   qputenv("XDG_RUNTIME_DIR", Dir.path().toUtf8());
+  qputenv("HOME", Dir.path().toUtf8());
+  qputenv("XDG_CONFIG_HOME", (Dir.path() + QStringLiteral("/.config")).toUtf8());
   QApplication App(argc, argv);
   Configuration & Config = Configuration::Instance();
   Config.SetIniFileName(Dir.path() + QStringLiteral("/nixscp.ini"));
@@ -213,7 +227,7 @@ int main(int argc, char ** argv)
     Rules->AgentAllow = QStringLiteral("echo *\nuptime");
     Rules->AgentRecord = false;
     // a saved tunnel to the server's own SSH port (2222 inside the container)
-    Config.StoredSessions().FindByName(QStringLiteral("agent-allow"))->PortForwards = QStringLiteral("ssh|22223|localhost|2222");
+    Config.StoredSessions().FindByName(QStringLiteral("agent-allow"))->PortForwards = QStringLiteral("ssh|22223|localhost|%1").arg(TunnelPort);
   }
   // agents know this one only by its agent name
   AddSite(QStringLiteral("Clients/secret-client"), AgentAccess::amAllow, AgentAccess::apAll, KnownHosts, QStringLiteral("web-alias"));
@@ -231,46 +245,61 @@ int main(int argc, char ** argv)
   for (const auto & Site : Config.StoredSessions().Sessions())
   {
     Site->KnownHostsFile = (Site->Name == QStringLiteral("agent-new-host")) ? NoKnownHosts : KnownHosts;
+    // set in the Agent Access dialog, as far as the user is concerned
+    CHECK((Site->AgentAccess == AgentAccess::amOff) || AgentAccess::ConfirmSettings(*Site));
   }
   R = Agent({QStringLiteral("--list")});
   CHECK_MSG((R.Code == 0) && R.Out.contains("agent-allow"), QString::fromUtf8(R.Err));
   R = Agent({QStringLiteral("--connect"), QStringLiteral("agent-allow"), QStringLiteral("--cmd"), QStringLiteral("echo free")});
   CHECK_MSG((R.Code == 0) && (R.Out == "free\n"), QString::fromUtf8(R.Err));
 
-  // ---- NixSCP Pro: the NixSCP password replaces the master password
-  CHECK(SignIn());
-  // the server's host key (KnownHostsFile is not stored, so set it on the loaded sites)
-  for (const auto & Site : Config.StoredSessions().Sessions())
+  if (HaveAccount)
   {
-    Site->KnownHostsFile = (Site->Name == QStringLiteral("agent-new-host")) ? NoKnownHosts : KnownHosts;
-  }
-
-  // ---- the NixSCP password (sync password) encrypts the configuration
-  auto KeyDone = std::make_shared<int>(0);
-  CloudSync::Instance().CreateKey(QStringLiteral("agent test NixSCP password"), true,
-    [KeyDone](bool Ok, const QString &) { *KeyDone = Ok ? 1 : 2; });
-  WaitFor([KeyDone]() { return *KeyDone != 0; });
-  CHECK(*KeyDone == 1);
-  CHECK(ConfigVault::Enabled());
-  CHECK(ConfigVault::IsSealedFile(Config.IniFileName()));
-  {
-    QFile Raw(Config.IniFileName());
-    CHECK(Raw.open(QIODevice::ReadOnly) && !Raw.readAll().contains("agent-allow"));
-  }
-  // the master password is replaced by the NixSCP password; site passwords survive a restart
-  CHECK(!Config.UseMasterPassword());
-  {
-    QString Password = qEnvironmentVariable("NIXSCP_TEST_AGENT_SSH_PASSWORD");
-    ConfigVault::Forget();
-    CHECK(ConfigVault::Unlock(Config.IniFileName(), QStringLiteral("agent test NixSCP password"), false));
-    Config.Load();
-    CHECK(!Config.IsLocked() && !Config.UseMasterPassword());
-    auto Site = Config.StoredSessions().FindByName(QStringLiteral("agent-allow"));
-    CHECK((Site != nullptr) && (Site->Password == Password));
-    for (const auto & S : Config.StoredSessions().Sessions())
+    // ---- NixSCP Pro: the NixSCP password replaces the master password
+    CHECK(SignIn());
+    // the server's host key (KnownHostsFile is not stored, so set it on the loaded sites)
+    for (const auto & Site : Config.StoredSessions().Sessions())
     {
-      S->KnownHostsFile = (S->Name == QStringLiteral("agent-new-host")) ? NoKnownHosts : KnownHosts;
+      Site->KnownHostsFile = (Site->Name == QStringLiteral("agent-new-host")) ? NoKnownHosts : KnownHosts;
     }
+
+    // ---- the NixSCP password (sync password) encrypts the configuration
+    auto KeyDone = std::make_shared<int>(0);
+    CloudSync::Instance().CreateKey(QStringLiteral("agent test NixSCP password"), true,
+      [KeyDone](bool Ok, const QString &) { *KeyDone = Ok ? 1 : 2; });
+    WaitFor([KeyDone]() { return *KeyDone != 0; });
+    CHECK(*KeyDone == 1);
+    CHECK(ConfigVault::Enabled());
+    CHECK(ConfigVault::IsSealedFile(Config.IniFileName()));
+    {
+      QFile Raw(Config.IniFileName());
+      CHECK(Raw.open(QIODevice::ReadOnly) && !Raw.readAll().contains("agent-allow"));
+    }
+    // the master password is replaced by the NixSCP password; site passwords survive a restart
+    CHECK(!Config.UseMasterPassword());
+    {
+      QString Password = qEnvironmentVariable("NIXSCP_TEST_AGENT_SSH_PASSWORD");
+      ConfigVault::Forget();
+      CHECK(ConfigVault::Unlock(Config.IniFileName(), QStringLiteral("agent test NixSCP password"), false));
+      Config.Load();
+      CHECK(!Config.IsLocked() && !Config.UseMasterPassword());
+      auto Site = Config.StoredSessions().FindByName(QStringLiteral("agent-allow"));
+      CHECK((Site != nullptr) && (Site->Password == Password));
+      for (const auto & S : Config.StoredSessions().Sessions())
+      {
+        S->KnownHostsFile = (S->Name == QStringLiteral("agent-new-host")) ? NoKnownHosts : KnownHosts;
+      }
+    }
+  }
+  else
+  {
+    // a NixSCP key in memory stands in for the account: recordings need one
+    std::printf("No NIXSCP_TEST_CLOUD_COOKIE: the account steps are skipped\n");
+    CloudCrypto::SnapshotHeader Wrap;
+    Wrap.User = QStringLiteral("agent@nixscp.test");
+    Wrap.DekPassword = QByteArray(48, 'w');
+    ConfigVault::SetKey(QByteArray(CloudCrypto::KeyLength, 'k'), Wrap);
+    CHECK(ConfigVault::Enabled());
   }
 
   // ---- -help needs nothing
@@ -296,7 +325,7 @@ int main(int argc, char ** argv)
   R = Agent({QStringLiteral("--connect"), QStringLiteral("agent-allow"), QStringLiteral("--cmd"), QStringLiteral("head -c 20000000 /dev/zero")});
   CHECK_MSG((R.Code == 0) && (R.Out.size() == 20000000), QStringLiteral("%1 bytes, %2").arg(R.Out.size()).arg(QString::fromUtf8(R.Err)));
   // the stored password never shows up
-  CHECK(!R.Err.contains(qgetenv("NIXSCP_TEST_AGENT_SSH_PASSWORD")));
+  CHECK(qEnvironmentVariableIsEmpty("NIXSCP_TEST_AGENT_SSH_PASSWORD") || !R.Err.contains(qgetenv("NIXSCP_TEST_AGENT_SSH_PASSWORD")));
 
   // ---- option forms: --cmd=..., words after --cmd, and mistakes
   R = Agent({QStringLiteral("--connect"), QStringLiteral("agent-allow"), QStringLiteral("--cmd=echo one two")});
@@ -352,7 +381,7 @@ int main(int argc, char ** argv)
   CHECK((R.Code == 255) && R.Err.contains("substitution"));
   R = Agent({QStringLiteral("--put"), QStringLiteral("agent-rules"), Local, QStringLiteral("/tmp/x.bin")});
   CHECK_MSG((R.Code == 255) && R.Err.contains("downloads only"), QString::fromUtf8(R.Err));
-  R = Agent({QStringLiteral("--get"), QStringLiteral("agent-rules"), QStringLiteral("/etc/hostname"), Dir.path() + QStringLiteral("/hostname.txt")});
+  R = Agent({QStringLiteral("--get"), QStringLiteral("agent-rules"), QStringLiteral("/etc/hosts"), Dir.path() + QStringLiteral("/hosts.txt")});
   CHECK_MSG(R.Code == 0, QString::fromUtf8(R.Err));
   R = Agent({QStringLiteral("--list")});
   CHECK(R.Out.contains("downloads") && R.Out.contains("restricted commands"));
@@ -407,7 +436,7 @@ int main(int argc, char ** argv)
   }
 
   // ---- tunnels: a spec and a saved tunnel; the SSH banner comes through
-  for (const QString & Forward : {QStringLiteral("22222:localhost:2222"), QStringLiteral("ssh")})
+  for (const QString & Forward : {QStringLiteral("22222:localhost:%1").arg(TunnelPort), QStringLiteral("ssh")})
   {
     int LocalPort = (Forward == QStringLiteral("ssh")) ? 22223 : 22222;
     QProcess Tunnel;
@@ -430,7 +459,7 @@ int main(int argc, char ** argv)
     Probe.connectToHost(QStringLiteral("127.0.0.1"), static_cast<quint16>(LocalPort));
     CHECK(!Probe.waitForConnected(500));
   }
-  R = Agent({QStringLiteral("--tunnel"), QStringLiteral("agent-commands-only"), QStringLiteral("22224:localhost:2222")});
+  R = Agent({QStringLiteral("--tunnel"), QStringLiteral("agent-commands-only"), QStringLiteral("22224:localhost:%1").arg(TunnelPort)});
   CHECK_MSG((R.Code == 255) && R.Err.contains("does not allow"), QString::fromUtf8(R.Err));
   R = Agent({QStringLiteral("--tunnel"), QStringLiteral("agent-allow"), QStringLiteral("no-such-tunnel")});
   CHECK((R.Code == 255) && R.Err.contains("no saved tunnel"));
@@ -453,8 +482,14 @@ int main(int argc, char ** argv)
   if (!QStandardPaths::findExecutable(QStringLiteral("script")).isEmpty())
   {
     QProcess P;
+#ifdef Q_OS_MACOS
+    // script of BSD: the file first, then the command, and it hands the exit code on
+    P.start(QStringLiteral("script"), {QStringLiteral("-q"), QStringLiteral("/dev/null"), qEnvironmentVariable("NIXSCP_AGENT_CLIENT"),
+      QStringLiteral("--connect"), QStringLiteral("agent-allow")});
+#else
     P.start(QStringLiteral("script"), {QStringLiteral("-qec"),
       QStringLiteral("%1 --connect agent-allow").arg(qEnvironmentVariable("NIXSCP_AGENT_CLIENT")), QStringLiteral("/dev/null")});
+#endif
     CHECK(P.waitForStarted(10000));
     P.write("echo shell-$((6*7))\nexit 3\n");
     QByteArray Out;
@@ -491,11 +526,14 @@ int main(int argc, char ** argv)
   CHECK(LogText.contains("Clients/secret-client [agent name: web-alias]\texec\tallowed\techo via-alias"));
   CHECK(LogText.contains("agent-off\texec\tdenied: not allowed"));
   CHECK(LogText.contains("agent-ask\texec\tdenied: by user"));
-  CHECK(!LogText.contains(qgetenv("NIXSCP_TEST_AGENT_SSH_PASSWORD")));
+  CHECK(qEnvironmentVariableIsEmpty("NIXSCP_TEST_AGENT_SSH_PASSWORD") || !LogText.contains(qgetenv("NIXSCP_TEST_AGENT_SSH_PASSWORD")));
   CHECK((Log.permissions() & (QFileDevice::ReadGroup | QFileDevice::ReadOther)) == 0);
 
-  CloudSync::Instance().SignOut();
-  WaitFor([]() { return !CloudSync::Instance().SignedIn(); }, 10000);
+  if (HaveAccount)
+  {
+    CloudSync::Instance().SignOut();
+    WaitFor([]() { return !CloudSync::Instance().SignedIn(); }, 10000);
+  }
   if (Failures == 0)
   {
     std::printf("All agent access tests passed\n");

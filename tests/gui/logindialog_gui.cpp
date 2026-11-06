@@ -11,7 +11,7 @@
 //   c++ -o /tmp/logindialog_gui /tmp/logindialog_gui.o B/CMakeFiles/nixscp.dir/src/gui/*.o
 //     B/CMakeFiles/nixscp.dir/nixscp_autogen/mocs_compilation.cpp.o B/libnixscpcore.a
 //     $(pkg-config --libs Qt6Widgets Qt6Network libssh libcrypto)
-//   HOME=<empty dir> XDG_CONFIG_HOME=<empty dir>/.config QT_QPA_PLATFORM=offscreen /tmp/logindialog_gui
+//   QT_QPA_PLATFORM=offscreen /tmp/logindialog_gui
 #include <QApplication>
 #include <QComboBox>
 #include <QDialog>
@@ -24,6 +24,7 @@
 #include <QTimer>
 #include <QFile>
 #include <QDir>
+#include <QTemporaryDir>
 #include <QThread>
 #include <QTreeWidget>
 #include <QPlainTextEdit>
@@ -71,6 +72,10 @@ static void PressBox(QWidget * W, QMessageBox::StandardButton B)
 
 int main(int argc, char ** argv)
 {
+  // never the real home folder, whatever the caller set
+  QTemporaryDir Home;
+  qputenv("HOME", Home.path().toUtf8());
+  qputenv("XDG_CONFIG_HOME", (Home.path() + "/.config").toUtf8());
   QApplication App(argc, argv);
   QString Ini = qEnvironmentVariable("HOME") + "/test.ini";
   QFile::remove(Ini);
@@ -162,11 +167,18 @@ int main(int argc, char ** argv)
     CHECK(Sessions.FindByName("Work/alpha")->UserName == "a2");
     CHECK(Sessions.FindByName("Work/alpha")->Password == "pw");
     // Clone to new site
+    Sessions.FindByName("Work/alpha")->AgentAccess = 1;
+    Sessions.FindByName("Work/alpha")->AgentName = "prod";
     D.ReloadSessions("Work/alpha");
     D.CloneToNewSite();
     CHECK(D.IsNewSiteNode(D.Selected()));
     CHECK(D.FNewSiteData.Name == "Work/alpha (1)");
     CHECK(D.HostNameEdit->text() == "alpha.example.com");
+    // agents do not get at the clone, least of all under the name of the original
+    CHECK(D.FNewSiteData.AgentAccess == 0);
+    CHECK(D.FNewSiteData.AgentName.isEmpty());
+    Sessions.FindByName("Work/alpha")->AgentAccess = 0;
+    Sessions.FindByName("Work/alpha")->AgentName.clear();
     // clone is default for sites that cannot be opened
     D.ReloadSessions("nohost");
     CHECK(D.IsCloneToNewSiteDefault());

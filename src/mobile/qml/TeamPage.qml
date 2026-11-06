@@ -29,22 +29,26 @@ Page {
         target: teams
         function onFinished(op, ok, error, data) {
             if (!ok) { if (error) app.toast(error); return }
-            if (op === "members") page.memberList = data
-            else if (op === "invites") page.inviteList = data
+            // a late reply of another team's page
+            if (op === "members") { if (data.uuid === page.team.uuid) page.memberList = data.list }
+            else if (op === "invites") { if (data.uuid === page.team.uuid) page.inviteList = data.list }
+            else if (op === "history") { if (data.uuid === page.team.uuid) { historyDialog.versions = data.list; historyDialog.open() } }
             else if (op === "invite") { codeDialog.code = data; codeDialog.open(); teams.invites(page.team.uuid) }
             else if (op === "revoke" || op === "role" || op === "removeMember") page.load()
+            else if (op === "restore") { app.toast(qsTr("The version was restored.")); page.load() }
+            else if (op === "resolve") page.load()
             else if (op === "share") { app.toast(qsTr("The folder is now shared with the team.")); page.sharedList = teams.sharedSites(page.team.uuid) }
             else if (op === "shareSite") { app.toast(qsTr("The site is now shared with the team.")); page.sharedList = teams.sharedSites(page.team.uuid) }
             else if (op === "unshare") { app.toast(qsTr("No longer shared.")); page.sharedList = teams.sharedSites(page.team.uuid) }
             else if (op === "rename") app.toast(qsTr("Renamed."))
-            else if (op === "delete" || op === "leave") page.StackView.view.pop()
+            else if (op === "delete" || op === "leave" || op === "forget") page.StackView.view.pop()
         }
         function onChanged() {
             // the team's new name or role
             var list = teams.teams
             for (var i = 0; i < list.length; i++)
                 if (list[i].uuid === page.team.uuid) page.team = list[i]
-            page.sharedList = teams.sharedSites(page.team.uuid)
+            page.load()
         }
     }
 
@@ -71,6 +75,7 @@ Page {
                     topMargin: insets.top + 4
                     bottomMargin: insets.bottom + 4
                     MenuItem { text: qsTr("Rename…"); visible: page.canEdit; height: visible ? implicitHeight : 0; onTriggered: { nameDialog.open() } }
+                    MenuItem { text: qsTr("Restore from history…"); visible: page.canEdit; height: visible ? implicitHeight : 0; onTriggered: teams.history(page.team.uuid) }
                     MenuItem { text: qsTr("Delete team…"); visible: page.owner; height: visible ? implicitHeight : 0; onTriggered: { confirmDialog.action = "delete"; confirmDialog.open() } }
                     MenuItem { text: qsTr("Leave team…"); visible: !page.owner; height: visible ? implicitHeight : 0; onTriggered: { confirmDialog.action = "leave"; confirmDialog.open() } }
                 }
@@ -104,6 +109,38 @@ Page {
                 text: qsTr("A member was removed: the team key is being renewed by the next sync of an owner or admin.")
             }
 
+            Label {
+                Layout.fillWidth: true
+                Layout.margins: 16
+                visible: !!page.team.error
+                wrapMode: Text.Wrap
+                color: Material.color(Material.Red)
+                text: page.team.error || ""
+            }
+            RowLayout {
+                Layout.leftMargin: 8
+                visible: !!page.team.error
+                Button { flat: true; text: qsTr("Remove, keep the sites"); onClicked: { confirmDialog.action = "forgetKeep"; confirmDialog.open() } }
+                Button { flat: true; text: qsTr("Remove with the sites"); onClicked: { confirmDialog.action = "forget"; confirmDialog.open() } }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                Layout.leftMargin: 16
+                Layout.rightMargin: 16
+                Layout.topMargin: 8
+                visible: !page.team.error && !!page.team.conflict
+                wrapMode: Text.Wrap
+                color: Material.color(Material.Orange)
+                text: page.team.conflict || ""
+            }
+            RowLayout {
+                Layout.leftMargin: 8
+                visible: !page.team.error && !!page.team.conflict
+                Button { flat: true; text: qsTr("Use the team's version"); onClicked: { confirmDialog.action = "useTeam"; confirmDialog.open() } }
+                Button { flat: true; text: qsTr("Keep mine for everyone"); onClicked: { confirmDialog.action = "keepMine"; confirmDialog.open() } }
+            }
+
             // ---- shared sites ----
             Heading { text: qsTr("Shared sites (%1)").arg(page.sharedList.length) }
             Label {
@@ -116,7 +153,7 @@ Page {
                 text: (page.sharedList.length === 0
                        ? (page.canEdit ? qsTr("Nothing is shared yet. Share single sites or a whole folder; every member gets them.")
                                        : qsTr("Nothing is shared with this team yet."))
-                       : qsTr("In the folder \"Team: %1\" of the site list.").arg(page.team.name || ""))
+                       : qsTr("In the folder \"%1\" of the site list.").arg(page.team.folder || ""))
                       + (page.canEdit ? "" : " " + qsTr("Only owners and admins change them."))
             }
             Repeater {
@@ -194,10 +231,11 @@ Page {
                     contentItem: ColumnLayout {
                         spacing: 0
                         Label { text: (modelData.email || modelData.user_uuid) + (modelData.email === pro.email ? " " + qsTr("(you)") : ""); elide: Text.ElideRight; Layout.fillWidth: true }
-                        Label { text: modelData.role; opacity: 0.65; font.pixelSize: 13 }
+                        Label { text: modelData.role + (modelData.gone ? " · " + qsTr("account deleted") : "") + (modelData.unusable ? " · " + qsTr("unusable key") : ""); opacity: 0.65; font.pixelSize: 13 }
+                        Label { text: modelData.fingerprint || ""; opacity: 0.65; font.pixelSize: 11; font.family: monoFont; elide: Text.ElideRight; Layout.fillWidth: true }
                     }
-                    // owners and admins manage the others (not the owner)
-                    onClicked: if (page.canEdit && modelData.role !== "owner" && modelData.email !== pro.email) { memberMenu.member = modelData; memberMenu.popup() }
+                    // the owner manages everyone but themselves, admins the plain members
+                    onClicked: if ((page.owner || (page.canEdit && modelData.role === "member")) && modelData.role !== "owner" && modelData.email !== pro.email) { memberMenu.member = modelData; memberMenu.popup() }
                 }
             }
             Menu {
@@ -206,9 +244,20 @@ Page {
                 bottomMargin: insets.bottom + 4
                 property var member: ({})
                 MenuItem { text: memberMenu.member.email || ""; enabled: false }
-                MenuItem { text: qsTr("Make admin"); visible: memberMenu.member.role === "member"; height: visible ? implicitHeight : 0; onTriggered: teams.setRole(page.team.uuid, memberMenu.member.user_uuid, "admin") }
-                MenuItem { text: qsTr("Make member"); visible: memberMenu.member.role === "admin"; height: visible ? implicitHeight : 0; onTriggered: teams.setRole(page.team.uuid, memberMenu.member.user_uuid, "member") }
+                MenuItem { text: qsTr("Make admin"); visible: page.owner && memberMenu.member.role === "member"; height: visible ? implicitHeight : 0; onTriggered: teams.setRole(page.team.uuid, memberMenu.member.user_uuid, "admin") }
+                MenuItem { text: qsTr("Make member"); visible: page.owner && memberMenu.member.role === "admin"; height: visible ? implicitHeight : 0; onTriggered: teams.setRole(page.team.uuid, memberMenu.member.user_uuid, "member") }
                 MenuItem { text: qsTr("Remove from the team…"); onTriggered: { confirmDialog.action = "removeMember"; confirmDialog.member = memberMenu.member; confirmDialog.open() } }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                Layout.leftMargin: 16
+                Layout.rightMargin: 16
+                Layout.topMargin: 8
+                wrapMode: Text.Wrap
+                opacity: 0.7
+                font.pixelSize: 13
+                text: qsTr("Your key fingerprint: %1. Compare fingerprints with your colleagues over another channel: a match proves the key is theirs.").arg(teams.fingerprint())
             }
 
             // ---- invites ----
@@ -252,7 +301,8 @@ Page {
             width: inviteDialog.availableWidth
             Label { Layout.fillWidth: true; wrapMode: Text.Wrap; opacity: 0.7; text: qsTr("You get a one-time code to send them; they enter it in NixSCP (Teams, Join).") }
             Label { text: qsTr("Role"); opacity: 0.7 }
-            ComboBox { id: inviteRole; Layout.fillWidth: true; model: [qsTr("Member (uses the sites)"), qsTr("Admin (also changes them, invites)")] }
+            // only the owner makes admins
+            ComboBox { id: inviteRole; Layout.fillWidth: true; model: page.owner ? [qsTr("Member (uses the sites)"), qsTr("Admin (also changes them, invites)")] : [qsTr("Member (uses the sites)")] }
             Label { text: qsTr("Valid for"); opacity: 0.7 }
             ComboBox { id: inviteDays; Layout.fillWidth: true; currentIndex: 1; model: [qsTr("1 day"), qsTr("7 days"), qsTr("30 days")] }
         }
@@ -302,7 +352,7 @@ Page {
         Label {
             width: shareDialog.availableWidth
             wrapMode: Text.Wrap
-            text: qsTr("Its sites (with their passwords) move into \"Team: %1\" and every member gets them.").arg(page.team.name)
+            text: qsTr("Its sites (with their passwords) move into \"%1\" and every member gets them. Proxy, tunnel and command settings stay on this phone.").arg(page.team.folder || "")
         }
         onAccepted: teams.shareFolder(page.team.uuid, folder)
     }
@@ -373,19 +423,61 @@ Page {
         anchors.centerIn: parent
         width: Math.min(parent.width - 32, 440)
         modal: true
-        title: action === "delete" ? qsTr("Delete the team?") : (action === "leave" ? qsTr("Leave the team?") : qsTr("Remove %1?").arg(member.email || ""))
+        title: action === "delete" ? qsTr("Delete the team?") : (action === "leave" ? qsTr("Leave the team?")
+               : (action === "useTeam" ? qsTr("Use the team's version?") : (action === "keepMine" ? qsTr("Keep your version?")
+               : (action === "forget" || action === "forgetKeep" ? qsTr("Remove the team from this phone?") : qsTr("Remove %1?").arg(member.email || "")))))
         standardButtons: Dialog.Cancel | Dialog.Yes
         Label {
             width: confirmDialog.availableWidth
             wrapMode: Text.Wrap
             text: confirmDialog.action === "delete" ? qsTr("Every member loses the team's sites. This cannot be undone.")
                   : confirmDialog.action === "leave" ? qsTr("The team's sites are removed from your devices.")
+                  : confirmDialog.action === "useTeam" ? qsTr("Your changes to the team's sites on this phone are lost.")
+                  : confirmDialog.action === "keepMine" ? qsTr("Your sites replace the team's for everyone. The team's version stays in the history.")
+                  : confirmDialog.action === "forgetKeep" ? qsTr("It leaves this phone until someone invites you again; nothing changes for the others. Its sites stay here as your own.")
+                  : confirmDialog.action === "forget" ? qsTr("It leaves this phone until someone invites you again; nothing changes for the others. Its sites are removed from here.")
                   : qsTr("They lose the team's sites; the team key is renewed.")
         }
         onAccepted: {
             if (action === "delete") teams.remove(page.team.uuid)
             else if (action === "leave") teams.leave(page.team.uuid)
+            else if (action === "useTeam") teams.resolveConflict(page.team.uuid, false)
+            else if (action === "keepMine") teams.resolveConflict(page.team.uuid, true)
+            else if (action === "forget") teams.forget(page.team.uuid, false)
+            else if (action === "forgetKeep") teams.forget(page.team.uuid, true)
             else teams.removeMember(page.team.uuid, member.user_uuid)
+        }
+    }
+
+    // the versions the server keeps; one becomes the content again
+    Dialog {
+        id: historyDialog
+        property var versions: []
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 32, 440)
+        height: Math.min(parent.height - insets.top - insets.bottom - 32, 560)
+        modal: true
+        title: qsTr("Restore from history")
+        standardButtons: Dialog.Cancel
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: 4
+            Label { Layout.fillWidth: true; wrapMode: Text.Wrap; opacity: 0.7; text: qsTr("The chosen version becomes the team's content for everyone, as a new version.") }
+            ListView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                model: historyDialog.versions
+                delegate: ItemDelegate {
+                    required property var modelData
+                    width: ListView.view.width
+                    text: qsTr("Version %1").arg(modelData.version) + (modelData.created_at ? " · " + new Date(modelData.created_at).toLocaleString() : "")
+                    onClicked: {
+                        teams.restore(page.team.uuid, modelData.version)
+                        historyDialog.close()
+                    }
+                }
+            }
         }
     }
 }

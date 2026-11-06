@@ -3,6 +3,8 @@
 // object.c, service.c, multipart.c) as a blocking HTTP/1.1 client on top of
 // QSslSocket (see S3FileSystem.h).
 #include "core/S3FileSystem.h"
+#include "core/Configuration.h"
+#include "core/FileMasks.h"
 #include "core/SessionLog.h"
 
 #include <QCryptographicHash>
@@ -32,6 +34,31 @@
 
 namespace
 {
+
+// TConfiguration::GetFileMimeType: MimeTypes "<mask>=<type>,..."; a mask with
+// no type means no Content-Type at all
+bool ConfiguredMimeType(const QString & FileName, QString & Type)
+{
+  QString Name = UnixPath::ExtractFileName(FileName);
+  const QStringList Tokens = Configuration::Instance().MimeTypes.split(QLatin1Char(','), Qt::SkipEmptyParts);
+  for (const QString & Token : Tokens)
+  {
+    qsizetype P = Token.indexOf(QLatin1Char('='));
+    try
+    {
+      if (FileMasks(Token.left(P).trimmed()).MatchesFileName(Name))
+      {
+        Type = (P >= 0) ? Token.mid(P + 1).trimmed() : QString();
+        return true;
+      }
+    }
+    catch (const FileMasksException &)
+    {
+      // an invalid mask of the hidden setting matches nothing
+    }
+  }
+  return false;
+}
 
 // TextsCore1.rc / TextsFileZilla.rc
 const char * const CONNECTION_FAILED = "Connection failed.";
@@ -143,6 +170,13 @@ void LogLine(const QString & Line)
   {
     std::fprintf(stderr, "[s3] %s\n", qPrintable(Line));
   }
+}
+
+// "host:port=fingerprint" entries for this server
+bool HasAcceptedCertificate(const QSet<QString> & Accepted, const QString & Host, int Port)
+{
+  QString Prefix = QStringLiteral("%1:%2=").arg(Host).arg(Port);
+  return std::any_of(Accepted.cbegin(), Accepted.cend(), [&Prefix](const QString & Key) { return Key.startsWith(Prefix); });
 }
 
 // TTerminal::VerifyCertificateAgainstSessionData: fingerprint(s) configured
@@ -1314,21 +1348,27 @@ void S3FileSystem::VerifyCertificate(const QString & Host, const QList<QSslError
   {
     return;
   }
-  if (CertificateMatchesSessionData(FData.HostKey, FingerprintSHA1, FingerprintSHA256))
-  {
-    return;
-  }
   // Keyed by the endpoint of the site, so that a certificate is confirmed
   // once and not for each bucket host name (virtual host style URLs)
   QString Key = QStringLiteral("%1:%2=%3").arg(FHostName).arg(FPort).arg(FingerprintSHA256);
+  bool OtherAccepted = false;
   {
     QMutexLocker Lock(&AcceptedCertificatesMutex);
     if (AcceptedCertificates.contains(Key))
     {
       return;
     }
+    OtherAccepted = HasAcceptedCertificate(AcceptedCertificates, FHostName, FPort);
   }
   if (FAcceptedOnce.contains(Key))
+  {
+    return;
+  }
+  // As with an SSH host key: a fingerprint in a URL does not outrank the
+  // certificate accepted for this server before, a different one is a question
+  OtherAccepted = OtherAccepted || HasAcceptedCertificate(FAcceptedOnce, FHostName, FPort);
+  if (!(FData.HostKeyFromUrl && OtherAccepted) &&
+      CertificateMatchesSessionData(FData.TrustedHostKey(), FingerprintSHA1, FingerprintSHA256))
   {
     return;
   }
@@ -2960,6 +3000,15 @@ void S3FileSystem::ChangeMode(const QString & Path, unsigned int /*Mode*/)
   throw ExtException(Tr(CANT_SET_ATTRS).arg(Path), Tr(NOTSUPPORTED));
 }
 
+void S3FileSystem::CheckDirectory(const QString & Path)
+{
+  // TS3FileSystem::ChangeDirectory: to verify existence of directory try to open it
+  if (!UnixPath::IsRoot(Path) && !ReadFile(Path).IsDirectory)
+  {
+    throw ExtException(QStringLiteral("Error changing directory to '%1'.").arg(Path));
+  }
+}
+
 void S3FileSystem::SetModificationTime(const QString & /*Path*/, const QDateTime & /*Time*/)
 {
   // fcPreservingTimestampUpload is not supported: WinSCP does not even try
@@ -3082,10 +3131,18 @@ void S3FileSystem::Upload(const QString & LocalPath, const QString & RemotePath,
     BucketContext Context = GetBucketContext(BucketName, Key);
 
     QByteArray ContentType;
-    QMimeType MimeType = QMimeDatabase().mimeTypeForFile(LocalPath, QMimeDatabase::MatchExtension);
-    if (MimeType.isValid() && !MimeType.isDefault())
+    QString ConfiguredType;
+    if (ConfiguredMimeType(RemotePath, ConfiguredType))
     {
-      ContentType = MimeType.name().toUtf8();
+      ContentType = ConfiguredType.toUtf8();
+    }
+    else
+    {
+      QMimeType MimeType = QMimeDatabase().mimeTypeForFile(LocalPath, QMimeDatabase::MatchExtension);
+      if (MimeType.isValid() && !MimeType.isDefault())
+      {
+        ContentType = MimeType.name().toUtf8();
+      }
     }
 
     qint64 Size = LocalEnd - LocalPos;

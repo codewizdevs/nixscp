@@ -4,6 +4,7 @@
 // RemoteTransferFiles, AddEditLink, CalculateDirectorySizes;
 // source/forms/ScpCommander.cpp: local links, Linux symlink(2)/link(2))
 #include "gui/FileOperations.h"
+#include "core/Platform.h"
 #include "core/LocalFileSystem.h"
 
 #include "core/Configuration.h"
@@ -476,6 +477,26 @@ void CalculateChecksum(QWidget * Parent, Terminal * Term, const QString & Alg, c
   }
 }
 
+QString InvalidNameCharacter(const QString & Name, bool WindowsPath)
+{
+  if (Name.contains(QLatin1Char('/')))
+  {
+    return QStringLiteral("/");
+  }
+  return (WindowsPath && Name.contains(QLatin1Char('\\'))) ? QStringLiteral("\\") : QString();
+}
+
+bool LocalRenameTargetTaken(const QString & OldName, const QString & NewName, bool TargetExists,
+  const std::function<QStringList()> & DirectoryEntries)
+{
+  if (!TargetExists)
+  {
+    return false;
+  }
+  bool CaseOnly = (OldName != NewName) && (OldName.compare(NewName, Qt::CaseInsensitive) == 0);
+  return !CaseOnly || DirectoryEntries().contains(NewName);
+}
+
 void Properties(QWidget * Parent, Terminal * Term, const QList<RemoteFile> & Files, const QStringList & Paths,
   const QString & Directory, const Runner & Run, std::function<void(bool Changed)> Done)
 {
@@ -810,6 +831,7 @@ void Duplicate(QWidget * Parent, Terminal * Term, const QList<RemoteFile> & File
     ShowErrorMessage(Parent, QStringLiteral("Cannot create temporary directory."), TempDir->errorString());
     return;
   }
+  Platform::MakeDirectoryPrivate(TempDir->path());
   CopyParam Param = Configuration::Instance().DefaultCopyParam();
   Param.FileMask = AnyMask;
   QPointer<Terminal> GuardTarget(TargetTerm);
@@ -830,14 +852,15 @@ void Duplicate(QWidget * Parent, Terminal * Term, const QList<RemoteFile> & File
     {
       QString Name = UnixPath::ExtractFileName(Path);
       QString Masked = MaskFileName(Name, FileMask);
-      QString Local = QDir(TempDir->path()).filePath(Name);
+      // as the download named it: on Windows the name of the server is not a local one
+      QString Local = QDir(TempDir->path()).filePath(CopyParam::ValidLocalFileName(Name));
       if (!QFileInfo::exists(Local) && !QFileInfo(Local).isSymLink())
       {
         continue;
       }
       if (Masked != Name)
       {
-        QString Renamed = QDir(TempDir->path()).filePath(Masked);
+        QString Renamed = QDir(TempDir->path()).filePath(CopyParam::ValidLocalFileName(Masked));
         if (QFile::rename(Local, Renamed))
         {
           Local = Renamed;

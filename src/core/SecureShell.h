@@ -91,6 +91,11 @@ public:
   // the system proxy; false when none is configured
   static bool AutodetectProxy(TProxyMethod & Method, QString & Host, int & Port);
 
+  // TSecureShell::TimeoutPrompt: no response for the session timeout. Returns
+  // when the user wants to wait on, throws FatalException otherwise, on its
+  // own after SessionReopenAutoStall (the connection is then reopened).
+  void ConfirmStalled();
+
   [[noreturn]] void SshError(const QString & Message);
   // Throws FatalException when the connection is lost
   void CheckConnection();
@@ -122,10 +127,23 @@ private:
   QString FKnownHostName;
   int FKnownHostPort = SshPortNumber;
 
+  // "Local" proxy command, run with its stdin and stdout on the returned socket
+  // (Windows: left to libssh); stopped with a bounded wait when the session closes
+#ifdef Q_OS_WIN
+  void StopProxyCommand() {}
+#else
+  pid_t FProxyCommandPid = 0;
+  bool FProxyCommandGroup = false;
+  socket_t StartProxyCommand(const QString & Command);
+  void StopProxyCommand();
+#endif
+
   void Connect();
+  bool TryFtp();
   void ApplyOptions();
-  Net::Socket OpenProxySocket();
-  bool PromptProxyCredentials();
+  // A socket connected to Target.HostName through the proxy of Target
+  Net::Socket OpenProxySocket(SessionData & Target);
+  bool PromptProxyCredentials(SessionData & Data);
   void VerifyHostKey();
   void Authenticate();
   void StartKeepAlive();

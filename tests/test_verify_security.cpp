@@ -26,6 +26,7 @@
 #include "core/Configuration.h"
 #include "core/CopyParam.h"
 #include "core/CustomCommands.h"
+#include "core/FtpFileSystem.h"
 #include "core/IniStorage.h"
 #include "core/ScpFileSystem.h"
 #include "core/SecureShell.h"
@@ -48,6 +49,7 @@ using DesktopIntegration::BuildTerminalCommand;
 #include <QMutex>
 #include <QProcess>
 #include <QRandomGenerator>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -57,6 +59,7 @@ using DesktopIntegration::BuildTerminalCommand;
 #include <QUrl>
 
 #include <sys/stat.h>
+#include <algorithm>
 #include <cstdio>
 
 static int Failures = 0;
@@ -137,7 +140,11 @@ static QStringList LocalInjectionPayloads(const QString & Mark)
     QStringLiteral("x'&mkdir %1&'y").arg(Mark),
   };
 #else
-  return InjectionPayloads(Mark);
+  // on macOS the shell gets them decomposed: U+1FEF is a backtick then, U+037E a semicolon
+  return InjectionPayloads(Mark) + QStringList{
+    QStringLiteral("x\u1FEFtouch %1\u1FEFy").arg(Mark),
+    QStringLiteral("x\u037E touch %1").arg(Mark),
+  };
 #endif
 }
 
@@ -317,19 +324,30 @@ static void TestRemoteCustomCommands(const QString & Dir)
     CHECK_MSG(!QFileInfo::exists(QDir(Dir).filePath(Mark)), Cmd);
     CHECK_MSG(Output == Payload + QStringLiteral("|b c|"), Output);
     QFile::remove(QDir(Dir).filePath(Mark));
-    // unquoted "!" and '!' are not safe in WinSCP either (DelimitStr escapes
-    // only $ and \ outside double quotes); informational only
-    for (const QString & Template : {QStringLiteral("printf %s !"), QStringLiteral("printf %s '!'")})
+    // WinSCP escapes only $ and \ outside double quotes, so a name of the server
+    // runs as a command there: here any place in the command is safe
+    for (const QString & Template : {QStringLiteral("printf %s !"), QStringLiteral("printf %s '!'"), QStringLiteral("printf %s \"[!]\""),
+      QStringLiteral("printf %s '[!]'"), QStringLiteral("printf %s [!]"), QStringLiteral("printf %s \"x\"!\"y\"")})
     {
       Cmd = RemoteCustomCommand(Data, QStringLiteral("/home/u"), Payload, QString()).Complete(Template, true);
-      RunShell(Cmd, Dir);
-      if (QFileInfo::exists(QDir(Dir).filePath(Mark)))
-      {
-        Log(QStringLiteral("note (WinSCP parity): remote command [%1] is injectable by [%2]")
-          .arg(Template, QString(Payload).replace(QLatin1Char('\n'), QStringLiteral("\\n"))));
-      }
+      Output = RunShell(Cmd, Dir);
+      CHECK_MSG(!QFileInfo::exists(QDir(Dir).filePath(Mark)), Cmd);
+      CHECK_MSG(Output.contains(Payload), Cmd + QStringLiteral(" -> ") + Output);
       QFile::remove(QDir(Dir).filePath(Mark));
     }
+    // a list where it does not belong: wrong, but nothing runs
+    for (const QString & Template : {QStringLiteral("printf %s \"!&\""), QStringLiteral("printf %s '!&'")})
+    {
+      Cmd = RemoteCustomCommand(Data, QStringLiteral("/home/u"), QString(), MakeShellFileList({Payload})).Complete(Template, true);
+      RunShell(Cmd, Dir);
+      CHECK_MSG(!QFileInfo::exists(QDir(Dir).filePath(Mark)), Cmd);
+      QFile::remove(QDir(Dir).filePath(Mark));
+    }
+    // the path of a command as well
+    Cmd = RemoteCustomCommand(Data, Payload).Complete(QStringLiteral("printf %s !/"), true);
+    RunShell(Cmd, Dir);
+    CHECK_MSG(!QFileInfo::exists(QDir(Dir).filePath(Mark)), Cmd);
+    QFile::remove(QDir(Dir).filePath(Mark));
   }
   // Leading dash: "./" is prepended (DelimitStr)
   QString Cmd = RemoteCustomCommand(Data, QStringLiteral("/home/u"), QStringLiteral("-rf"), QString()).Complete(QStringLiteral("rm \"!\""), true);
@@ -500,24 +518,37 @@ static void TestTerminalCommand(const QString & Dir)
     TerminalCommand Command;
     QString Error;
     CHECK(BuildTerminalCommand(Data, QStringLiteral("s3cret pw"), QString(), false, Command, Error, nullptr, QStringLiteral("ssh !U@!@")));
-    CHECK(!Command.AskPassFile.isEmpty());
-    if (!Command.AskPassFile.isEmpty())
+    CHECK(!Command.AskPassSocket.isEmpty());
+    if (!Command.AskPassSocket.isEmpty())
     {
-      QFileInfo Info(Command.AskPassFile);
-      CHECK(Info.isFile());
+      // the password never reaches the disk: an owner-only socket with an
+      // unpredictable name in a private directory, nothing to read in the file
+      QFileInfo Info(Command.AskPassSocket);
+      CHECK(Info.exists());
       CHECK_MSG((Info.permissions() & (QFileDevice::ReadGroup | QFileDevice::ReadOther | QFileDevice::WriteGroup | QFileDevice::WriteOther)) == 0,
-        Command.AskPassFile);
-      // unpredictable name in a private directory
-      CHECK(Info.fileName().size() > QStringLiteral("nixscp-askpass-").size() + 5);
+        Command.AskPassSocket);
+      CHECK(Info.fileName().size() > QStringLiteral("nixscp-askpass-").size() + 16);
       QFileInfo DirInfo(Info.absolutePath());
       bool PrivateDir = (DirInfo.permissions() & (QFileDevice::WriteGroup | QFileDevice::WriteOther)) == 0;
-      Log(QStringLiteral("askpass file %1 (directory private: %2)").arg(Command.AskPassFile).arg(PrivateDir));
-      QFile F(Command.AskPassFile);
-      CHECK(F.open(QIODevice::ReadOnly) && (F.readAll() == "s3cret pw"));
-      F.close();
-      // the password is not on the command line
+      Log(QStringLiteral("askpass socket %1 (directory private: %2)").arg(Command.AskPassSocket).arg(PrivateDir));
+      // the password is not on the command line, and neither is what opens the socket
       CHECK(!Command.Arguments.join(QLatin1Char(' ')).contains(QStringLiteral("s3cret")));
-      QFile::remove(Command.AskPassFile);
+      QString Token = Command.Environment.value(0).section(QLatin1Char('='), 1);
+      CHECK(Token.size() >= 32);
+      CHECK(!Command.Arguments.join(QLatin1Char(' ')).contains(Token));
+      // one reader only, and the socket is gone then
+      QByteArray Password;
+      QThread * Reader = QThread::create([&Password, &Command, Token]() { Password = DesktopIntegration::FetchAskPassPassword(Command.AskPassSocket, Token); });
+      Reader->start();
+      while (!Reader->isFinished())
+      {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+      }
+      Reader->wait();
+      delete Reader;
+      CHECK(Password == "s3cret pw");
+      QCoreApplication::processEvents();
+      CHECK(!QFileInfo::exists(Command.AskPassSocket));
     }
     Config.PuttyPassword = Saved;
   }
@@ -547,6 +578,7 @@ public:
   QMutex Mutex;
   HostKeyAnswer HostKeyReply = HostKeyAccept;
   unsigned int CertificateReply = qaCancel;
+  unsigned int OverwriteReply = qaSkip;
   int HostKeyCalls = 0;
   HostKeyState LastHostKeyState = HostKeyUnknown;
   int CertificateQueries = 0;
@@ -569,6 +601,10 @@ public:
     {
       CertificateQueries++;
       return CertificateReply;
+    }
+    if (Query.startsWith(QStringLiteral("Cannot create temporary file")))
+    {
+      return OverwriteReply;
     }
     // errors of single files: skip
     if (Answers & qaSkip) return qaSkip;
@@ -646,12 +682,22 @@ static void CheckTraversal(Terminal & T, const QString & Protocol, const QString
   CopyParam Param;
   OperationResult R = DoSimple([&](Terminal::Callback Cb) { T.CopyToLocal(QStringList{QStringLiteral("/evil")}, Target, Param, false, Cb); });
   Log(QStringLiteral("%1 download of malicious listing: %2").arg(Protocol, Describe(R)));
+  // S17: an entry selected as it is, not found by walking the folder.
+  // The panel builds the path from the listed name.
+  for (const QString & Name : {QStringLiteral("x/.."), QStringLiteral("../esc1.txt"), QStringLiteral("../../escdir"), QStringLiteral("..")})
+  {
+    OperationResult Direct = DoSimple([&](Terminal::Callback Cb)
+    {
+      T.CopyToLocal(QStringList{UnixPath::Combine(QStringLiteral("/evil"), Name)}, Target, Param, false, Cb);
+    });
+    Log(QStringLiteral("%1 download of the entry \"%2\": %3").arg(Protocol, Name, Describe(Direct)));
+  }
   QStringList Files = AllFiles(Work.path());
-  QString Allowed = Target + QStringLiteral("/evil/");
+  QString Allowed = Target + QLatin1Char('/');
   bool OkDownloaded = false;
   for (const QString & File : Files)
   {
-    if (File == Allowed + QStringLiteral("ok.txt"))
+    if (File == Allowed + QStringLiteral("evil/ok.txt"))
     {
       OkDownloaded = true;
     }
@@ -786,6 +832,127 @@ static void TestEvilFtp(const QString & Scripts)
   }
   Server.kill();
   Server.waitForFinished(3000);
+}
+
+// The server turns down the upload of the temporary file. A refusal for good
+// can be about the name, and writing to the target then takes the user's word;
+// anything else says nothing about the file, and the target is left alone
+static void TestFtpPartialRefused(const QString & Scripts)
+{
+  std::printf("[FTP server refuses the temporary file]\n");
+  QTemporaryDir Scratch;
+  QString AbsDir = Scratch.filePath(QStringLiteral("abs"));
+  QDir().mkpath(AbsDir);
+  for (const char * Name : {"ok.txt", "missing.txt"})
+  {
+    QFile F(Scratch.filePath(QString::fromLatin1(Name)));
+    CHECK(F.open(QIODevice::WriteOnly));
+    F.write(QByteArray(300000, 'x'));
+  }
+  struct { const char * Reply; unsigned int Answer; bool Asked; bool Written; const char * Name; } Cases[] = {
+    {"425 Cannot open data connection", qaYes, false, false, "ok.txt"},
+    {"421 Service not available", qaYes, false, false, "ok.txt"},
+    {"451 Local error", qaYes, false, false, "ok.txt"},
+    {"425 Cannot open data connection", qaYes, false, false, "missing.txt"},
+    {"550 Permission denied", qaSkip, true, false, "ok.txt"},
+    {"550 Permission denied", qaAbort, true, false, "ok.txt"},
+    {"550 Permission denied", qaYes, true, true, "ok.txt"},
+    // nothing to lose: no question
+    {"550 Permission denied", qaSkip, false, true, "missing.txt"},
+  };
+  // the upload to the target fails: only a file of its own goes away with it
+  struct { const char * Name; unsigned int Answer; bool Deleted; } Failing[] = {
+    {"ok.txt", qaYes, false},
+    {"missing.txt", qaSkip, true},
+  };
+  for (const auto & Case : Failing)
+  {
+    QString LogFile = Scratch.filePath(QStringLiteral("stor-end.log"));
+    QFile::remove(LogFile);
+    int Port = FreePort();
+    QProcess Server;
+    QProcessEnvironment Env = QProcessEnvironment::systemEnvironment();
+    Env.insert(QStringLiteral("EVIL_FTP_STOR_PARTIAL"), QStringLiteral("550 Permission denied"));
+    Env.insert(QStringLiteral("EVIL_FTP_STOR_END"), QStringLiteral("451 Disk full"));
+    Server.setProcessEnvironment(Env);
+    Server.start(QStringLiteral("python3"), {QStringLiteral("-I"), QDir(Scripts).filePath(QStringLiteral("evil_ftp.py")),
+      QString::number(Port), AbsDir, LogFile});
+    if (!WaitListening(Port))
+    {
+      CHECK_MSG(false, QStringLiteral("evil FTP server did not start"));
+      return;
+    }
+    SessionData Data;
+    Data.FSProtocol = fsFTP;
+    Data.HostName = QStringLiteral("127.0.0.1");
+    Data.PortNumber = Port;
+    Data.UserName = QStringLiteral("u");
+    Data.Password = QStringLiteral("p");
+    Data.Timeout = 10;
+    TestUserInterface UI;
+    UI.OverwriteReply = Case.Answer;
+    {
+      Terminal T(Data, &UI);
+      OperationResult R = DoSimple([&](Terminal::Callback Cb) { T.Open(Cb); });
+      CHECK_MSG(R.Ok, Describe(R));
+      CopyParam Param;
+      Param.ConfirmOverwriting = false;
+      DoSimple([&](Terminal::Callback Cb) { T.CopyToRemote({Scratch.filePath(QString::fromLatin1(Case.Name))}, QStringLiteral("/evil"), Param, false, Cb); });
+      T.Close();
+    }
+    QString Target = QStringLiteral("/evil/") + QString::fromLatin1(Case.Name);
+    QStringList Commands = ReadText(LogFile).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    CHECK_MSG(Commands.contains(QStringLiteral("STOR ") + Target), Commands.join(QLatin1Char('|')));
+    CHECK_MSG(Commands.contains(QStringLiteral("DELE ") + Target) == Case.Deleted, Commands.join(QLatin1Char('|')));
+    Server.kill();
+    Server.waitForFinished(3000);
+  }
+  for (const auto & Case : Cases)
+  {
+    QString LogFile = Scratch.filePath(QStringLiteral("stor.log"));
+    QFile::remove(LogFile);
+    int Port = FreePort();
+    QProcess Server;
+    QProcessEnvironment Env = QProcessEnvironment::systemEnvironment();
+    Env.insert(QStringLiteral("EVIL_FTP_STOR_PARTIAL"), QString::fromLatin1(Case.Reply));
+    Server.setProcessEnvironment(Env);
+    Server.start(QStringLiteral("python3"), {QStringLiteral("-I"), QDir(Scripts).filePath(QStringLiteral("evil_ftp.py")),
+      QString::number(Port), AbsDir, LogFile});
+    if (!WaitListening(Port))
+    {
+      CHECK_MSG(false, QStringLiteral("evil FTP server did not start"));
+      return;
+    }
+    SessionData Data;
+    Data.FSProtocol = fsFTP;
+    Data.HostName = QStringLiteral("127.0.0.1");
+    Data.PortNumber = Port;
+    Data.UserName = QStringLiteral("u");
+    Data.Password = QStringLiteral("p");
+    Data.Timeout = 10;
+    TestUserInterface UI;
+    UI.OverwriteReply = Case.Answer;
+    {
+      Terminal T(Data, &UI);
+      OperationResult R = DoSimple([&](Terminal::Callback Cb) { T.Open(Cb); });
+      CHECK_MSG(R.Ok, Describe(R));
+      CopyParam Param;
+      Param.ConfirmOverwriting = false;
+      R = DoSimple([&](Terminal::Callback Cb) { T.CopyToRemote({Scratch.filePath(QString::fromLatin1(Case.Name))}, QStringLiteral("/evil"), Param, false, Cb); });
+      CHECK_MSG(!Case.Written || R.Ok, QString::fromLatin1(Case.Reply) + QLatin1Char(' ') + Describe(R));
+      T.Close();
+    }
+    QString What = QString::fromLatin1(Case.Reply) + QLatin1Char(' ') + QString::fromLatin1(Case.Name);
+    QString Target = QStringLiteral("/evil/") + QString::fromLatin1(Case.Name);
+    QStringList Commands = ReadText(LogFile).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    CHECK_MSG(Commands.contains(QStringLiteral("STOR %1.filepart").arg(Target)), Commands.join(QLatin1Char('|')));
+    CHECK_MSG(Commands.contains(QStringLiteral("STOR ") + Target) == Case.Written, What + QLatin1Char(' ') + Commands.join(QLatin1Char('|')));
+    CHECK_MSG(!Commands.contains(QStringLiteral("DELE ") + Target), What + QLatin1Char(' ') + Commands.join(QLatin1Char('|')));
+    bool Asked = std::any_of(UI.Queries.cbegin(), UI.Queries.cend(), [](const QString & Query) { return Query.startsWith(QStringLiteral("Cannot create temporary file")); });
+    CHECK_MSG(Asked == Case.Asked, What + QLatin1Char(' ') + UI.Queries.join(QLatin1Char('|')));
+    Server.kill();
+    Server.waitForFinished(3000);
+  }
 }
 
 static void TestEvilWebDav(const QString & Scripts)
@@ -1042,6 +1209,138 @@ static void TestTlsCertificate(const SessionData & Data, const QString & Name)
   CHECK(UI.CertificateQueries == Before + 1);
 }
 
+// How many times the certificate was questioned with these keys in the session
+static int CertificateQuestions(SessionData Data, const QString & Keys, bool FromUrl, OperationResult * Result = nullptr)
+{
+  Data.HostKey = Keys;
+  Data.HostKeyFromUrl = FromUrl;
+  TestUserInterface UI;
+  UI.CertificateReply = qaCancel;
+  Terminal T(Data, &UI);
+  OperationResult R = DoSimple([&](Terminal::Callback Cb) { T.Open(Cb); });
+  T.Close();
+  if (Result != nullptr)
+  {
+    *Result = R;
+  }
+  return UI.CertificateQueries;
+}
+
+// The fingerprint of a certificate the session cannot trust, from the question about it
+static QString QuestionedFingerprint(const SessionData & Data)
+{
+  TestUserInterface UI;
+  UI.CertificateReply = qaCancel;
+  Terminal T(Data, &UI);
+  DoSimple([&](Terminal::Callback Cb) { T.Open(Cb); });
+  QRegularExpressionMatch Match = QRegularExpression(QStringLiteral("SHA-256: ([0-9a-fA-F:]+)")).match(UI.Queries.value(0));
+  return Match.captured(1);
+}
+
+// What a URL says about a certificate, as about an SSH host key: no check is
+// given up, and an unknown certificate is compared with the fingerprint
+static void TestUrlCertificate(const SessionData & Data, const QString & Name, bool Connects)
+{
+  QString Fingerprint = QuestionedFingerprint(Data);
+  CHECK_MSG(!Fingerprint.isEmpty(), Name);
+  const QString Wrong = QStringLiteral("aa:bb:cc:dd");
+  for (const QString & Keys : {QStringLiteral("*"), QStringLiteral(" * "), QStringLiteral("acceptnew"), QStringLiteral("*;acceptnew"), Wrong + QStringLiteral(";*"), Wrong})
+  {
+    OperationResult R;
+    CHECK_MSG(CertificateQuestions(Data, Keys, true, &R) == 1, Name + QLatin1Char(' ') + Keys);
+    CHECK_MSG(!R.Ok, Name + QLatin1Char(' ') + Keys);
+  }
+  // a switch or the site: what they say goes
+  OperationResult R;
+  CHECK_MSG(CertificateQuestions(Data, QStringLiteral("*"), false, &R) == 0, Name);
+  CHECK_MSG(!Connects || R.Ok, Name + QLatin1Char(' ') + Describe(R));
+  CHECK_MSG(CertificateQuestions(Data, Fingerprint, false, &R) == 0, Name);
+  CHECK_MSG(!Connects || R.Ok, Name + QLatin1Char(' ') + Describe(R));
+  CHECK_MSG(CertificateQuestions(Data, Fingerprint, true, &R) == 0, Name);
+  CHECK_MSG(!Connects || R.Ok, Name + QLatin1Char(' ') + Describe(R));
+}
+
+// A self-signed TLS server that says no more than a 500 to HTTP, for the
+// certificate check of WebDAV and S3 with a certificate that can be changed
+static QStringList MakeCertificate(const QString & Dir, const QString & Name)
+{
+  QString Key = QDir(Dir).filePath(Name + QStringLiteral(".key"));
+  QString Certificate = QDir(Dir).filePath(Name + QStringLiteral(".crt"));
+  QProcess Make;
+  // RSA: the Python of macOS has a LibreSSL that finds no cipher for an EC key
+  Make.start(QStringLiteral("openssl"), {QStringLiteral("req"), QStringLiteral("-x509"), QStringLiteral("-newkey"), QStringLiteral("rsa:2048"),
+    QStringLiteral("-nodes"), QStringLiteral("-subj"), QStringLiteral("/CN=") + Name,
+    QStringLiteral("-keyout"), Key, QStringLiteral("-out"), Certificate, QStringLiteral("-days"), QStringLiteral("2")});
+  CHECK(Make.waitForFinished(30000) && (Make.exitCode() == 0));
+  return {Certificate, Key};
+}
+
+static void StartTlsServer(QProcess & Server, const QStringList & Certificate, int Port)
+{
+  static const char Script[] =
+    "import socket, ssl, sys\n"
+    "context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\n"
+    "context.load_cert_chain(sys.argv[1], sys.argv[2])\n"
+    "listener = socket.socket()\n"
+    "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+    "listener.bind(('127.0.0.1', int(sys.argv[3])))\n"
+    "listener.listen(5)\n"
+    "while True:\n"
+    "    client, _ = listener.accept()\n"
+    "    try:\n"
+    "        tls = context.wrap_socket(client, server_side=True)\n"
+    "        tls.recv(65536)\n"
+    "        tls.sendall(b'HTTP/1.1 500 No\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n')\n"
+    "        tls.close()\n"
+    "    except OSError:\n"
+    "        client.close()\n";
+  Server.start(QStringLiteral("python3"), {QStringLiteral("-I"), QStringLiteral("-c"), QString::fromLatin1(Script),
+    Certificate.value(0), Certificate.value(1), QString::number(Port)});
+  CHECK(WaitListening(Port));
+}
+
+// As a key known for a host: the certificate accepted for a server is not
+// replaced by a fingerprint in a URL, the new one is a question
+static void TestUrlCertificateChanged(TFSProtocol Protocol, const QString & Name)
+{
+  QTemporaryDir Scratch;
+  QStringList First = MakeCertificate(Scratch.path(), Name + QStringLiteral("-first"));
+  QStringList Second = MakeCertificate(Scratch.path(), Name + QStringLiteral("-second"));
+  int Port = FreePort();
+  SessionData Data;
+  Data.FSProtocol = Protocol;
+  Data.Ftps = ftpsImplicit;
+  Data.HostName = QStringLiteral("127.0.0.1");
+  Data.PortNumber = Port;
+  Data.UserName = QStringLiteral("u");
+  Data.Password = QStringLiteral("p");
+  Data.Timeout = 5;
+  {
+    QProcess Server;
+    StartTlsServer(Server, First, Port);
+    // nothing known yet: the fingerprint is compared
+    QString Fingerprint = QuestionedFingerprint(Data);
+    CHECK_MSG(CertificateQuestions(Data, Fingerprint, true) == 0, Name);
+    // the user accepts it for good
+    TestUserInterface UI;
+    UI.CertificateReply = qaYes;
+    Terminal T(Data, &UI);
+    DoSimple([&](Terminal::Callback Cb) { T.Open(Cb); });
+    T.Close();
+    CHECK_MSG(UI.CertificateQueries == 1, Name);
+    Server.kill();
+    Server.waitForFinished(3000);
+  }
+  QProcess Server;
+  StartTlsServer(Server, Second, Port);
+  QString Fingerprint = QuestionedFingerprint(Data);
+  CHECK_MSG(!Fingerprint.isEmpty(), Name);
+  CHECK_MSG(CertificateQuestions(Data, Fingerprint, true) == 1, Name);
+  CHECK_MSG(CertificateQuestions(Data, Fingerprint, false) == 0, Name);
+  Server.kill();
+  Server.waitForFinished(3000);
+}
+
 static void TestTls()
 {
   QByteArray FtpsPort = qgetenv("NIXSCP_TEST_FTPS_PORT");
@@ -1057,6 +1356,12 @@ static void TestTls()
     Data.Password = qEnvironmentVariable("NIXSCP_TEST_FTP_PASSWORD", QStringLiteral("secret"));
     Data.Timeout = 10;
     TestTlsCertificate(Data, QStringLiteral("FTPS"));
+    TestUrlCertificate(Data, QStringLiteral("FTPS"), true);
+    // a certificate accepted before, of another fingerprint: a question, whatever the URL says
+    QString Fingerprint = QuestionedFingerprint(Data);
+    FtpFileSystem::CacheCertificate(QStringLiteral("%1:%2").arg(Data.HostName).arg(Data.PortNumber), QStringLiteral("aa:bb:cc"), 18);
+    CHECK(CertificateQuestions(Data, Fingerprint, true) == 1);
+    CHECK(CertificateQuestions(Data, Fingerprint, false) == 0);
   }
   else
   {
@@ -1076,10 +1381,25 @@ static void TestTls()
     Data.Password = qEnvironmentVariable("NIXSCP_TEST_DAV_PASSWORD", QStringLiteral("secret"));
     Data.Timeout = 10;
     TestTlsCertificate(Data, QStringLiteral("WebDAVS"));
+    TestUrlCertificate(Data, QStringLiteral("WebDAVS"), true);
+    // the certificate check of S3 needs no more than the TLS of that server
+    SessionData S3 = Data;
+    S3.FSProtocol = fsS3;
+    TestUrlCertificate(S3, QStringLiteral("S3"), false);
   }
   else
   {
     std::printf("[WebDAVS certificate verification] SKIPPED (NIXSCP_TEST_DAVS_URL)\n");
+  }
+  if (!QStandardPaths::findExecutable(QStringLiteral("openssl")).isEmpty())
+  {
+    std::printf("[certificate changed, fingerprint in a URL]\n");
+    TestUrlCertificateChanged(fsWebDAV, QStringLiteral("dav"));
+    TestUrlCertificateChanged(fsS3, QStringLiteral("s3"));
+  }
+  else
+  {
+    std::printf("[certificate changed, fingerprint in a URL] SKIPPED (no openssl)\n");
   }
 }
 
@@ -1138,6 +1458,15 @@ int main(int argc, char ** argv)
   if (!Scripts.isEmpty() && QFileInfo::exists(QDir(Scripts).filePath(QStringLiteral("evil_ftp.py"))))
   {
     TestEvilFtp(Scripts);
+    // (an older copy of the server, as in a test environment set up before)
+    if (ReadText(QDir(Scripts).filePath(QStringLiteral("evil_ftp.py"))).contains(QStringLiteral("EVIL_FTP_STOR_END")))
+    {
+      TestFtpPartialRefused(Scripts);
+    }
+    else
+    {
+      std::printf("[FTP server refuses the temporary file] SKIPPED (evil_ftp.py without EVIL_FTP_STOR_END)\n");
+    }
     TestEvilWebDav(Scripts);
   }
   else

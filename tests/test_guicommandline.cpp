@@ -23,7 +23,10 @@ int main()
 #include "cli/SessionUrl.h"
 #include "core/Configuration.h"
 #include "core/FileSystem.h"
+#include "core/IniStorage.h"
 #include "core/Terminal.h"
+#include "gui/AuthenticateDialog.h"
+#include "core/Workspaces.h"
 #include "gui/CommanderWindow.h"
 #include "gui/FilePanel.h"
 #include "gui/GuiUserInterface.h"
@@ -40,12 +43,17 @@ int main()
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
+#include <QAction>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMouseEvent>
 #include <QPushButton>
 #include <QDialogButtonBox>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QTreeWidget>
+#include <QTreeWidgetItemIterator>
 
 #include <atomic>
 #include <cstdio>
@@ -245,6 +253,23 @@ static void TestParseUrl()
   CHECK_EQ(P.Data.UserName, QStringLiteral("switchuser"));
   CHECK_EQ(P.Data.Timeout, 33);
 
+  // Started by a link: its URL and nothing else, however the arguments got there
+  CHECK(LinkArguments({QStringLiteral("sftp://host/")}).isEmpty());
+  CHECK(LinkArguments({QStringLiteral("/ini=x"), QStringLiteral("-platform"), QStringLiteral("offscreen")}).isEmpty());
+  const QStringList PlainLink{QStringLiteral("/unsafe"), QStringLiteral("sftp://host/")};
+  CHECK_EQ(LinkArguments(PlainLink), PlainLink);
+  CHECK_EQ(LinkArguments({QStringLiteral("-UNSAFE"), QStringLiteral("sftp://host/")}), PlainLink);
+  // what a link with a quote adds on Windows
+  CHECK_EQ(LinkArguments({QStringLiteral("/unsafe"), QStringLiteral("sftp://host/"), QStringLiteral("-platformpluginpath"),
+    QStringLiteral("\\\\evil\\share"), QStringLiteral("-platform"), QStringLiteral("x")}), PlainLink);
+  CHECK_EQ(LinkArguments({QStringLiteral("/unsafe"), QStringLiteral("sftp://host/"), QStringLiteral("/script=\\\\evil\\s.txt")}), PlainLink);
+  CHECK_EQ(LinkArguments({QStringLiteral("/unsafe"), QStringLiteral("sftp://host/"), QStringLiteral("/upload"), QStringLiteral("C:\\secret")}), PlainLink);
+  CHECK_EQ(LinkArguments({QStringLiteral("/unsafe"), QStringLiteral("sftp://host/"), QStringLiteral("/hostkey=*"), QStringLiteral("/ini=x")}), PlainLink);
+  CHECK_EQ(LinkArguments({QStringLiteral("/unsafe"), QStringLiteral("sftp://host/"), QStringLiteral("other://host/")}), PlainLink);
+  // a switch for Qt is not a link
+  CHECK_EQ(LinkArguments({QStringLiteral("/unsafe"), QStringLiteral("--"), QStringLiteral("-platformpluginpath")}), QStringList{QStringLiteral("/unsafe")});
+  CHECK_EQ(LinkArguments({QStringLiteral("/unsafe")}), QStringList{QStringLiteral("/unsafe")});
+
   // CheckSafe / pufUnsafe
   Options Safe = MakeOptions({QStringLiteral("sftp://host/")});
   CHECK(CheckSafe(Safe));
@@ -265,10 +290,136 @@ static void TestParseUrl()
   P = ParseUrl(QStringLiteral("sftp://host/"), &Raw, Stored, true);
   CHECK(P.Data.SftpServer != QStringLiteral("/bin/evil"));
   CHECK(P.Data.PostLoginCommands.isEmpty());
-  CHECK(P.Data.Compression);
+  // no switch applies to an unsafe command line at all, harmless or not
+  CHECK(!P.Data.Compression);
   Options Raw2 = MakeOptions({QStringLiteral("sftp://host/"), QStringLiteral("/rawsettings"), QStringLiteral("SftpServer=/bin/sftp")});
   P = ParseUrl(QStringLiteral("sftp://host/"), &Raw2, Stored, false);
   CHECK_EQ(P.Data.SftpServer, QStringLiteral("/bin/sftp"));
+
+  // A link sets only what is on the list: whatever it holds about trust, the
+  // target, commands or local files is gone, known setting or not
+  P = ParseUrl(QStringLiteral("sftp://user;x-SshHostKey=*;x-TunnelHostKey=*;x-AgentAccess=1;x-AgentPermissions=7;x-AgentName=evil;x-AgentAllow=*;"
+    "x-AgentDeny=x;x-AgentRecord=1;x-PortForwards=L1%20h%202;x-AgentFwd=1;x-GSSAPIFwdTGT=1;x-HostName=evil.example;x-PortNumber=2222;x-Ftps=0;"
+    "x-PublicKeyFile=%2Fhome%2Fu%2Fkey;x-LocalDirectory=%2Fetc;x-RemoteDirectory=%7E%3Bid;x-Tunnel=1;x-TunnelHostName=evil.example;"
+    "x-ProxyMethod=cmd;x-ProxyTelnetCommand=id;x-ProxyHost=evil.example;x-Compression=1;x-S3CredentialsEnv=1;x-S3Profile=default;"
+    "x-Passphrase=p;x-WebDavUnencryptedRedirects=1;x-Cipher=des,WARN;x-Timeout=33@host/"), nullptr, Stored, true);
+  {
+    SessionData Factory = Stored.DefaultSettings();
+    const SessionData & D = P.Data;
+    CHECK(D.HostKey.isEmpty() && D.TunnelHostKey.isEmpty() && !D.HostKeyFromUrl && !D.TunnelHostKeyFromUrl);
+    CHECK((D.AgentAccess == Factory.AgentAccess) && (D.AgentPermissions == Factory.AgentPermissions) && D.AgentName.isEmpty());
+    CHECK((D.AgentAllow == Factory.AgentAllow) && (D.AgentDeny == Factory.AgentDeny) && (D.AgentRecord == Factory.AgentRecord));
+    CHECK(D.PortForwards.isEmpty() && !D.AgentFwd && !D.GSSAPIFwdTGT);
+    CHECK_EQ(D.HostName, QStringLiteral("host"));
+    CHECK(D.PortNumber == SshPortNumber);
+    CHECK(D.PublicKeyFile.isEmpty() && D.LocalDirectory.isEmpty() && D.RemoteDirectory.isEmpty());
+    CHECK(!D.Tunnel && D.TunnelHostName.isEmpty());
+    CHECK((D.ProxyMethod == Factory.ProxyMethod) && (D.ProxyHost == Factory.ProxyHost) && (D.ProxyTelnetCommand == Factory.ProxyTelnetCommand) &&
+      (D.ProxyLocalCommand == Factory.ProxyLocalCommand));
+    CHECK(!D.S3CredentialsEnv && D.S3Profile.isEmpty());
+    CHECK(D.CipherList == Factory.CipherList);
+    CHECK(P.Passphrase.isEmpty());
+    CHECK(D.Compression);
+    CHECK(D.Timeout == 33);
+    // nothing of it is kept for saving either
+    IniFile File;
+    IniStorage Storage(&File);
+    Storage.OpenSubKey(QStringLiteral("Site"), true);
+    D.Save(Storage);
+    SessionData Back;
+    Back.Load(Storage);
+    CHECK((Back.AgentAccess == Factory.AgentAccess) && Back.HostKey.isEmpty() && Back.TunnelHostKey.isEmpty());
+    CHECK(!File.Keys(QStringLiteral("Site")).contains(QStringLiteral("WebDavUnencryptedRedirects"), Qt::CaseInsensitive));
+  }
+  // the scheme of a link stays what it says
+  P = ParseUrl(QStringLiteral("ftpes://user;x-Ftps=0@host/"), nullptr, Stored, true);
+  CHECK(P.Data.Ftps == ftpsExplicitTls);
+  // ";fingerprint=" of a clicked link is its author's: the user is still asked.
+  // Elsewhere it goes on as a URL's: an unknown key is compared with it, a known one is not
+  P = ParseUrl(QStringLiteral("sftp://user;fingerprint=abc@host/"), nullptr, Stored, true);
+  CHECK(P.Data.HostKey.isEmpty());
+  CHECK(!P.Data.HostKeyFromUrl);
+  P = ParseUrl(QStringLiteral("sftp://user;fingerprint=abc@host/"), nullptr, Stored, false);
+  CHECK_EQ(P.Data.HostKey, QStringLiteral("abc"));
+  CHECK(P.Data.HostKeyFromUrl);
+  for (const char * Url : {"sftp://user;fingerprint=*@host/", "sftp://user;fingerprint=acceptnew@host/", "ftpes://user;fingerprint=*@host/", "davs://user;fingerprint=*@host/"})
+  {
+    for (bool AUnsafe : {false, true})
+    {
+      P = ParseUrl(QString::fromLatin1(Url), nullptr, Stored, AUnsafe);
+      CHECK(P.Data.HostKey.isEmpty());
+    }
+  }
+  // a command line of one's own has more to say, not about keys and agents though
+  P = ParseUrl(QStringLiteral("sftp://user;x-SshHostKey=abc;x-TunnelHostKey=*;x-AgentAccess=1;x-PortForwards=L1%20h%202;x-Tunnel=1;x-TunnelHostName=gw@host/"),
+    nullptr, Stored, false);
+  CHECK_EQ(P.Data.HostKey, QStringLiteral("abc"));
+  CHECK(P.Data.HostKeyFromUrl);
+  CHECK(P.Data.TunnelHostKey.isEmpty());
+  CHECK(P.Data.AgentAccess == Stored.DefaultSettings().AgentAccess);
+  CHECK(P.Data.PortForwards.isEmpty());
+  CHECK_EQ(P.Data.TunnelHostName, QStringLiteral("gw"));
+  // S14: from another process (Unsafe) a stored site keeps its host and security
+  Options Redirect = MakeOptions({QStringLiteral("myhost.example.com"), QStringLiteral("/rawsettings"),
+    QStringLiteral("HostName=evil.example"), QStringLiteral("PortNumber=21"), QStringLiteral("/hostkey=*")});
+  P = ParseUrl(QStringLiteral("myhost.example.com"), &Redirect, Stored, true);
+  CHECK_EQ(P.Data.HostName, QStringLiteral("myhost.example.com"));
+  CHECK_EQ(P.Data.PortNumber, 2200);
+  CHECK(P.Data.HostKey.isEmpty());
+  // nor does a link take a stored site to another protocol
+  SessionData SftpSite;
+  SftpSite.HostName = QStringLiteral("protocol.example");
+  SftpSite.FSProtocol = fsSFTP;
+  Stored.NewSession(QStringLiteral("protocol.example"), SftpSite);
+  P = ParseUrl(QStringLiteral("ftp://protocol.example/"), nullptr, Stored, true);
+  CHECK(P.Data.FSProtocol == fsSFTP);
+  P = ParseUrl(QStringLiteral("ftp://protocol.example/"), nullptr, Stored, false);
+  CHECK(P.Data.FSProtocol == fsFTP);
+  Stored.Remove(QStringLiteral("protocol.example"));
+  // the command line stays with a new instance rather than losing its switches
+  CHECK(CanForwardCommandLine(MakeOptions({QStringLiteral("/unsafe"), QStringLiteral("sftp://host/")})));
+  CHECK(CanForwardCommandLine(MakeOptions({QStringLiteral("mysite"), QStringLiteral("/browse=x")})));
+  CHECK(!CanForwardCommandLine(MakeOptions({QStringLiteral("mysite"), QStringLiteral("/rawsettings"), QStringLiteral("HostName=x")})));
+  CHECK(!CanForwardCommandLine(MakeOptions({QStringLiteral("mysite"), QStringLiteral("/hostkey=*")})));
+  CHECK(!CanForwardCommandLine(MakeOptions({QStringLiteral("mysite"), QStringLiteral("/explicit=0")})));
+
+  // S3: nothing of a URL is expanded, in any of its forms
+  qputenv("NIXSCP_TEST_SECRET", "wJalrFAKEsecret");
+  for (bool AUnsafe : {false, true})
+  {
+    P = ParseUrl(QStringLiteral("ftp://$NIXSCP_TEST_SECRET@evil.example/"), nullptr, Stored, AUnsafe);
+    CHECK_EQ(PrepareSession(P.Data).UserName, QStringLiteral("$NIXSCP_TEST_SECRET"));
+    P = ParseUrl(QStringLiteral("ftp://$%7BNIXSCP_TEST_SECRET%7D@evil.example/"), nullptr, Stored, AUnsafe);
+    CHECK_EQ(PrepareSession(P.Data).UserName, QStringLiteral("${NIXSCP_TEST_SECRET}"));
+    P = ParseUrl(QStringLiteral("ftp://%25NIXSCP_TEST_SECRET%25@evil.example/"), nullptr, Stored, AUnsafe);
+    CHECK_EQ(PrepareSession(P.Data).UserName, QStringLiteral("%NIXSCP_TEST_SECRET%"));
+    P = ParseUrl(QStringLiteral("ftp://u@$NIXSCP_TEST_SECRET.evil.example/"), nullptr, Stored, AUnsafe);
+    CHECK_EQ(PrepareSession(P.Data).HostName, QStringLiteral("$NIXSCP_TEST_SECRET.evil.example"));
+    // (a link does not get to choose a tunnel at all)
+    P = ParseUrl(QStringLiteral("sftp://u;x-TunnelHostName=$NIXSCP_TEST_SECRET.evil.example;x-TunnelUserName=$NIXSCP_TEST_SECRET@h/"), nullptr, Stored, AUnsafe);
+    CHECK_EQ(PrepareSession(P.Data).TunnelHostName, AUnsafe ? QString() : QStringLiteral("$NIXSCP_TEST_SECRET.evil.example"));
+    CHECK_EQ(PrepareSession(P.Data).TunnelUserName, AUnsafe ? QString() : QStringLiteral("$NIXSCP_TEST_SECRET"));
+  }
+  // the switches of the local command line and stored sites are expanded as ever
+  Options UserSwitch = MakeOptions({QStringLiteral("sftp://host/"), QStringLiteral("/username=$NIXSCP_TEST_SECRET")});
+  P = ParseUrl(QStringLiteral("sftp://host/"), &UserSwitch, Stored, false);
+  CHECK_EQ(PrepareSession(P.Data).UserName, QStringLiteral("wJalrFAKEsecret"));
+  SessionData Expanding;
+  Expanding.HostName = QStringLiteral("expanding.example");
+  Expanding.UserName = QStringLiteral("$NIXSCP_TEST_SECRET");
+  Stored.NewSession(QStringLiteral("Expanding"), Expanding);
+  P = ParseUrl(QStringLiteral("Expanding"), nullptr, Stored, true);
+  CHECK_EQ(PrepareSession(P.Data).UserName, QStringLiteral("wJalrFAKEsecret"));
+  // saved as a site, a URL stays literal
+  P = ParseUrl(QStringLiteral("ftp://$NIXSCP_TEST_SECRET@evil.example/"), nullptr, Stored, true);
+  std::shared_ptr<SessionData> FromUrl = Stored.NewSession(QStringLiteral("FromUrl"), P.Data);
+  IniFile Ini;
+  Stored.Save(Ini);
+  StoredSessionList Reloaded;
+  Reloaded.Load(Ini);
+  CHECK_EQ(PrepareSession(*Reloaded.FindByName(QStringLiteral("FromUrl"))).UserName, QStringLiteral("$NIXSCP_TEST_SECRET"));
+  Stored.Remove(QStringLiteral("FromUrl"));
+  Stored.Remove(QStringLiteral("Expanding"));
 }
 
 static void TestFolderAndLoginData()
@@ -474,6 +625,36 @@ static void TestUrlHandler(const QString & Scratch)
 #endif
 }
 
+static void TestServerNameLength(const QString & Scratch)
+{
+#ifndef _WIN32
+  // Qt binds "<name>XXXXXX/s" first: with a name that still fits sockaddr_un,
+  // but not with that, the instances would silently run on their own
+  QString Run = Scratch + QStringLiteral("/longrun");
+  QByteArray Saved = qgetenv("XDG_RUNTIME_DIR");
+  QString Name = SingleInstance::DefaultServerName(QStringLiteral("nul"));
+  qsizetype Fixed = QFileInfo(Name).fileName().size() + 1;
+  for (qsizetype Length = 90; Length <= 110; Length++)
+  {
+    QString Dir = Run + QLatin1Char('/');
+    if (Dir.size() + 1 < Length - Fixed)
+    {
+      Dir += QString(Length - Fixed - Dir.size(), QLatin1Char('d'));
+    }
+    QDir().mkpath(Dir);
+    QFile::setPermissions(Dir, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    qputenv("XDG_RUNTIME_DIR", QFile::encodeName(Dir));
+    QString Server = SingleInstance::DefaultServerName(QStringLiteral("nul"));
+    SingleInstance Instance(Server);
+    CHECK(Instance.Listen());
+  }
+  qputenv("XDG_RUNTIME_DIR", Saved);
+  QDir(Run).removeRecursively();
+#else
+  Q_UNUSED(Scratch);
+#endif
+}
+
 static void TestSingleInstance(const QString & Scratch)
 {
   QString Name = Scratch + QStringLiteral("/instance.sock");
@@ -635,6 +816,120 @@ static void TestLastSessionWatcher(const QString & Scratch)
   CHECK_EQ(RejectedLoginDialogs, 0);
 }
 
+// T16: the site of a node can go while the dialog is open (another instance, a
+// team sync); the tree is not reloaded while a site is being edited
+static void TestSiteRemovedInLoginDialog()
+{
+  auto NewSites = []()
+  {
+    auto Sites = std::make_shared<StoredSessionList>();
+    auto Data = std::make_shared<SessionData>();
+    Data->Name = QStringLiteral("Folder/Doomed");
+    Data->HostName = QStringLiteral("doomed.example.com");
+    Data->UserName = QStringLiteral("deploy");
+    Sites->Add(Data);
+    return Sites;
+  };
+  auto SiteNode = [](QTreeWidget * Tree)
+  {
+    QTreeWidgetItem * Result = nullptr;
+    for (QTreeWidgetItemIterator It(Tree); *It; ++It)
+    {
+      if ((*It)->text(0) == QStringLiteral("Doomed")) Result = *It;
+    }
+    return Result;
+  };
+  auto Trigger = [](QDialog & Dialog, const QString & Text)
+  {
+    for (QAction * Action : Dialog.findChildren<QAction *>())
+    {
+      if (Action->text() == Text)
+      {
+        Action->trigger();
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // a drag of the stale node
+  {
+    auto Sites = NewSites();
+    LoginDialog Dialog(*Sites);
+    Dialog.show();
+    QApplication::processEvents();
+    auto * Tree = Dialog.findChild<QTreeWidget *>();
+    QTreeWidgetItem * Node = SiteNode(Tree);
+    CHECK(Node != nullptr);
+    if (Node == nullptr) return;
+    Tree->expandAll();
+    Tree->setCurrentItem(Node);
+    QApplication::processEvents();
+    Sites->Remove(QStringLiteral("Folder/Doomed"));
+    QPoint Pos = Tree->visualItemRect(Node).center();
+    QWidget * Viewport = Tree->viewport();
+    QMouseEvent Press(QEvent::MouseButtonPress, Pos, Viewport->mapToGlobal(Pos), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(Viewport, &Press);
+    QPoint Far = Pos + QPoint(QApplication::startDragDistance() * 4, 0);
+    QMouseEvent Move(QEvent::MouseMove, Far, Viewport->mapToGlobal(Far), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(Viewport, &Move);
+    QMouseEvent Release(QEvent::MouseButtonRelease, Far, Viewport->mapToGlobal(Far), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(Viewport, &Release);
+    // the Desktop Icon command of the stale node
+    Trigger(Dialog, QStringLiteral("Desktop &Icon"));
+  }
+  // saved while editing: under its name, not a default one
+  {
+    auto Sites = NewSites();
+    LoginDialog Dialog(*Sites);
+    Dialog.show();
+    QApplication::processEvents();
+    auto * Tree = Dialog.findChild<QTreeWidget *>();
+    QTreeWidgetItem * Node = SiteNode(Tree);
+    CHECK(Node != nullptr);
+    if (Node == nullptr) return;
+    Tree->setCurrentItem(Node);
+    QApplication::processEvents();
+    CHECK(Trigger(Dialog, QStringLiteral("&Edit")));
+    QApplication::processEvents();
+    Sites->Remove(QStringLiteral("Folder/Doomed"));
+    CHECK(Trigger(Dialog, QStringLiteral("&Save")));
+    QApplication::processEvents();
+    CHECK(Sites->FindByName(QStringLiteral("Folder/Doomed")) != nullptr);
+    CHECK_EQ(Sites->Sessions().size(), static_cast<qsizetype>(1));
+  }
+  // renamed: the workspace follows (L37)
+  {
+    auto Sites = NewSites();
+    SessionData Tab = *Sites->FindByName(QStringLiteral("Folder/Doomed"));
+    Workspaces::SaveWorkspace(*Sites, QStringLiteral("WS"), {Tab}, false);
+    LoginDialog Dialog(*Sites);
+    Dialog.show();
+    QApplication::processEvents();
+    auto * Tree = Dialog.findChild<QTreeWidget *>();
+    QTreeWidgetItem * Node = SiteNode(Tree);
+    CHECK(Node != nullptr);
+    if (Node == nullptr) return;
+    Tree->expandAll();
+    Tree->setCurrentItem(Node);
+    QApplication::processEvents();
+    CHECK(Trigger(Dialog, QStringLiteral("&Rename")));
+    QApplication::processEvents();
+    auto * Editor = Tree->findChild<QLineEdit *>();
+    CHECK(Editor != nullptr);
+    if (Editor != nullptr)
+    {
+      Editor->setText(QStringLiteral("Survivor"));
+      QKeyEvent Press(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+      QApplication::sendEvent(Editor, &Press);
+      CHECK(WaitUntil([&Sites]() { return Sites->FindByName(QStringLiteral("Folder/Survivor")) != nullptr; }, 3000));
+      QList<SessionData> Tabs = Workspaces::LoadWorkspace(*Sites, QStringLiteral("WS"));
+      CHECK_EQ(Tabs.size(), static_cast<qsizetype>(1));
+      CHECK_EQ(Tabs.value(0).Name, QStringLiteral("Folder/Survivor"));
+    }
+  }
+}
+
 static void TestStandaloneOperations(const QString & Scratch)
 {
   // URL pointing to a file: download (Copy dialog accepted by /defaults=1)
@@ -661,13 +956,21 @@ static void TestStandaloneOperations(const QString & Scratch)
     {
       if (QWidget * W = QApplication::activeModalWidget())
       {
-        if (auto * Dialog = qobject_cast<QDialog *>(W))
+        // the error, not the connecting dialog (shown by the "*" warning, ANY_HOSTKEY)
+        auto * Dialog = qobject_cast<QDialog *>(W);
+        if ((Dialog != nullptr) && (qobject_cast<AuthenticateDialog *>(W) == nullptr))
         {
+          // only the error: the connection has a modal dialog too on a busy machine
+          QString Text;
           for (QLabel * Label : Dialog->findChildren<QLabel *>())
           {
-            ErrorText += Label->text();
+            Text += Label->text();
           }
-          Dialog->reject();
+          if (Text.contains(QStringLiteral("does not exist")))
+          {
+            ErrorText = Text;
+            Dialog->reject();
+          }
         }
       }
     });
@@ -709,15 +1012,23 @@ static void TestSessionsFromAnotherInstance(const QString & Scratch)
   SessionData Data = TestSession(Scratch);
   QString Dir = Scratch + QStringLiteral("/remote");
   QString Url = QStringLiteral("sftp://%1@%2:%3%4/").arg(Data.UserName, Data.HostName).arg(Data.PortNumber).arg(Dir);
-  QStringList Args{Url, QStringLiteral("/privatekey=") + Data.PublicKeyFile, QStringLiteral("/hostkey=*"),
-    QStringLiteral("/rawsettings"), QStringLiteral("TryAgent=0"), QStringLiteral("AuthKI=0"),
-    QStringLiteral("/browse=") + Dir + QStringLiteral("/down load.txt")};
+  // S14: what comes from another process is a stored site or a plain URL. A
+  // site is opened as it is stored, whatever the command line tries.
+  StoredSessionList & Stored = Configuration::Instance().StoredSessions();
+  SessionData Site = Data;
+  Site.HostKey = QStringLiteral("*");
+  Site.TryAgent = false;
+  Site.AuthKI = false;
+  Site.RemoteDirectory = Dir;
+  Stored.NewSession(QStringLiteral("instance site"), Site);
+  QStringList Args{QStringLiteral("instance site"), QStringLiteral("/rawsettings"), QStringLiteral("HostName=127.0.0.2"),
+    QStringLiteral("PortNumber=1"), QStringLiteral("/browse=") + Dir + QStringLiteral("/down load.txt")};
   CommandLineFromAnotherInstance(&Window, Args, Scratch, QString());
-  CHECK(WaitUntil([&Window]()
+  CHECK(WaitUntil([&Window, &Site]()
   {
     for (Terminal * T : Window.findChildren<Terminal *>(Qt::FindDirectChildrenOnly))
     {
-      if (T->Active()) return true;
+      if (T->Active()) return (T->Data().HostName == Site.HostName) && (T->Data().PortNumber == Site.PortNumber);
     }
     return false;
   }, 30000));
@@ -792,6 +1103,8 @@ int main(int argc, char * argv[])
   TestUrlHandler(Scratch.path());
   std::printf("- %s\n", "TestSingleInstance"); std::fflush(stdout);
   TestSingleInstance(Scratch.path());
+  TestServerNameLength(Scratch.path());
+  TestSiteRemovedInLoginDialog();
 
   if (!qEnvironmentVariableIsEmpty("NIXSCP_TEST_SSH_PORT") && !qEnvironmentVariableIsEmpty("NIXSCP_TEST_SSH_KEY"))
   {

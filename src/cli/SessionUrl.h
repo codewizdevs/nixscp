@@ -21,6 +21,8 @@ const int piDefaultsOnly = 0x02;
 // -hostkey, -certificate and ;fingerprint= go to SessionData::HostKey
 // (WinSCP.ini "SshHostKey"), which the core verifies (SSH and TLS);
 // the raw setting "HostKey" is the host key algorithm list (HostKeyList).
+// "*" and "acceptnew" count from -hostkey, -certificate and -rawsettings,
+// which a script author has written, never from a URL.
 struct SessionExtras
 {
   QString Passphrase;     // -passphrase / Passphrase raw setting
@@ -39,8 +41,10 @@ QString DecodeUrlChars(QString S);
 // Data is reset to the stored site, or to Default Settings for an ad-hoc URL.
 // Stored may be null. Switches recognized are consumed from Opts (may be null).
 // Throws ExtException on invalid switch values.
+// Unsafe (pufUnsafe): the URL is from somebody else, a link for one, so of its
+// raw settings only SessionData::IsUrlSetting ones apply, without a word.
 void ParseSessionUrl(const QString & Url, Options * Opts, const StoredSessionList * Stored,
-  SessionData & Data, SessionExtras & Extras, int & ParsedInfo, QString * MaskedUrl = nullptr);
+  SessionData & Data, SessionExtras & Extras, int & ParsedInfo, QString * MaskedUrl = nullptr, bool Unsafe = false);
 
 // Applies "Key=Value" settings in WinSCP.ini format (TSessionData::ApplyRawSettings)
 void ApplySessionRawSettings(SessionData & Data, SessionExtras & Extras, const QStringList & Settings);

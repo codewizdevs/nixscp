@@ -4,6 +4,8 @@
 #include <QDir>
 #include <QFileInfo>
 
+#include <algorithm>
+
 int MobileQueue::active() const
 {
   int Count = 0;
@@ -83,7 +85,8 @@ const MobileQueue::Item * MobileQueue::Find(int Id) const
   return (Row >= 0) ? &FItems.at(Row) : nullptr;
 }
 
-int MobileQueue::Add(RemoteSession * Owner, Direction Dir, const QStringList & Sources, const QString & Target, bool Publish)
+int MobileQueue::Add(RemoteSession * Owner, Direction Dir, const QStringList & Sources, const QString & Target, bool Publish,
+  const QString & CacheFolder)
 {
   Item I;
   I.Id = FNextId++;
@@ -93,6 +96,7 @@ int MobileQueue::Add(RemoteSession * Owner, Direction Dir, const QStringList & S
   I.Sources = Sources;
   I.Target = Target;
   I.Publish = Publish;
+  I.CacheFolder = CacheFolder;
   QString First = QFileInfo(Sources.value(0)).fileName();
   I.Title = (Sources.size() == 1) ? First : QStringLiteral("%1 and %2 more").arg(First).arg(Sources.size() - 1);
   int Row = static_cast<int>(FItems.size());
@@ -102,6 +106,23 @@ int MobileQueue::Add(RemoteSession * Owner, Direction Dir, const QStringList & S
   emit changed();
   emit added(Owner);
   return I.Id;
+}
+
+bool MobileQueue::HasActive(const RemoteSession * Owner) const
+{
+  return std::any_of(FItems.cbegin(), FItems.cend(), [Owner](const Item & I)
+  {
+    return (I.Owner == Owner) && ((I.St == Waiting) || (I.St == Running));
+  });
+}
+
+void MobileQueue::RemoveCopies(Item & I)
+{
+  if (!I.CacheFolder.isEmpty())
+  {
+    QDir(I.CacheFolder).removeRecursively();
+    I.CacheFolder.clear();
+  }
 }
 
 const MobileQueue::Item * MobileQueue::Next(RemoteSession * Owner) const
@@ -129,6 +150,7 @@ void MobileQueue::SetState(int Id, State St, const QString & Error)
   if (St == Done)
   {
     I.Progress = 1;
+    RemoveCopies(I);
     int Count = static_cast<int>(I.Sources.size());
     if (I.Dir == Upload)
     {
@@ -171,11 +193,20 @@ void MobileQueue::SetProgress(int Id, double Progress, const QString & Detail)
 
 void MobileQueue::Abandon(RemoteSession * Owner)
 {
-  for (const Item & I : FItems)
+  for (const Item & I : std::as_const(FItems))
   {
     if ((I.Owner == Owner) && ((I.St == Waiting) || (I.St == Running)))
     {
       SetState(I.Id, Cancelled);
+    }
+  }
+  // no Retry without the session: the rows change what they offer
+  for (int Row = 0; Row < FItems.size(); Row++)
+  {
+    if (FItems.at(Row).Owner == Owner)
+    {
+      RemoveCopies(FItems[Row]);
+      emit dataChanged(index(Row), index(Row), {CanRetryRole});
     }
   }
 }
@@ -200,7 +231,8 @@ void MobileQueue::cancel(int Id)
 void MobileQueue::retry(int Id)
 {
   int Row = RowOf(Id);
-  if ((Row < 0) || (FItems.at(Row).Owner == nullptr) || (FItems.at(Row).St == Waiting) || (FItems.at(Row).St == Running))
+  if ((Row < 0) || (FItems.at(Row).Owner == nullptr) || !FItems.at(Row).Owner->connected() ||
+      (FItems.at(Row).St == Waiting) || (FItems.at(Row).St == Running))
   {
     return;
   }
@@ -220,6 +252,7 @@ void MobileQueue::clearFinished()
     State St = FItems.at(Row).St;
     if ((St != Waiting) && (St != Running))
     {
+      RemoveCopies(FItems[Row]);
       beginRemoveRows(QModelIndex(), Row, Row);
       FItems.removeAt(Row);
       endRemoveRows();
@@ -252,6 +285,8 @@ QVariant MobileQueue::data(const QModelIndex & Index, int Role) const
     case DetailRole: return I.Detail;
     case ErrorRole: return I.Error;
     case TargetRole: return I.Target;
+    // the connection of a closed tab is gone
+    case CanRetryRole: return (I.Owner != nullptr) && I.Owner->connected() && ((I.St == Failed) || (I.St == Cancelled));
     default: return QVariant();
   }
 }
@@ -259,5 +294,6 @@ QVariant MobileQueue::data(const QModelIndex & Index, int Role) const
 QHash<int, QByteArray> MobileQueue::roleNames() const
 {
   return {{IdRole, "itemId"}, {SiteRole, "site"}, {TitleRole, "title"}, {DirectionRole, "direction"},
-    {StateRole, "status"}, {ProgressRole, "progress"}, {DetailRole, "detail"}, {ErrorRole, "error"}, {TargetRole, "target"}};
+    {StateRole, "status"}, {ProgressRole, "progress"}, {DetailRole, "detail"}, {ErrorRole, "error"}, {TargetRole, "target"},
+    {CanRetryRole, "canRetry"}};
 }

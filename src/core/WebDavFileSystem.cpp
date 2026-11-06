@@ -21,6 +21,7 @@
 #include <QUrl>
 #include <QXmlStreamReader>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -36,8 +37,8 @@ const char * const FTP_ACCESS_DENIED = "Access denied.";
 const char * const NET_TRANSL_HOST_NOT_EXIST2 = "Host \"%1\" does not exist.";
 const char * const NET_TRANSL_TIMEOUT2 = "Network error: Connection to \"%1\" timed out.";
 const char * const REQUEST_REDIRECTED = "WebDAV resource moved to '%1'.";
-const char * const UNENCRYPTED_REDIRECT = "Redirected to an unencrypted URL.";
-const char * const WEBDAV_CROSS_DOMAIN_REDIR = "Redirect to other host encountered. If you trust the target host %1, please allow redirects to other hosts in session settings.";
+const char * const UNENCRYPTED_REDIRECT = "The server redirected to an unencrypted URL. NixSCP does not follow it, as the password of this site would be sent unencrypted.";
+const char * const WEBDAV_CROSS_DOMAIN_REDIR = "The server redirected to other host %1. NixSCP does not follow it, as the password of this site would go there. If you trust that host, connect to it directly.";
 const char * const TOO_MANY_REDIRECTS = "Too many redirects.";
 const char * const REDIRECT_LOOP = "Redirect loop detected.";
 const char * const INVALID_URL = "Invalid URL \"%1\".";
@@ -110,6 +111,13 @@ void LogLine(const QString & Line)
   {
     std::fprintf(stderr, "[dav] %s\n", qPrintable(Line));
   }
+}
+
+// "host:port=fingerprint" entries for this server
+bool HasAcceptedCertificate(const QSet<QString> & Accepted, const QString & Host, int Port)
+{
+  QString Prefix = QStringLiteral("%1:%2=").arg(Host).arg(Port);
+  return std::any_of(Accepted.cbegin(), Accepted.cend(), [&Prefix](const QString & Key) { return Key.startsWith(Prefix); });
 }
 
 // TTerminal::VerifyCertificateAgainstSessionData: fingerprint(s) configured
@@ -333,8 +341,10 @@ QDateTime ParseHttpDate(const QString & Str)
 }
 
 // Path of an href of a multistatus response: absolute URIs are reduced to
-// their path, relative references resolved against the request path
-QString HrefPath(const QString & Href, const QString & RequestPath)
+// their path, relative references resolved against the request path.
+// LiberalEscaping (WebDavLiberalEscaping, NE_SESSFLAG_LIBERAL_ESCAPING): the
+// server does not encode names, so '?' and '#' are characters of the name.
+QString HrefPathOf(const QString & Href, const QString & RequestPath, bool LiberalEscaping)
 {
   QByteArray Raw = Href.trimmed().toUtf8();
   qsizetype SchemeEnd = Raw.indexOf("://");
@@ -343,8 +353,8 @@ QString HrefPath(const QString & Href, const QString & RequestPath)
     qsizetype PathStart = Raw.indexOf('/', SchemeEnd + 3);
     Raw = (PathStart < 0) ? QByteArray("/") : Raw.mid(PathStart);
   }
-  qsizetype End = Raw.indexOf('?');
-  qsizetype Fragment = Raw.indexOf('#');
+  qsizetype End = LiberalEscaping ? -1 : Raw.indexOf('?');
+  qsizetype Fragment = LiberalEscaping ? -1 : Raw.indexOf('#');
   if ((Fragment >= 0) && ((End < 0) || (Fragment < End)))
   {
     End = Fragment;
@@ -481,6 +491,11 @@ QString WebDavFileSystem::ServerInfo() const
     Lines << Tr(WEBDAV_EXTENSION_INFO) << (QStringLiteral("  ") + FCapabilities.join(QStringLiteral(", ")));
   }
   return Lines.join(QLatin1Char('\n'));
+}
+
+QString WebDavFileSystem::HrefPath(const QString & Href, const QString & RequestPath, bool LiberalEscaping)
+{
+  return HrefPathOf(Href, RequestPath, LiberalEscaping);
 }
 
 QByteArray WebDavFileSystem::PathEscape(const QString & Path)
@@ -769,19 +784,25 @@ void WebDavFileSystem::VerifyCertificate(const QList<QSslError> & Errors)
   {
     return;
   }
-  if (CertificateMatchesSessionData(FData.HostKey, FCertificateFingerprintSHA1, FCertificateFingerprintSHA256))
-  {
-    return;
-  }
   QString Key = QStringLiteral("%1:%2=%3").arg(FHost).arg(FPort).arg(FCertificateFingerprintSHA256);
+  bool OtherAccepted = false;
   {
     QMutexLocker Lock(&AcceptedCertificatesMutex);
     if (AcceptedCertificates.contains(Key))
     {
       return;
     }
+    OtherAccepted = HasAcceptedCertificate(AcceptedCertificates, FHost, FPort);
   }
   if (FAcceptedOnce.contains(Key))
+  {
+    return;
+  }
+  // As with an SSH host key: a fingerprint in a URL does not outrank the
+  // certificate accepted for this server before, a different one is a question
+  OtherAccepted = OtherAccepted || HasAcceptedCertificate(FAcceptedOnce, FHost, FPort);
+  if (!(FData.HostKeyFromUrl && OtherAccepted) &&
+      CertificateMatchesSessionData(FData.TrustedHostKey(), FCertificateFingerprintSHA1, FCertificateFingerprintSHA256))
   {
     return;
   }
@@ -1625,7 +1646,8 @@ void WebDavFileSystem::CheckStatus(const Response & Resp, bool Multistatus)
   }
 }
 
-QList<WebDavFileSystem::Resource> WebDavFileSystem::ParseMultistatus(const QByteArray & Xml, const QString & RequestPath, QStringList * Errors)
+QList<WebDavFileSystem::Resource> WebDavFileSystem::ParseMultistatus(const QByteArray & Xml, const QString & RequestPath, QStringList * Errors,
+  bool LiberalEscaping)
 {
   // ne_207.c + ne_props.c: properties of 2xx propstat elements only
   QList<Resource> Result;
@@ -1674,7 +1696,7 @@ QList<WebDavFileSystem::Resource> WebDavFileSystem::ParseMultistatus(const QByte
       }
       else if (Dav && (Name == u"href") && !InPropstat)
       {
-        Current.Path = HrefPath(Reader.readElementText(QXmlStreamReader::IncludeChildElements), RequestPath);
+        Current.Path = HrefPath(Reader.readElementText(QXmlStreamReader::IncludeChildElements), RequestPath, LiberalEscaping);
       }
       else if (Dav && (Name == u"propstat"))
       {
@@ -1817,7 +1839,7 @@ bool WebDavFileSystem::ReadFileInternal(const QString & Abs, RemoteFile & File, 
     }
     return false;
   }
-  QList<Resource> Resources = ParseMultistatus(Resp.Body, Path, nullptr);
+  QList<Resource> Resources = ParseMultistatus(Resp.Body, Path, nullptr, FData.WebDavLiberalEscaping);
   const Resource * Found = nullptr;
   for (const Resource & Res : std::as_const(Resources))
   {
@@ -2024,7 +2046,7 @@ RemoteFileList WebDavFileSystem::ReadDirectory(const QString & Directory)
     Response Resp = Propfind(Path, 1);
     CheckStatus(Resp, false);
     QString Base = DirectoryPath(Path);
-    for (const Resource & Res : ParseMultistatus(Resp.Body, Path, nullptr))
+    for (const Resource & Res : ParseMultistatus(Resp.Body, Path, nullptr, FData.WebDavLiberalEscaping))
     {
       if (Res.Failed)
       {

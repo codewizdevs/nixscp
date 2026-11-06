@@ -8,6 +8,8 @@
 
 class QWidget;
 
+class QDateTime;
+
 namespace UpdateCheck
 {
   // Shortly after startup, at most once a day, when enabled
@@ -18,4 +20,6 @@ namespace UpdateCheck
   QString CurrentVersion();
   // Latest is newer than Current ("1.2.0" or "v1.2.0")
   bool IsNewer(const QString & Latest, const QString & Current);
+  // Time for the daily check? A last check in the future (clock changed) does not count
+  bool CheckDue(const QDateTime & LastCheck, const QDateTime & Now);
 }

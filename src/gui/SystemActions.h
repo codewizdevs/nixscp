@@ -41,6 +41,12 @@ bool ShutDown(QString * Error = nullptr);
 // here (disconnecting is the main window's job) and return true.
 bool Execute(OnceDoneOperation Operation, QString * Error = nullptr);
 
+// There is a backend for the operation: Sleep and Shut Down go through
+// systemd-logind, so the queue and the progress window offer them on Linux only
+bool OperationSupported(OnceDoneOperation Operation);
+// Test hook: as on a platform without a backend for them
+void SetSystemOperationsUnsupported(bool Unsupported);
+
 // Errors of asynchronous requests (polkit refusal, logind missing); the
 // default prints a warning.
 void SetErrorHandler(const std::function<void(const QString &)> & Handler);

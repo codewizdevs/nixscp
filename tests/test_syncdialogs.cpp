@@ -205,9 +205,13 @@ static void TestFullSynchronizeDialog(QWidget * Main)
       }
       CHECK(Combos.value(0)->currentText() == QStringLiteral("/home/local"));
       CHECK((Combos.value(0)->findText(QStringLiteral("/history/local")) >= 0) || (Combos.value(1)->findText(QStringLiteral("/history/local")) >= 0));
-      // Linux: case sensitive by default
+      // Linux: case sensitive by default; not on macOS, where the disk ignores case
       QCheckBox * CaseSensitive = ByText<QCheckBox>(W, QStringLiteral("C&ase sensitive"));
+#ifdef Q_OS_MACOS
+      CHECK((CaseSensitive != nullptr) && !CaseSensitive->isChecked());
+#else
       CHECK((CaseSensitive != nullptr) && CaseSensitive->isChecked());
+#endif
       QCheckBox * Preview = ByText<QCheckBox>(W, QStringLiteral("Pre&view changes"));
       CHECK((Preview != nullptr) && Preview->isChecked());
       // split buttons: Transfer settings always has the presets drop-down,

@@ -2,6 +2,7 @@
 // manager part) and windows/WinConfiguration.cpp (master password)
 #include "core/Security.h"
 
+#include <QFile>
 #include <QHash>
 #include <QMutex>
 #include <QRandomGenerator>
@@ -12,16 +13,255 @@
 #include <openssl/rand.h>
 
 #include <cstring>
+#include <utility>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
+#if defined(Q_OS_LINUX) && !defined(Q_OS_ANDROID)
+#include <sys/prctl.h>
+#endif
+#ifdef Q_OS_MACOS
+#include <sys/types.h>
+#include <sys/proc.h>
+#include <sys/ptrace.h>
+#include <sys/sysctl.h>
+#endif
+
+//---------------------------------------------------------------------------
+// SecureBytes
+
+#ifdef Q_OS_WIN
+// A function of kernel32 that older versions of Windows do not have
+static FARPROC Kernel32Function(const char * Name)
+{
+  return GetProcAddress(GetModuleHandleW(L"kernel32.dll"), Name);
+}
+
+// Left out of the dumps of Windows Error Reporting (Windows 10 1903 and newer)
+static void ExcludeFromDumps(void * Memory, size_t Size)
+{
+  using Function = HRESULT (WINAPI *)(const void *, DWORD);
+  static const auto Exclude = reinterpret_cast<Function>(reinterpret_cast<void *>(Kernel32Function("WerRegisterExcludedMemoryBlock")));
+  if (Exclude != nullptr)
+  {
+    Exclude(Memory, static_cast<DWORD>(Size));
+  }
+}
+
+static void IncludeInDumps(void * Memory)
+{
+  using Function = HRESULT (WINAPI *)(const void *);
+  static const auto Include = reinterpret_cast<Function>(reinterpret_cast<void *>(Kernel32Function("WerUnregisterExcludedMemoryBlock")));
+  if (Include != nullptr)
+  {
+    Include(Memory);
+  }
+}
+#endif
+
+// A secret is small, so a page of its own costs little and can be locked and
+// excluded from dumps alone. Locking is best effort: the limit for locked
+// memory is low on some systems, and the key is still wiped.
+static char * AllocateSecret(size_t Size, size_t & Capacity)
+{
+#ifdef Q_OS_WIN
+  SYSTEM_INFO Info;
+  GetSystemInfo(&Info);
+  size_t Page = Info.dwPageSize;
+  Capacity = ((Size + Page - 1) / Page) * Page;
+  void * Memory = VirtualAlloc(nullptr, Capacity, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (Memory == nullptr)
+  {
+    qFatal("Cannot allocate memory for a key");
+  }
+  VirtualLock(Memory, Capacity);
+  ExcludeFromDumps(Memory, Capacity);
+#else
+  size_t Page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  Capacity = ((Size + Page - 1) / Page) * Page;
+  void * Memory = mmap(nullptr, Capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (Memory == MAP_FAILED)
+  {
+    qFatal("Cannot allocate memory for a key");
+  }
+  mlock(Memory, Capacity);
+#ifdef MADV_DONTDUMP
+  madvise(Memory, Capacity, MADV_DONTDUMP);
+#endif
+#endif
+  return static_cast<char *>(Memory);
+}
+
+static void ReleaseSecret(char * Memory, size_t Capacity)
+{
+  OPENSSL_cleanse(Memory, Capacity);
+#ifdef Q_OS_WIN
+  IncludeInDumps(Memory);
+  VirtualUnlock(Memory, Capacity);
+  VirtualFree(Memory, 0, MEM_RELEASE);
+#else
+  munlock(Memory, Capacity);
+  munmap(Memory, Capacity);
+#endif
+}
+
+SecureBytes::SecureBytes(SecureBytes && Other) noexcept :
+  FData(std::exchange(Other.FData, nullptr)),
+  FSize(std::exchange(Other.FSize, 0)),
+  FCapacity(std::exchange(Other.FCapacity, 0))
+{
+}
+
+SecureBytes & SecureBytes::operator=(const SecureBytes & Other)
+{
+  if (this != &Other)
+  {
+    Assign(Other.View());
+  }
+  return *this;
+}
+
+SecureBytes & SecureBytes::operator=(SecureBytes && Other) noexcept
+{
+  if (this != &Other)
+  {
+    Clear();
+    FData = std::exchange(Other.FData, nullptr);
+    FSize = std::exchange(Other.FSize, 0);
+    FCapacity = std::exchange(Other.FCapacity, 0);
+  }
+  return *this;
+}
+
+void SecureBytes::Assign(const QByteArray & Data)
+{
+  // Released last: Data may be a View of this object
+  SecureBytes Old(std::move(*this));
+  if (!Data.isEmpty())
+  {
+    FData = AllocateSecret(static_cast<size_t>(Data.size()), FCapacity);
+    FSize = static_cast<int>(Data.size());
+    std::memcpy(FData, Data.constData(), static_cast<size_t>(FSize));
+  }
+}
+
+void SecureBytes::Clear()
+{
+  if (FData != nullptr)
+  {
+    ReleaseSecret(FData, FCapacity);
+  }
+  FData = nullptr;
+  FSize = 0;
+  FCapacity = 0;
+}
+
+QByteArray SecureBytes::View() const
+{
+  return (FData != nullptr) ? QByteArray::fromRawData(FData, FSize) : QByteArray();
+}
+
+QByteArray SecureBytes::Copy() const
+{
+  return (FData != nullptr) ? QByteArray(FData, FSize) : QByteArray();
+}
+
+bool SecureBytes::Equals(const QByteArray & Data) const
+{
+  return (Data.size() == FSize) &&
+    ((FSize == 0) || (CRYPTO_memcmp(FData, Data.constData(), static_cast<size_t>(FSize)) == 0));
+}
 
 namespace Security
 {
 
 static const char PWALG_SIMPLE_STRING[] = "0123456789ABCDEF";
 
+// xdg-desktop-portal identifies its caller through /proc/<pid>/root, which a
+// non-dumpable process closes: every portal call is refused, so the file
+// dialogs of a session using portals would fail without a message
+bool DesktopPortalInUse()
+{
+  return qEnvironmentVariable("QT_QPA_PLATFORMTHEME").contains(QStringLiteral("portal"), Qt::CaseInsensitive) ||
+    (qEnvironmentVariable("GTK_USE_PORTAL") == QStringLiteral("1")) || qEnvironmentVariableIsSet("SNAP") ||
+    QFile::exists(QStringLiteral("/.flatpak-info"));
+}
+
+void ProtectProcessMemory()
+{
+#if defined(QT_NO_DEBUG) && !defined(Q_OS_ANDROID)
+  static bool Done = false;
+  if (Done || qEnvironmentVariableIsSet("NIXSCP_ALLOW_COREDUMP"))
+  {
+    return;
+  }
+  Done = true;
+#if defined(Q_OS_WIN)
+  // Attached before the key arrived: someone is debugging this process
+  if (IsDebuggerPresent())
+  {
+    return;
+  }
+  // A crash ends the process without Windows Error Reporting, so also without
+  // the dumps an administrator may have set up (LocalDumps). Programs started
+  // from here inherit this. Reports of a hanging window are not covered, hence
+  // no heap in them, and SecureBytes is left out of dumps by itself.
+  SetErrorMode(GetErrorMode() | SEM_NOGPFAULTERRORBOX);
+  using SetFlags = HRESULT (WINAPI *)(DWORD);
+  auto WerFlags = reinterpret_cast<SetFlags>(reinterpret_cast<void *>(Kernel32Function("WerSetFlags")));
+  if (WerFlags != nullptr)
+  {
+    constexpr DWORD NoHeap = 1;   // WER_FAULT_REPORTING_FLAG_NOHEAP
+    WerFlags(NoHeap);
+  }
+#else
+#if defined(Q_OS_LINUX)
+  // Attached before the key arrived: someone is debugging this process
+  QFile Status(QStringLiteral("/proc/self/status"));
+  if (Status.open(QIODevice::ReadOnly) && !Status.readAll().contains("TracerPid:\t0\n"))
+  {
+    return;
+  }
+#elif defined(Q_OS_MACOS)
+  // The same; PT_DENY_ATTACH would end a process that is being traced
+  struct kinfo_proc Process = {};
+  size_t ProcessSize = sizeof(Process);
+  int Request[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+  if ((sysctl(Request, 4, &Process, &ProcessSize, nullptr, 0) != 0) || ((Process.kp_proc.p_flag & P_TRACED) != 0))
+  {
+    return;
+  }
+#endif
+  // The soft limit only: programs started from here may still raise theirs
+  struct rlimit Limit;
+  if (getrlimit(RLIMIT_CORE, &Limit) == 0)
+  {
+    Limit.rlim_cur = 0;
+    setrlimit(RLIMIT_CORE, &Limit);
+  }
+#if defined(Q_OS_LINUX)
+  if (!DesktopPortalInUse())
+  {
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+  }
+#elif defined(Q_OS_MACOS)
+  // No debugger of this user from now on. Unsigned, a program started with
+  // DYLD_INSERT_LIBRARIES or under a debugger gets around this
+  ptrace(PT_DENY_ATTACH, 0, nullptr, 0);
+#endif
+#endif
+#endif
+}
+
 // Overwrites a buffer holding a secret (plain or scrambled password, key
 // material) before it is released. Only an unshared buffer is overwritten:
 // data() of a shared QByteArray would detach and wipe a fresh copy only.
-static void WipeBytes(QByteArray & Data)
+void WipeBytes(QByteArray & Data)
 {
   if (!Data.isEmpty() && !Data.isDetached())
   {

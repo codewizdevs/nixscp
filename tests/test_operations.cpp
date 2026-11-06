@@ -279,7 +279,7 @@ static void UnitTests()
   CHECK(Terminal::ProtocolCapability(fsSFTP, fcRename));
   CHECK(Terminal::ProtocolCapability(fsSFTP, fcResumeOverwrite));
   CHECK(!Terminal::ProtocolCapability(fsSFTP, fcMoveOverExistingFile));
-  CHECK(!Terminal::ProtocolCapability(fsSFTP, fcAppendUpload));
+  CHECK(Terminal::ProtocolCapability(fsSFTP, fcAppendUpload));
   CHECK(Terminal::ProtocolCapability(fsSCPonly, fcMoveOverExistingFile));
   CHECK(Terminal::ProtocolCapability(fsSCPonly, fcShellAnyCommand));
   CHECK(!Terminal::ProtocolCapability(fsSCPonly, fcResumeSupport));
@@ -847,6 +847,44 @@ int main(int argc, char ** argv)
     CHECK_MSG(R.Ok, Describe(R));
     CHECK(T.Active());
     CHECK_MSG(T.CurrentDirectory() == Base + QStringLiteral("/last"), T.CurrentDirectory());
+  }
+
+  std::printf("[reopen when the last directory is gone]\n");
+  {
+    // not a reason to lose the session, whatever the rule of Open is
+    SessionData Strict[2] = {Data, Data};
+    Strict[0].RequireDirectories = true;
+    Strict[1].UpdateDirectories = false;
+    for (const SessionData & D : Strict)
+    {
+      QString Gone = Base + QStringLiteral("/gone");
+      QDir().mkpath(Gone);
+      Terminal TG(D, &UI);
+      Waiter O;
+      TG.Open(O.Cb());
+      CHECK_MSG(O.Wait().Ok, Describe(O.Result));
+      QString HomeDir = TG.CurrentDirectory();
+      Waiter L;
+      TG.ReadDirectory(Gone, L.ListCb());
+      CHECK(L.Wait().Ok);
+      TG.Close();
+      CHECK(QDir(Gone).removeRecursively());
+      Waiter W;
+      TG.Reopen(W.Cb());
+      OperationResult R = W.Wait();
+      CHECK_MSG(R.Ok, Describe(R));
+      CHECK(TG.Active());
+      CHECK_MSG(TG.CurrentDirectory() == HomeDir, TG.CurrentDirectory());
+      TG.Close();
+      // opening it is still the error of the site or the URL
+      SessionData Opening = D;
+      Opening.RemoteDirectory = Gone;
+      Terminal TO(Opening, &UI);
+      Waiter F;
+      TO.Open(F.Cb());
+      CHECK_MSG(!F.Wait().Ok, Gone);
+      CHECK(F.Result.Message.contains(QStringLiteral("Error changing directory")));
+    }
   }
 
   // ---------------------------------------------------------------- automatic reconnect

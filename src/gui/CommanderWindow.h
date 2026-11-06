@@ -3,6 +3,7 @@
 // gui/CommanderActions.h), windows/TerminalManager.cpp (tabs, local browser)
 #pragma once
 
+#include "core/LocalFileOperations.h"
 #include "core/SessionData.h"
 #include "core/RemoteFile.h"
 #include "gui/FilePanel.h"
@@ -54,6 +55,16 @@ struct SessionTab
   bool Connecting = false;
   bool LocalBrowser = false;        // two local panels (New Local Tab)
   bool Implicit = false;            // the local browser shown when no session is open (replaced by the first session)
+  // TManagedTerminal::Permanent: of a workspace or a site folder; stays when
+  // its session fails to connect
+  bool Permanent = false;
+  bool ConnectOnActivate = false;   // opened with a workspace: connects when it gets activated
+  bool ConnectInBackground = false; // NextInactiveReconnect: connects by itself (WorkspaceConnectAll)
+  // The first tab of the reopened auto-saved workspace does not connect
+  // by itself, until it is left and activated again
+  bool DisconnectedTemporarily = false;
+  QString DisconnectMessage;        // ManagedSession->DisconnectMessage: why the session ended (no message box told it)
+  bool OperationLost = false;       // the session was lost in an operation with progress (not while idle)
   QString Name;                     // Rename Tab (empty = automatic caption)
   int Color = 0;                    // tab color (BGR TColor, 0 = none); from the site
   // Synchronized browsing (TScpCommanderForm::SynchronizeBrowsing)
@@ -73,13 +84,22 @@ public:
 
   void NewSession();
   void OpenSession(const SessionData & Data);
-  void OpenWorkspace(const QString & Name);
+  // TCustomScpExplorerForm::DoOpenFolderOrWorkspace: a tab per session. The
+  // first one connects (unless ConnectFirst is false), the others when they
+  // get activated, or one by one by themselves with WorkspaceConnectAll
+  void OpenWorkspace(const QString & Name, bool ConnectFirst = true);
+  // TCustomScpExplorerForm::DoShow: reopens the workspace auto-saved when the
+  // main window was last closed; false when there is none to reopen
+  bool OpenAutoWorkspace();
   // TTerminalManager::NewLocalSession (Tabs > New Tab > Local Tab)
   void NewLocalTab(const QString & LocalDirectory = QString(), const QString & OtherLocalDirectory = QString());
 
   CommanderActions * Actions() const { return FA; }
-  // The connected tabs with their current directories (workspace / cloud session)
+  // The connected tabs with their current directories (cloud session)
   QList<SessionData> WorkspaceTabs() const;
+  // TTerminalManager::SaveWorkspace: all tabs for a workspace, also local and
+  // disconnected ones (not the implicit local browser)
+  QList<SessionData> CollectWorkspace() const;
   // The stored site of the current tab (empty for an ad-hoc session or a local tab)
   QString CurrentSiteName() const;
   EditorManager * Editors() const { return FEditorManager; }
@@ -113,6 +133,12 @@ private:
   bool FUpdatingTabs = false;
   bool FClosing = false;
   bool FExecutedByShortcut = false;   // the action being executed was triggered by its shortcut
+  // The command comes from a file popup: WinSCP's *Focused actions, operating on
+  // the focused file when it is not marked (FilePanel::SelectedPaths)
+  bool FOnFocused = false;
+  bool FFirstTerminal = true;         // TScpCommanderForm::FFirstTerminal
+  int FLocalOperations = 0;           // local operations on worker threads
+  QTimer * FBackgroundConnectTimer = nullptr;
 
   // Menus and toolbars
   QMenu * FLocalMenu = nullptr;
@@ -180,6 +206,10 @@ private:
   SessionTab * CurrentTab() const;
   SessionTab * TabOfTerminal(Terminal * Term) const;
   int TabIndex(SessionTab * Tab) const;
+  // TScpCommanderForm::SessionChanged: what the panels keep of the tab left
+  void SessionChanged(SessionTab * Previous, SessionTab * Tab);
+  // Reconnect button and disconnect message of the remote panel of a tab without session
+  void UpdateDisconnectedPanel(SessionTab * Tab);
   void NewTab(bool Remote);
   void NewTabFromCurrent(bool AllowReverse);
   void DuplicateTab();
@@ -202,6 +232,10 @@ private:
   bool Connected(const SessionTab * Tab = nullptr) const;
   bool PanelReady(FilePanel * Panel) const;
   bool CheckReady();
+  // Connects the session of a tab without session (OpenSession, activated workspace tab)
+  void ConnectTab(SessionTab * Tab, const SessionData & Data, const QString & RememberedPassword = QString());
+  // TTerminalManager::Idle (NextInactiveReconnect): the next inactive workspace tab
+  void ConnectNextInBackground();
   void SessionClosed(SessionTab * Tab);
   void DisconnectTab(SessionTab * Tab);
   bool CanCloseQueue(SessionTab * Tab);
@@ -226,7 +260,9 @@ private:
 
   // Operations on a side (Remote = right panel); Focused: popup command
   void CopyFiles(bool Remote, bool Move, int QueueMode = 0);
-  void LocalLocalCopy(bool Remote, bool Move);
+  void LocalLocalCopy(bool Remote, bool Move, bool NoConfirmation = false);
+  // On a worker thread with progress and cancel
+  void RunLocalOperation(const LocalFileOperations::Params & Params, const std::function<void(const LocalOperationResult &)> & Done);
   void TransferFiles(const QStringList & Paths, bool FromRemote, const QString & TargetDirectory, bool Move, bool Confirm,
     int QueueMode = 0, bool ShortCutHint = false);
   void HandleDrop(FilePanel * Target, const QStringList & Paths, bool FromRemote, const QString & TargetDirectory,
@@ -267,6 +303,7 @@ private:
   void SynchronizeBrowsingFailed(SessionTab * Tab, const QString & Path, bool CreateRemote, const QString & More);
   // Context menus (NonVisual.dfm popups)
   void ShowFilePopup(FilePanel * Panel, const QPoint & GlobalPos, bool OnItem);
+  void ExecuteFilePopup(FilePanel * Panel, const QPoint & GlobalPos, bool OnItem);
   void ShowPanelPopup(FilePanel * Panel, const QPoint & GlobalPos);
   QMenu * CreateEditPopupSubmenu(QMenu * Parent, bool Bold);
   // Workspaces / custom commands

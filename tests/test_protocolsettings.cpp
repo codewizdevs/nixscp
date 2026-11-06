@@ -28,6 +28,7 @@
 #include <QTimer>
 
 #include <sys/stat.h>
+#include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstdio>
@@ -322,11 +323,17 @@ static void TestSftpSettings(const SessionData & BaseData, TestUserInterface & U
   }
 
   std::printf("[sftp Utf: legacy names]\n");
+  // "café" in Windows-1252 / Latin-1 bytes
+  QByteArray LegacyName = QByteArray("caf\xE9.txt");
+  QByteArray LocalPath = QFile::encodeName(Dir) + "/" + LegacyName;
+  int Fd = ::open(LocalPath.constData(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  if ((Fd < 0) && (errno == EILSEQ))
   {
-    // "café" in Windows-1252 / Latin-1 bytes
-    QByteArray LegacyName = QByteArray("caf\xE9.txt");
-    QByteArray LocalPath = QFile::encodeName(Dir) + "/" + LegacyName;
-    int Fd = ::open(LocalPath.constData(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    // APFS has no such name
+    std::printf("  SKIPPED (this disk takes UTF-8 names only)\n");
+  }
+  else
+  {
     CHECK(Fd >= 0);
     CHECK(::write(Fd, "legacy", 6) == 6);
     ::close(Fd);

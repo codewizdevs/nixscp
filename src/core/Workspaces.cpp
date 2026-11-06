@@ -4,6 +4,7 @@
 #include "core/Configuration.h"
 #include "core/IniStorage.h"
 
+#include <QFileInfo>
 #include <QStringList>
 #include <algorithm>
 
@@ -56,32 +57,32 @@ QStringList Workspaces::WorkspaceNames(const StoredSessionList & Sessions)
   return Result;
 }
 
-// TStoredSessionList::GetFirstFolderOrWorkspaceSession
-static std::shared_ptr<SessionData> FirstFolderOrWorkspaceSession(const StoredSessionList & Sessions, const QString & Name)
+// Unlike WinSCP not only the first session of the name decides: a site can
+// share its folder with a workspace ("Prod" and "Prod/web"), and it must not
+// pass for a workspace entry then
+static bool AnySessionOfKind(const StoredSessionList & Sessions, const QString & Name, bool Workspace)
 {
   if (!Name.isEmpty())
   {
     for (const auto & Data : Sessions.Sessions())
     {
-      if (Workspaces::IsInFolderOrWorkspace(*Data, Name))
+      if ((Data->IsWorkspace == Workspace) && Workspaces::IsInFolderOrWorkspace(*Data, Name))
       {
-        return Data;
+        return true;
       }
     }
   }
-  return nullptr;
+  return false;
 }
 
 bool Workspaces::IsWorkspace(const StoredSessionList & Sessions, const QString & Name)
 {
-  std::shared_ptr<SessionData> Data = FirstFolderOrWorkspaceSession(Sessions, Name);
-  return (Data != nullptr) && Data->IsWorkspace;
+  return AnySessionOfKind(Sessions, Name, true);
 }
 
 bool Workspaces::IsFolder(const StoredSessionList & Sessions, const QString & Name)
 {
-  std::shared_ptr<SessionData> Data = FirstFolderOrWorkspaceSession(Sessions, Name);
-  return (Data != nullptr) && !Data->IsWorkspace;
+  return AnySessionOfKind(Sessions, Name, false);
 }
 
 bool Workspaces::HasAnyWorkspace(const StoredSessionList & Sessions)
@@ -114,15 +115,17 @@ QList<SessionData> Workspaces::FolderOrWorkspace(const StoredSessionList & Sessi
 {
   // TStoredSessionList::DoGetFolderOrWorkspace
   QList<SessionData> Result;
+  // sites sharing the name of a workspace are not its tabs
+  bool OnlyWorkspace = IsWorkspace(Sessions, Name);
   for (const auto & RawData : Sessions.Sessions())
   {
-    if (!IsInFolderOrWorkspace(*RawData, Name))
+    if (!IsInFolderOrWorkspace(*RawData, Name) || (OnlyWorkspace && !RawData->IsWorkspace))
     {
       continue;
     }
     // CheckIsInFolderOrWorkspaceAndResolve
     std::shared_ptr<SessionData> Data = ResolveWorkspaceData(Sessions, RawData);
-    if ((Data == nullptr) || !Data->CanLogin() || !Data->Link.isEmpty())
+    if ((Data == nullptr) || !Data->CanOpen() || !Data->Link.isEmpty())
     {
       continue;
     }
@@ -161,7 +164,9 @@ QStringList Workspaces::FolderOrWorkspaceList(const StoredSessionList & Sessions
   QStringList Result;
   for (const SessionData & Data : FolderOrWorkspace(Sessions, Name))
   {
-    Result.append(Data.SessionName());
+    // TSessionData::GetDefaultSessionName of a local browser
+    Result.append(Data.CanLogin() ? Data.SessionName() :
+      QFileInfo(Data.LocalDirectory).fileName() + QStringLiteral(" \u2013 ") + QFileInfo(Data.OtherLocalDirectory).fileName());
   }
   return Result;
 }
@@ -214,13 +219,17 @@ void Workspaces::CopyStateData(SessionData & Target, const SessionData & Source)
 
 bool Workspaces::HasAnySessionPassword(const SessionData & Data)
 {
-  return !Data.Password.isEmpty() || !Data.TunnelPassword.isEmpty();
+  return Data.HasAnySessionPassword();
 }
 
 void Workspaces::ClearSessionPasswords(SessionData & Data)
 {
   Data.Password.clear();
   Data.TunnelPassword.clear();
+  // WinSCP keeps these, but "without passwords" means no secret at all
+  Data.ProxyPassword.clear();
+  Data.S3SessionToken.clear();
+  Data.TunnelPassphrase.clear();
 }
 
 // SaveWorkspaceData, the stored site branch: Result is a new TSessionData
@@ -264,7 +273,6 @@ static std::shared_ptr<SessionData> CreateLinkEntry(StoredSessionList & Sessions
   // link never carries any (WinSCP may write the redundant session
   // credentials, but they are ignored when the workspace is opened)
   Workspaces::ClearSessionPasswords(*Entry);
-  Entry->ProxyPassword.clear();
   return Entry;
 }
 
@@ -294,35 +302,32 @@ void Workspaces::SaveWorkspace(StoredSessionList & Sessions, const QString & Nam
       }
     }
     Result->IsWorkspace = true;
-    Result->Name = EntryName(Name, Index);
     DataList.append(Result);
   }
 
   // TStoredSessionList::NewWorkspace
-  QStringList Remove;
-  for (const auto & Data : Sessions.Sessions())
-  {
-    if (IsInFolderOrWorkspace(*Data, Name))
-    {
-      Remove.append(Data->Name);
-    }
-  }
-  for (const QString & RemoveName : Remove)
-  {
-    Sessions.Remove(RemoveName);
-  }
+  DeleteWorkspace(Sessions, Name);
+  // A site of a folder of the same name may hold the name of an entry ("Prod/0000")
+  int EntryIndex = 0;
   for (const auto & Data : DataList)
   {
+    while (Sessions.FindByName(EntryName(Name, EntryIndex)) != nullptr)
+    {
+      EntryIndex++;
+    }
+    Data->Name = EntryName(Name, EntryIndex);
     Sessions.Add(Data);
   }
 }
 
 int Workspaces::DeleteWorkspace(StoredSessionList & Sessions, const QString & Name)
 {
+  // Only the entries of the workspace: sites never go with it, whatever the
+  // workspace is called (WinSCP's NewWorkspace removes all sessions of the name)
   QStringList Remove;
   for (const auto & Data : Sessions.Sessions())
   {
-    if (IsInFolderOrWorkspace(*Data, Name))
+    if (Data->IsWorkspace && IsInFolderOrWorkspace(*Data, Name))
     {
       Remove.append(Data->Name);
     }
@@ -332,6 +337,30 @@ int Workspaces::DeleteWorkspace(StoredSessionList & Sessions, const QString & Na
     Sessions.Remove(RemoveName);
   }
   return Remove.size();
+}
+
+int Workspaces::UpdateLinks(StoredSessionList & Sessions, const QString & OldName, const QString & NewName, bool Folder)
+{
+  int Result = 0;
+  QString Prefix = OldName + QLatin1Char('/');
+  for (const auto & Data : Sessions.Sessions())
+  {
+    if (!Data->IsWorkspace || Data->Link.isEmpty())
+    {
+      continue;
+    }
+    if (!Folder && (Data->Link.compare(OldName, Qt::CaseInsensitive) == 0))
+    {
+      Data->Link = NewName;
+      Result++;
+    }
+    else if (Folder && Data->Link.startsWith(Prefix, Qt::CaseInsensitive))
+    {
+      Data->Link = NewName + QLatin1Char('/') + Data->Link.mid(Prefix.size());
+      Result++;
+    }
+  }
+  return Result;
 }
 
 Workspaces::PasswordOptions Workspaces::SavePasswordOptions(const StoredSessionList & Sessions, const QList<SessionData> & Tabs)

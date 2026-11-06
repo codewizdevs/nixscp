@@ -172,7 +172,8 @@ QString Options::Param(int Index)
   return Result;
 }
 
-bool Options::DoFindSwitch(const QString & Switch, QString & Value, int & ParamsStart, int & ParamsCount, bool & ValueSet)
+bool Options::DoFindSwitch(const QString & Switch, QString & Value, int & ParamsStart, int & ParamsCount, bool & ValueSet,
+  Qt::CaseSensitivity Sensitivity)
 {
   ParamsStart = 0;
   ValueSet = false;
@@ -185,7 +186,7 @@ bool Options::DoFindSwitch(const QString & Switch, QString & Value, int & Params
     {
       ParamsStart++;
     }
-    else if (O.Name.compare(Switch, Qt::CaseInsensitive) == 0)
+    else if (O.Name.compare(Switch, Sensitivity) == 0)
     {
       Found = true;
       Value = O.Value;
@@ -231,11 +232,27 @@ bool Options::FindSwitch(const QString & Switch, QString & Value, bool & ValueSe
 
 bool Options::FindSwitch(const QString & Switch, QStringList & Params, int ParamsMax)
 {
+  return FindSwitchParams(Switch, Params, ParamsMax, Qt::CaseInsensitive);
+}
+
+bool Options::FindSwitchCaseSensitive(const QString & Switch)
+{
+  QStringList Params;
+  return FindSwitchCaseSensitive(Switch, Params, 0);
+}
+
+bool Options::FindSwitchCaseSensitive(const QString & Switch, QStringList & Params, int ParamsMax)
+{
+  return FindSwitchParams(Switch, Params, ParamsMax, Qt::CaseSensitive);
+}
+
+bool Options::FindSwitchParams(const QString & Switch, QStringList & Params, int ParamsMax, Qt::CaseSensitivity Sensitivity)
+{
   QString Value;
   int ParamsStart;
   int ParamsCount;
   bool ValueSet;
-  bool Result = DoFindSwitch(Switch, Value, ParamsStart, ParamsCount, ValueSet);
+  bool Result = DoFindSwitch(Switch, Value, ParamsStart, ParamsCount, ValueSet, Sensitivity);
   if (Result)
   {
     bool Ok = false;

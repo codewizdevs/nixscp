@@ -118,7 +118,8 @@ static void StripSessionPasswords(IniFile & File)
     QStringLiteral("Password"), QStringLiteral("PasswordPlain"), QStringLiteral("ProxyPasswordEnc"),
     QStringLiteral("ProxyPassword"), QStringLiteral("TunnelPassword"), QStringLiteral("TunnelPasswordPlain"),
     QStringLiteral("TunnelPassphrase"), QStringLiteral("TunnelPassphrasePlain"), QStringLiteral("Passphrase"),
-    QStringLiteral("PassphrasePlain"), QStringLiteral("EncryptKey"), QStringLiteral("EncryptKeyPlain") };
+    QStringLiteral("PassphrasePlain"), QStringLiteral("EncryptKey"), QStringLiteral("EncryptKeyPlain"),
+    QStringLiteral("S3SessionToken") };
   for (const QString & Section : File.Sections())
   {
     if (Section.startsWith(SessionsSectionPrefix, Qt::CaseInsensitive))
@@ -320,7 +321,14 @@ QStringList Configuration::SystemIniFileNames() const
   QStringList Result;
   QString UserDir = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
   QString Own = QFileInfo(FIniFileName).absoluteFilePath();
-  for (const QString & Dir : QStandardPaths::standardLocations(QStandardPaths::GenericConfigLocation))
+#ifdef Q_OS_MACOS
+  // QStandardPaths has the user's folder only there: without this, what an
+  // administrator set for the computer would never be read
+  QStringList Dirs = qEnvironmentVariable("XDG_CONFIG_DIRS").split(QLatin1Char(':'), Qt::SkipEmptyParts);
+#else
+  QStringList Dirs = QStandardPaths::standardLocations(QStandardPaths::GenericConfigLocation);
+#endif
+  for (const QString & Dir : Dirs)
   {
     if (Dir == UserDir)
     {
@@ -332,6 +340,14 @@ QStringList Configuration::SystemIniFileNames() const
       Result.append(FileName);
     }
   }
+#ifdef Q_OS_MACOS
+  // next to where the user's settings are, under /Library
+  QString Machine = QStringLiteral("/Library/Application Support/NixSCP/nixscp.ini");
+  if (QFileInfo(Machine).isFile() && (QFileInfo(Machine).absoluteFilePath() != Own))
+  {
+    Result.append(Machine);
+  }
+#endif
   return Result;
 }
 
@@ -350,8 +366,33 @@ QString Configuration::DefaultLogFileName()
 
 QString Configuration::DefaultPuttyPath()
 {
+#ifdef Q_OS_WIN
+  // The OpenSSH client of Windows, in a console of its own (DesktopIntegration)
+  return QStringLiteral("ssh -p !# !U@!@");
+#else
   // Linux replacement for PuTTY: OpenSSH client in the default terminal
   return QStringLiteral("x-terminal-emulator -e ssh -p !# !U@!@");
+#endif
+}
+
+QString Configuration::LastStoredSession()
+{
+  IniStorage Storage(&FIni);
+  QString Result;
+  if (Storage.OpenSubKey(ConfigurationKey, false) && Storage.OpenSubKey(InterfaceKey, false))
+  {
+    Result = Storage.ReadString(QStringLiteral("LastStoredSession"), QString());
+  }
+  return Result;
+}
+
+void Configuration::SetLastStoredSession(const QString & Name)
+{
+  IniStorage Storage(&FIni);
+  if (Storage.OpenSubKey(ConfigurationKey, true) && Storage.OpenSubKey(InterfaceKey, true))
+  {
+    Storage.WriteString(QStringLiteral("LastStoredSession"), Name);
+  }
 }
 
 QList<EditorPreferences> Configuration::DefaultEditors()
@@ -510,6 +551,7 @@ void Configuration::LoadFrom(IniFile & File, bool Prompt)
       Data->Password.clear();
       Data->ProxyPassword.clear();
       Data->TunnelPassword.clear();
+      Data->S3SessionToken.clear();
     }
   }
 
@@ -533,6 +575,7 @@ void Configuration::LoadFrom(IniFile & File, bool Prompt)
       READ_INT(LocalPortNumberMin, "LocalPortNumberMin");
       READ_INT(LocalPortNumberMax, "LocalPortNumberMax");
       READ_BOOL(TryFtpWhenSshFails, "TryFtpWhenSshFails");
+      READ_STRING(MimeTypes, "MimeTypes");
       READ_INT(QueueTransfersLimit, "QueueTransfersLimit");
       READ_INT(ParallelTransferThreshold, "ParallelTransferThreshold");
       // TGUIConfiguration
@@ -731,6 +774,7 @@ void Configuration::SaveTo(IniFile & File)
       WRITE_INT(LocalPortNumberMin, "LocalPortNumberMin");
       WRITE_INT(LocalPortNumberMax, "LocalPortNumberMax");
       WRITE_BOOL(TryFtpWhenSshFails, "TryFtpWhenSshFails");
+      WRITE_STRING(MimeTypes, "MimeTypes");
       WRITE_INT(QueueTransfersLimit, "QueueTransfersLimit");
       WRITE_INT(ParallelTransferThreshold, "ParallelTransferThreshold");
       WRITE_BOOL(ContinueOnError, "ContinueOnError");

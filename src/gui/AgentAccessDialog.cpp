@@ -1,4 +1,5 @@
 #include "gui/AgentAccessDialog.h"
+#include "gui/AgentBroker.h"
 #include "gui/HelpSystem.h"
 
 #include "core/AgentAccess.h"
@@ -100,7 +101,8 @@ void AgentAccessDialog::ShowSessions(QWidget * Window)
     if (List->count() == 0)
     {
       Text->setPlainText(QStringLiteral("No recorded agent sessions.\n\nSites with \"Record sessions\" on (Agent Access...) "
-        "keep the commands agents run and their output here."));
+        "keep the commands agents run and their output here, encrypted with your NixSCP password. "
+        "Without a NixSCP password nothing is recorded."));
     }
   };
   QObject::connect(List, &QListWidget::currentItemChanged, &Dialog, [Text](QListWidgetItem * Item)
@@ -180,7 +182,10 @@ AgentAccessDialog::AgentAccessDialog(SessionData & Data, QWidget * Parent) : QDi
   auto * R = new QGridLayout(Rules);
   auto * RulesNote = new QLabel(QStringLiteral("One pattern per line, * matches anything (e.g. <b>systemctl status *</b>). "
     "Empty: all commands are allowed. Each part of a command (split at ; &amp;&amp; || |) must match an allowed pattern and "
-    "none of the denied ones. Rules are a safety net, not a sandbox: an allowed program can still do more."), Rules);
+    "none of the denied ones. What NixSCP cannot check for certain ($variables, $(...), comments, here-documents, line "
+    "continuations...) is refused, unless an allowed pattern without * is exactly the whole command. "
+    "<b>Rules are a safety net, not a security boundary:</b> they check text, so an allowed program can still do more, and "
+    "a denied one can run under another name. To really limit an agent, use a server account with few rights."), Rules);
   RulesNote->setWordWrap(true);
   R->addWidget(RulesNote, 0, 0, 1, 2);
   R->addWidget(new QLabel(QStringLiteral("Allowed commands:"), Rules), 1, 0);
@@ -211,6 +216,8 @@ AgentAccessDialog::AgentAccessDialog(SessionData & Data, QWidget * Parent) : QDi
     FDeny->setPlainText(AgentAccess::ReadOnlyDenyPreset());
     FTransfer->setChecked(true);
     FUpload->setChecked(false);
+    // a tunnel reaches the databases and services of the server, past any rule
+    FTunnels->setChecked(false);
   });
   connect(Clear, &QPushButton::clicked, this, [this]()
   {
@@ -218,6 +225,7 @@ AgentAccessDialog::AgentAccessDialog(SessionData & Data, QWidget * Parent) : QDi
     FDeny->clear();
   });
   connect(FTransfer, &QCheckBox::toggled, this, [this]() { UpdateControls(); });
+  connect(FRecord, &QCheckBox::toggled, this, [this]() { UpdateControls(); });
 
   FWarning = new QLabel(this);
   FWarning->setWordWrap(true);
@@ -280,16 +288,37 @@ void AgentAccessDialog::UpdateControls()
       "can read it directly. Protect it with a passphrase (Tools &gt; Run PuTTYgen or ssh-keygen -p); NixSCP then asks "
       "you for it when an agent connects."));
   }
+  if (On && FRecord->isChecked() && !AgentAccess::CanRecord())
+  {
+    Warnings.append(QStringLiteral("<b>Sessions will not be recorded.</b> Recordings hold whatever commands print, so they "
+      "are always encrypted, which needs the NixSCP password; a master password alone encrypts only saved passwords."));
+  }
+  if (On && !AgentBroker::ListenError().isEmpty())
+  {
+    Warnings.append(QStringLiteral("<b>Agents cannot reach NixSCP:</b> %1").arg(AgentBroker::ListenError().toHtmlEscaped()));
+  }
   if (On)
   {
-    Warnings.append(QStringLiteral("Agent access needs NixSCP running. "
-      "Requests are recorded in the agent access log (Commands menu)."));
+    Warnings.append(QStringLiteral("Agent access needs NixSCP running. Each request is written to the agent access log "
+      "(Commands menu), plain text with the first 500 characters of the command as it was sent: no stored passwords or keys, "
+      "but a secret typed into a command does land there."));
   }
   FWarning->setText(Warnings.join(QStringLiteral("<br><br>")));
 }
 
 void AgentAccessDialog::accept()
 {
+  for (QPlainTextEdit * Edit : {FAllow, FDeny})
+  {
+    QString Invalid = AgentAccess::InvalidPattern(Edit->toPlainText());
+    if (!Invalid.isEmpty())
+    {
+      // a denied pattern that cannot match would block the whole site
+      QMessageBox::warning(this, windowTitle(), QStringLiteral("The pattern \"%1\" is not valid: it has a [ without a closing ].").arg(Invalid));
+      Edit->setFocus();
+      return;
+    }
+  }
   QString AgentName = FAgentName->text().trimmed();
   QString Effective = AgentName.isEmpty() ? FData.Name : AgentName;
   if ((FAccess->currentIndex() != AgentAccess::amOff) && !Effective.isEmpty())
@@ -319,6 +348,12 @@ void AgentAccessDialog::accept()
   FData.AgentRecord = FRecord->isChecked();
   FData.AgentAllow = FAllow->toPlainText().trimmed();
   FData.AgentDeny = FDeny->toPlainText().trimmed();
+  // set by the user here, so no need to ask again (AgentAccess::SettingsConfirmed);
+  // should more of the site change before it is saved, NixSCP does ask
+  if (FData.AgentAccess != AgentAccess::amOff)
+  {
+    AgentAccess::ConfirmSettings(FData);
+  }
   QDialog::accept();
 }
 

@@ -1,5 +1,6 @@
 // Port of WinSCP site import (see SiteImport.h for the origin of each part)
 #include "core/SiteImport.h"
+#include "core/Platform.h"
 #include "core/IniStorage.h"
 
 #include <QDir>
@@ -8,6 +9,7 @@
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QSet>
+#include <QStringDecoder>
 #include <QTextStream>
 #include <QXmlStreamReader>
 
@@ -196,6 +198,40 @@ static bool IsValidOpensshLine(const QString & Line)
   return !Line.isEmpty() && (Line[0] != QLatin1Char('#'));
 }
 
+// A # at the start of a word, outside quotes, ends the line ("Host web # main")
+static QString CutOpensshComment(const QString & Value)
+{
+  QChar Quote;
+  bool WordStart = true;
+  for (qsizetype P = 0; P < Value.size(); P++)
+  {
+    QChar C = Value[P];
+    if (C == QLatin1Char('\\'))
+    {
+      P++;
+      WordStart = false;
+    }
+    else if (!Quote.isNull())
+    {
+      Quote = (C == Quote) ? QChar() : Quote;
+    }
+    else if ((C == QLatin1Char('\'')) || (C == QLatin1Char('"')))
+    {
+      Quote = C;
+      WordStart = false;
+    }
+    else if ((C == QLatin1Char('#')) && WordStart)
+    {
+      return Value.left(P).trimmed();
+    }
+    else
+    {
+      WordStart = (C == QLatin1Char(' ')) || (C == QLatin1Char('\t'));
+    }
+  }
+  return Value;
+}
+
 bool SiteImport::ParseOpensshDirective(const QString & ALine, QString & Directive, QString & Value)
 {
   QString Line = ALine.trimmed();
@@ -237,7 +273,7 @@ bool SiteImport::ParseOpensshDirective(const QString & ALine, QString & Directiv
         }
       }
     }
-    Value = Line;
+    Value = CutOpensshComment(Line);
     Result = Result && !Value.isEmpty();
   }
   return Result;
@@ -337,11 +373,7 @@ static void InsertOpensshIncludes(QStringList & Lines, int Depth)
           }
         }
       }
-      Lines.removeAt(Index);
-      for (int Index2 = 0; Index2 < Included.size(); Index2++)
-      {
-        Lines.insert(Index + Index2, Included[Index2]);
-      }
+      Lines = Lines.mid(0, Index) + Included + Lines.mid(Index + 1);
       Index += static_cast<int>(Included.size()) - 1;
     }
   }
@@ -369,42 +401,119 @@ static bool OpensshBoolValue(const QString & Value)
   return (Value.compare(QStringLiteral("yes"), Qt::CaseInsensitive) == 0);
 }
 
-static bool MatchesOpensshPattern(const QString & Pattern, const QString & Name)
+namespace
 {
-  // The WinSCP TFileMasks match does more, but host patterns only use * and ?
-  QRegularExpression Re(QRegularExpression::wildcardToRegularExpression(Pattern, QRegularExpression::NonPathWildcardConversion),
-    QRegularExpression::CaseInsensitiveOption);
-  return Re.match(Name).hasMatch();
+// A host pattern of a Host line
+struct OpensshPattern
+{
+  QString Text;
+  bool Negated = false;
+  // wildcards only: plain names, nearly all of them, need no regular expression
+  QRegularExpression Wildcard;
+
+  bool Matches(const QString & Name) const
+  {
+    // The WinSCP TFileMasks match does more, but host patterns only use * and ?
+    return Wildcard.pattern().isEmpty() ? (Text.compare(Name, Qt::CaseInsensitive) == 0) : Wildcard.match(Name).hasMatch();
+  }
+};
+
+// One line of the config. A config is read once per host and once per
+// ProxyJump: parsing it there took 45 seconds with 2000 hosts
+struct OpensshLine
+{
+  enum { Setting, Host, Match } Kind = Setting;
+  QString Directive;
+  QString Args;
+  QList<OpensshPattern> Patterns;   // Host
+};
+}
+
+static QList<OpensshLine> ParseOpensshLines(const QStringList & Lines)
+{
+  QList<OpensshLine> Result;
+  Result.reserve(Lines.size());
+  for (const QString & Text : Lines)
+  {
+    OpensshLine Line;
+    if (!SiteImport::ParseOpensshDirective(Text, Line.Directive, Line.Args))
+    {
+      continue;
+    }
+    if (Line.Directive.compare(QStringLiteral("Host"), Qt::CaseInsensitive) == 0)
+    {
+      Line.Kind = OpensshLine::Host;
+      QString Args = Line.Args;
+      while (!Args.isEmpty())
+      {
+        OpensshPattern Pattern;
+        Pattern.Text = SiteImport::CutOpensshToken(Args);
+        Pattern.Negated = !Pattern.Text.isEmpty() && (Pattern.Text[0] == QLatin1Char('!'));
+        if (Pattern.Negated)
+        {
+          Pattern.Text.remove(0, 1);
+        }
+        if (Pattern.Text.contains(QLatin1Char('*')) || Pattern.Text.contains(QLatin1Char('?')))
+        {
+          Pattern.Wildcard = QRegularExpression(QRegularExpression::wildcardToRegularExpression(Pattern.Text, QRegularExpression::NonPathWildcardConversion),
+            QRegularExpression::CaseInsensitiveOption);
+        }
+        Line.Patterns.append(Pattern);
+      }
+    }
+    else if (Line.Directive.compare(QStringLiteral("Match"), Qt::CaseInsensitive) == 0)
+    {
+      Line.Kind = OpensshLine::Match;
+    }
+    Result.append(Line);
+  }
+  return Result;
+}
+
+// ssh_config TOKENS of Hostname: %h = the name given on the command line, %% = literal %
+static QString ExpandOpensshHostName(const QString & Value, const QString & Host)
+{
+  QString Result;
+  for (qsizetype P = 0; P < Value.size(); P++)
+  {
+    if ((Value[P] == QLatin1Char('%')) && (P + 1 < Value.size()) && (Value[P + 1] == QLatin1Char('h')))
+    {
+      Result += Host;
+      P++;
+    }
+    else if ((Value[P] == QLatin1Char('%')) && (P + 1 < Value.size()) && (Value[P + 1] == QLatin1Char('%')))
+    {
+      Result += QLatin1Char('%');
+      P++;
+    }
+    else
+    {
+      Result += Value[P];
+    }
+  }
+  return Result;
 }
 
 // Nesting of ProxyJump hosts being resolved (ImportFromOpenssh recursion)
 static thread_local int ProxyJumpDepth = 0;
 
-void SiteImport::ImportFromOpenssh(SessionData & Data, const QStringList & Lines)
+static void ImportFromOpensshLines(SessionData & Data, const QList<OpensshLine> & Lines)
 {
+  using namespace SiteImport;
   bool SkippingSection = false;
   QSet<QString> UsedDirectives;
-  for (const QString & Line : Lines)
+  for (const OpensshLine & Line : Lines)
   {
-    QString Directive, Args;
-    if (!ParseOpensshDirective(Line, Directive, Args))
-    {
-      continue;
-    }
-    if (Directive.compare(QStringLiteral("Host"), Qt::CaseInsensitive) == 0)
+    const QString & Directive = Line.Directive;
+    QString Args = Line.Args;
+    if (Line.Kind == OpensshLine::Host)
     {
       SkippingSection = true;
-      while (!Args.isEmpty())
+      for (const OpensshPattern & Pattern : Line.Patterns)
       {
-        QString M = CutOpensshToken(Args);
-        bool Negated = !M.isEmpty() && (M[0] == QLatin1Char('!'));
-        if (Negated)
+        if (Pattern.Matches(Data.Name))
         {
-          M.remove(0, 1);
-        }
-        if (MatchesOpensshPattern(M, Data.Name))
-        {
-          if (Negated)
+          if (Pattern.Negated)
           {
             // Skip even if matched by other positive patterns
             SkippingSection = true;
@@ -415,7 +524,7 @@ void SiteImport::ImportFromOpenssh(SessionData & Data, const QStringList & Lines
         }
       }
     }
-    else if (Directive.compare(QStringLiteral("Match"), Qt::CaseInsensitive) == 0)
+    else if (Line.Kind == OpensshLine::Match)
     {
       SkippingSection = true;
     }
@@ -462,7 +571,7 @@ void SiteImport::ImportFromOpenssh(SessionData & Data, const QStringList & Lines
         }
         else if (Directive.compare(QStringLiteral("Hostname"), Qt::CaseInsensitive) == 0)
         {
-          Data.HostName = Value;
+          Data.HostName = ExpandOpensshHostName(Value, Data.Name);
         }
         else if (Directive.compare(QStringLiteral("IdentityFile"), Qt::CaseInsensitive) == 0)
         {
@@ -513,7 +622,7 @@ void SiteImport::ImportFromOpenssh(SessionData & Data, const QStringList & Lines
               }
               JumpData.Name = JumpData.HostName;
               ProxyJumpDepth++;
-              ImportFromOpenssh(JumpData, Lines);
+              ImportFromOpensshLines(JumpData, Lines);
               ProxyJumpDepth--;
               if (!JumpUser.isEmpty())
               {
@@ -538,6 +647,11 @@ void SiteImport::ImportFromOpenssh(SessionData & Data, const QStringList & Lines
   }
 }
 
+void SiteImport::ImportFromOpenssh(SessionData & Data, const QStringList & Lines)
+{
+  ImportFromOpensshLines(Data, ParseOpensshLines(Lines));
+}
+
 ImportSessionList SiteImport::SelectOpensshSessionsForImport(const StoredSessionList & Stored, const QString & ConfigFile)
 {
   ImportSessionList Result;
@@ -550,11 +664,12 @@ ImportSessionList SiteImport::SelectOpensshSessionsForImport(const StoredSession
   }
   // TStoredSessionList::ImportFromOpenssh
   QSet<QString> Hosts;
-  for (const QString & Line : Lines)
+  QList<OpensshLine> Parsed = ParseOpensshLines(Lines);
+  for (const OpensshLine & Line : Parsed)
   {
-    QString Directive, Value;
-    if (ParseOpensshDirective(Line, Directive, Value) && (Directive.compare(QStringLiteral("Host"), Qt::CaseInsensitive) == 0))
+    if (Line.Kind == OpensshLine::Host)
     {
+      QString Value = Line.Args;
       while (!Value.isEmpty())
       {
         QString Name = CutOpensshToken(Value);
@@ -564,7 +679,7 @@ ImportSessionList SiteImport::SelectOpensshSessionsForImport(const StoredSession
           auto Data = NewImportSession(Stored);
           Data->Name = Name;
           Data->HostName = Name;
-          ImportFromOpenssh(*Data, Lines);
+          ImportFromOpensshLines(*Data, Parsed);
           Data->Name = SessionData::MakeValidName(Name);
           Result.Add(Data);
           Hosts.insert(Name.toLower());
@@ -590,7 +705,7 @@ static QString PuttyUnmungeName(const QString & Name)
 {
   // unix/storage.c: names are %-escaped except for [A-Za-z0-9+-.@_]
   QByteArray Out;
-  QByteArray In = Name.toLatin1();
+  QByteArray In = QFile::encodeName(Name);
   for (int I = 0; I < In.size(); I++)
   {
     if ((In[I] == '%') && (I + 2 < In.size()))
@@ -603,7 +718,28 @@ static QString PuttyUnmungeName(const QString & Name)
       Out += In[I];
     }
   }
-  return QString::fromUtf8(Out);
+  // stateless: a name that ends in the middle of a character is an error, not "more to come"
+  QStringDecoder Utf8(QStringDecoder::Utf8, QStringDecoder::Flag::Stateless);
+  QString Result = Utf8.decode(Out);
+  // names saved before PuTTY used UTF-8 are in a legacy encoding
+  return Utf8.hasError() ? QString::fromLatin1(Out) : Result;
+}
+
+// What NixSCP takes from a PuTTY session: the settings PuTTY itself writes. A
+// file with others did not come from PuTTY, and they must not reach the site:
+// AgentAccess and PasswordPlain would grant access and store a password no
+// import dialog shows.
+static bool IsPuttySetting(const QString & Key)
+{
+  static const QSet<QString> Keys{QStringLiteral("HostName"), QStringLiteral("PortNumber"), QStringLiteral("Protocol"), QStringLiteral("UserName"),
+    QStringLiteral("PublicKeyFile"), QStringLiteral("DetachedCertificate"), QStringLiteral("AddressFamily"), QStringLiteral("Compression"),
+    QStringLiteral("TryAgent"), QStringLiteral("AgentFwd"), QStringLiteral("AuthKI"), QStringLiteral("AuthGSSAPI"), QStringLiteral("AuthGSSAPIKEX"),
+    QStringLiteral("GssapiFwd"), QStringLiteral("ChangeUsername"), QStringLiteral("Cipher"), QStringLiteral("KEX"), QStringLiteral("HostKey"),
+    QStringLiteral("RekeyTime"), QStringLiteral("RekeyBytes"), QStringLiteral("PingInterval"), QStringLiteral("PingIntervalSecs"),
+    QStringLiteral("LogicalHostName"), QStringLiteral("Ssh2DES"), QStringLiteral("ProxyMethod"), QStringLiteral("ProxyHost"), QStringLiteral("ProxyPort"),
+    QStringLiteral("ProxyUsername"), QStringLiteral("ProxyPassword"), QStringLiteral("ProxyTelnetCommand"), QStringLiteral("ProxyDNS"),
+    QStringLiteral("ProxyLocalhost")};
+  return Keys.contains(Key) || Key.startsWith(QStringLiteral("Bug"));
 }
 
 ImportSessionList SiteImport::SelectPuttySessionsForImport(const StoredSessionList & Stored, const QString & SessionsFolder)
@@ -623,7 +759,7 @@ ImportSessionList SiteImport::SelectPuttySessionsForImport(const StoredSessionLi
     for (const QString & Line : ReadLines(Dir.filePath(FileName)))
     {
       qsizetype P = Line.indexOf(QLatin1Char('='));
-      if (P > 0)
+      if ((P > 0) && IsPuttySetting(Line.left(P)))
       {
         QString Key = Line.left(P);
         QString Value = Line.mid(P + 1);
@@ -646,6 +782,10 @@ ImportSessionList SiteImport::SelectPuttySessionsForImport(const StoredSessionLi
       Storage.DeleteValue(QStringLiteral("ProxyMethod"));
     }
     Data->Load(Storage);
+    if ((Data->PortNumber <= 0) || (Data->PortNumber > 65535))
+    {
+      Data->PortNumber = Data->DefaultPort();
+    }
     // PuTTY defaults to TcpNoDelay, but psftp/pscp ignore it
     Data->TcpNoDelay = DefaultTcpNoDelay;
     if ((PuttyProxyMethod == 6) && !Data->Tunnel)
@@ -818,12 +958,17 @@ static int ReadSettingsNode(const XmlNode * Node, const QString & Name, int Defa
   return Ok ? Result : Default;
 }
 
-// TSessionData::ImportFromFilezilla
-static void ImportSessionFromFilezilla(SessionData & Data, const XmlNode * Node, const QString & Path, const XmlNode * SettingsNode)
+// TSessionData::ImportFromFilezilla; false when the site cannot be imported:
+// nothing to connect to, or a protocol of FileZilla NixSCP does not have
+static bool ImportSessionFromFilezilla(SessionData & Data, const XmlNode * Node, const QString & Path, const XmlNode * SettingsNode)
 {
-  Data.Name = SessionData::ComposePath(Path, SessionData::MakeValidName(ReadXmlNode(Node, QStringLiteral("Name"), Data.Name)));
   Data.HostName = ReadXmlNode(Node, QStringLiteral("Host"), Data.HostName);
-  Data.PortNumber = ReadXmlNode(Node, QStringLiteral("Port"), Data.PortNumber);
+  if (Data.HostName.isEmpty())
+  {
+    return false;
+  }
+  // a site without a name would be stored over the default settings
+  Data.Name = SessionData::ComposePath(Path, SessionData::MakeValidName(ReadXmlNode(Node, QStringLiteral("Name"), Data.HostName)));
 
   // ServerProtocol enum
   switch (ReadXmlNode(Node, QStringLiteral("Protocol"), 0))
@@ -840,10 +985,28 @@ static void ImportSessionFromFilezilla(SessionData & Data, const XmlNode * Node,
       Data.Ftps = ftpsExplicitTls;
       break;
     case 0: // FTP
-    default: // UNKNOWN, HTTP, HTTPS, INSECURE_FTP
+    case 6: // INSECURE_FTP
       Data.FSProtocol = fsFTP;
       break;
+    case 7: // S3
+      Data.FSProtocol = fsS3;
+      Data.Ftps = ftpsImplicit;
+      break;
+    case 9: // WEBDAV
+      Data.FSProtocol = fsWebDAV;
+      Data.Ftps = ftpsImplicit;
+      break;
+    case 19: // INSECURE_WEBDAV
+      Data.FSProtocol = fsWebDAV;
+      Data.Ftps = ftpsNone;
+      break;
+    default:
+      // HTTP, Azure, Dropbox... Not as FTP: the stored credentials of a cloud
+      // service would go in the clear to whatever answers there
+      return false;
   }
+  int Port = ReadXmlNode(Node, QStringLiteral("Port"), 0);
+  Data.PortNumber = ((Port > 0) && (Port <= 65535)) ? Port : Data.DefaultPort();
 
   // LogonType enum
   if (ReadXmlNode(Node, QStringLiteral("Logontype"), 0) == 0) // ANONYMOUS
@@ -858,18 +1021,25 @@ static void ImportSessionFromFilezilla(SessionData & Data, const XmlNode * Node,
     if (const XmlNode * PassNode = Node->Find(QStringLiteral("Pass")))
     {
       QString APassword = PassNode->Text.trimmed();
-      if (PassNode->Attributes.value(QStringLiteral("encoding")).compare(QStringLiteral("base64"), Qt::CaseInsensitive) == 0)
+      QString Encoding = PassNode->Attributes.value(QStringLiteral("encoding"));
+      if (Encoding.compare(QStringLiteral("base64"), Qt::CaseInsensitive) == 0)
       {
-        APassword = QString::fromUtf8(QByteArray::fromBase64(APassword.toLatin1()));
+        Data.Password = QString::fromUtf8(QByteArray::fromBase64(APassword.toLatin1()));
       }
-      Data.Password = APassword;
+      else if (Encoding.isEmpty() || (Encoding.compare(QStringLiteral("plain"), Qt::CaseInsensitive) == 0))
+      {
+        Data.Password = APassword;
+      }
+      // anything else ("crypt": FileZilla's master password) is ciphertext, not
+      // the password: the site is imported without one
     }
   }
 
   Data.PublicKeyFile = ReadXmlNode(Node, QStringLiteral("Keyfile"), Data.PublicKeyFile);
 
-  int DefaultTimeDifference = static_cast<int>(Data.TimeDifference * 86400.0);
-  Data.TimeDifference = ReadXmlNode(Node, QStringLiteral("TimezoneOffset"), DefaultTimeDifference) / 86400.0;
+  // in minutes (WinSCP takes them for seconds)
+  int DefaultTimeDifference = static_cast<int>(Data.TimeDifference * 1440.0);
+  Data.TimeDifference = ReadXmlNode(Node, QStringLiteral("TimezoneOffset"), DefaultTimeDifference) / 1440.0;
   Data.TimeDifferenceAuto = (Data.TimeDifference == 0);
 
   QString PasvMode = ReadXmlNode(Node, QStringLiteral("PasvMode"), QString());
@@ -914,7 +1084,8 @@ static void ImportSessionFromFilezilla(SessionData & Data, const XmlNode * Node,
     int PrefixSize = CutToSpace(RemoteDir).toInt(); // prefix size
     if (PrefixSize > 0)
     {
-      RemoteDir.remove(0, PrefixSize);
+      // with the space that follows it
+      RemoteDir.remove(0, PrefixSize + 1);
     }
     QString Directory = QStringLiteral("/");
     while (!RemoteDir.isEmpty())
@@ -924,9 +1095,19 @@ static void ImportSessionFromFilezilla(SessionData & Data, const XmlNode * Node,
       {
         break;
       }
-      QString Segment = RemoteDir.left(SegmentSize);
+      // sizes count UTF-16 units on Windows, code points elsewhere
+      qsizetype Units = SegmentSize;
+      if ((Units < RemoteDir.size()) && (RemoteDir[Units] != QLatin1Char(' ')))
+      {
+        Units = 0;
+        for (int Point = 0; (Point < SegmentSize) && (Units < RemoteDir.size()); Point++)
+        {
+          Units += RemoteDir[Units].isHighSurrogate() ? 2 : 1;
+        }
+      }
+      QString Segment = RemoteDir.left(Units);
       Directory = Directory.endsWith(QLatin1Char('/')) ? (Directory + Segment) : (Directory + QLatin1Char('/') + Segment);
-      RemoteDir.remove(0, SegmentSize + 1);
+      RemoteDir.remove(0, Units + 1);
     }
     Data.RemoteDirectory = Directory;
   }
@@ -985,6 +1166,7 @@ static void ImportSessionFromFilezilla(SessionData & Data, const XmlNode * Node,
       }
     }
   }
+  return true;
 }
 
 // TStoredSessionList::ImportLevelFromFilezilla
@@ -996,8 +1178,10 @@ static void ImportLevelFromFilezilla(ImportSessionList & List, const StoredSessi
     if (Child->Name == QStringLiteral("Server"))
     {
       auto Data = NewImportSession(Stored);
-      ImportSessionFromFilezilla(*Data, Child.get(), Path, SettingsNode);
-      List.Add(Data);
+      if (ImportSessionFromFilezilla(*Data, Child.get(), Path, SettingsNode))
+      {
+        List.Add(Data);
+      }
     }
     else if (Child->Name == QStringLiteral("Folder"))
     {
@@ -1397,7 +1581,7 @@ int SiteImport::AppendKnownHosts(const QString & TargetKnownHostsFile, const QSt
   if (!Info.dir().exists())
   {
     QDir().mkpath(Info.absolutePath());
-    QFile::setPermissions(Info.absolutePath(), QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    Platform::MakeDirectoryPrivate(Info.absolutePath());
   }
   bool New = !Info.exists();
   QFile F(TargetKnownHostsFile);
@@ -1411,7 +1595,7 @@ int SiteImport::AppendKnownHosts(const QString & TargetKnownHostsFile, const QSt
   }
   if (New)
   {
-    F.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    Platform::MakePrivate(F);
   }
   QByteArray Out;
   if (!Contents.isEmpty() && !Contents.endsWith('\n'))
@@ -1486,7 +1670,13 @@ ImportSessionList SiteImport::SelectKnownHostsSessionsForImport(const StoredSess
       qsizetype P = HostNameStr.indexOf(QStringLiteral("]:"));
       if (P > 0)
       {
-        PortNumber = HostNameStr.mid(P + 2).toInt();
+        bool Ok = false;
+        PortNumber = HostNameStr.mid(P + 2).toInt(&Ok);
+        if (!Ok || (PortNumber <= 0) || (PortNumber > 65535))
+        {
+          // "[host]:abc": not a key anything can connect with
+          continue;
+        }
         HostNameStr = HostNameStr.mid(1, P - 1);
       }
       else

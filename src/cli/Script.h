@@ -5,11 +5,11 @@
 
 #include "cli/Options.h"
 #include "cli/SessionUrl.h"
+#include "core/ActionsLog.h"
 #include "core/CopyParam.h"
 #include "core/SessionData.h"
 #include "core/Terminal.h"
 
-#include <QFile>
 #include <QMutex>
 #include <QString>
 #include <QStringList>
@@ -45,6 +45,9 @@ public:
   void SetCopyParam(const CopyParam & Value);
   void SetWantsProgress(bool Value) { FWantsProgress = Value; }
   void SetUsageWarnings(bool Value) { FUsageWarnings = Value; }
+  // TScript::SetSynchronizeParams: the configured options (Interface\SynchronizeParams),
+  // as far as the script takes them
+  void SetSynchronizeParams(int Value);
   // TScript::Init: Configuration->SessionReopenTimeout (ms, 0 = default)
   void SetConfigurationReopenTimeout(int Value);
   // /log=<file> with WinSCP's ! patterns, /logsize=[<count>*]<size>
@@ -53,8 +56,9 @@ public:
   // exit code), 2 debug 2 (+ all script output); -1 reduced (no script output); * logs passwords
   void SetLogLevel(int Level, bool LogPasswords);
   int LogLevel() const { return FLogLevel; }
-  // /xmllog=<file> [/xmlgroups] (TActionLog); false when the file cannot be created
-  bool OpenXmlLog(const QString & FileName, bool Groups, QString & Error);
+  // /xmllog=<file> [/xmlgroups] [/xmllogrequired] (TActionLog): the sessions
+  // record into it too; false when the file cannot be created
+  bool OpenXmlLog(const QString & FileName, bool Groups, bool Required, QString & Error);
   // Closes the XML log (</session>); called at exit
   void CloseXmlLog();
   // /stdout and /stdin: "get ... -" and "put - ..." stream file contents
@@ -147,6 +151,7 @@ private:
   bool FFailOnNoMatch = false;
   bool FIncludeFileMaskOptionUsed = false;
   bool FWarnNonDefaultCopyParam = false;
+  bool FWarnNonDefaultSynchronizeParams = false;
   std::atomic<BatchMode> FBatch{BatchAbort};
   BatchMode FInteractiveBatch = BatchOff;
   bool FConfirm = false;
@@ -157,7 +162,7 @@ private:
   std::atomic<bool> FAborted{false};
   std::atomic<bool> FCommandError{false};
   bool FInterrupted = false;
-  int FSynchronizeParams = 0;
+  int FSynchronizeParams;
   StdInOutMode FStdOut = StdInOutOff;
   bool FStdIn = false;
 
@@ -166,30 +171,15 @@ private:
   int FLogLevel = 0;
   bool FLogPasswords = false;
 
-  // XML log (TActionLog)
-  QFile FXmlFile;
+  // XML log (TActionLog): shared with the sessions, whose Terminal records
+  // the transfers and operations per file; the actions of the script
+  // commands themselves are recorded on the main thread
+  std::shared_ptr<ActionsLog> FXmlLog;
   bool FXmlGroups = false;
-  bool FXmlStarted = false;
-  bool FXmlInGroup = false;
-  QString FXmlIndent;
-  struct XmlParam
-  {
-    QString Name;
-    QString Value;
-  };
-  void XmlAdd(const QString & Line);
-  void XmlStart();
-  // TSessionActionRecord::Record
-  void XmlRecord(const QString & Action, const std::vector<XmlParam> & Params, bool Success,
-    const QStringList & Errors = QStringList(), bool Recursive = false,
-    const RemoteFileList * Files = nullptr, const RemoteFile * File = nullptr);
-  void XmlRecordFile(const QString & Indent, const RemoteFile & File, bool IncludeFileName);
-  // TActionLog::AddFailure
-  void XmlFailure(const ExtException & E);
-  void XmlBeginGroup(const QString & Name);
-  void XmlEndGroup();
-  bool XmlLogging() const { return FXmlFile.isOpen(); }
-  static QStringList ExceptionMessages(const ExtException & E);
+  bool FXmlRequired = false;
+  bool XmlLogging() const { return FXmlLog && FXmlLog->Logging(); }
+  // /xmllogrequired: writing the log has failed
+  void CheckXmlLog();
 
   // Transfer progress (TManagementScript::TerminalOperationProgress)
   QString FLastProgressFile;
@@ -217,12 +207,13 @@ private:
   void NoMatch(const QString & Message);
   void NoMatch(const QString & Mask, const QString & Error);
   void CheckDefaultCopyParam();
+  void CheckDefaultSynchronizeParams();
   void CheckMultiFilesToOne(int Count, const QString & Target, bool Unix);
   QString AbsolutePath(const QString & Path) const;
   std::vector<RemoteItem> CreateFileList(ScriptProcParams & Params, int Start, int End, int ListType);
   std::vector<LocalItem> CreateLocalFileList(ScriptProcParams & Params, int Start, int End, int ListType);
   void CopyParamParams(CopyParam & Param, ScriptProcParams & Params);
-  void TransferParamParams(ScriptProcParams & Params, bool & Move, bool & Resume);
+  void TransferParamParams(ScriptProcParams & Params, CopyParam & Param, bool & Move, bool & Resume);
   CopyParam::TransferMode ParseTransferModeName(const QString & Name);
   bool RemoteIsDirectory(const QString & Path);
   void Download(const std::vector<RemoteItem> & Files, const QString & TargetDir, const QString & FileMask,
@@ -254,6 +245,7 @@ private:
   void EchoProc(ScriptProcParams & Params);
   void StatProc(ScriptProcParams & Params);
   void ChecksumProc(ScriptProcParams & Params);
+  void CopyIdProc(ScriptProcParams & Params);
   void PwdProc(ScriptProcParams & Params);
   void CdProc(ScriptProcParams & Params);
   void LsProc(ScriptProcParams & Params);

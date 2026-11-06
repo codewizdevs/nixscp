@@ -124,7 +124,12 @@ struct TerminalCommand
 {
   QString Program;
   QStringList Arguments;
-  QString AskPassFile;        // one-time password file read by nixscp as SSH_ASKPASS
+  // nixscp run by ssh as SSH_ASKPASS gets the password from here, once
+  // (FetchAskPassPassword); it never reaches the disk or a command line
+  QString AskPassSocket;
+  // NAME=value for the program: what no other program may read on its command
+  // line (Windows: all of it, it has no env(1) to put them on the command line)
+  QStringList Environment;
 };
 // Builds the command line of OpenSessionInPutty for Data. Password: session
 // password (or passphrase) when not stored in Data; it is passed (as
@@ -137,17 +142,44 @@ bool BuildTerminalCommand(const SessionData & Data, const QString & Password, co
   bool ChangeDirectory, TerminalCommand & Command, QString & Error,
   const std::function<bool(const QStringList & Prompts, const QStringList & Defaults, QStringList & Values)> & Prompts = nullptr,
   const QString & CommandTemplate = QString());
+// What the password of a terminal client goes through: the running NixSCP offers
+// it on a private local socket, to one reader and for two minutes at most.
+// OfferAskPassPassword returns the name of the socket, empty when it cannot be
+// created (ssh then asks in the terminal). The password stays in memory only, so a
+// crash leaves nothing behind but an empty socket file.
+// Any program of the user can see the socket, in its folder and in the process
+// list, so the reader also has to give Token, which travels in the environment of
+// the terminal client only (TerminalCommand::Environment). A program that reads
+// environments of other processes (/proc) or debugs them is not kept out; nothing
+// short of another user account does that. A terminal that does not pass on its
+// environment (one process for all windows) leaves the helper without the token:
+// it then asks in the terminal, as ssh would (src/main.cpp).
+QString OfferAskPassPassword(const QString & Password, QString & Token);
+void WithdrawAskPassPassword(const QString & SocketName);
+// The other end, blocking; empty when no password is offered there any more, or
+// not to this token
+QByteArray FetchAskPassPassword(const QString & SocketName, const QString & Token);
+// What a crash left behind (sockets, password files of older versions): older
+// than an offer can be, so never one of a running NixSCP
+void RemoveStaleAskPassFiles();
 // OpenSessionInPutty: builds and starts the command (asking for prompt
 // patterns with the custom command prompts dialog). Errors are shown.
 bool OpenSessionInTerminal(QWidget * Parent, const SessionData & Data, const QString & Password = QString(),
   const QString & RemoteDirectory = QString(), bool ChangeDirectory = false);
+// CreateDesktopSessionShortCut exists: .desktop launchers are freedesktop.org's
+bool CanCreateSessionShortcut();
 // Terminal emulator fallback when the configured program (x-terminal-emulator)
 // does not exist (non-Debian distributions): $TERMINAL, xdg-terminal-exec,
 // the terminal of the current desktop (XDG_CURRENT_DESKTOP: ptyxis/kgx/
 // gnome-terminal on GNOME, konsole on KDE, xfce4-terminal on Xfce...), then
 // any known one; a leading "-e" of Arguments is replaced in place by the
-// emulator's "execute" switch ("--", "-x", none...)
-QString ResolveTerminalProgram(const QString & Program, QStringList & Arguments);
+// emulator's "execute" switch ("--", "-x", none...). Environment: NAME=value that
+// has to reach the command (macOS: the script of TerminalScript takes it along)
+QString ResolveTerminalProgram(const QString & Program, QStringList & Arguments, const QStringList & Environment = QStringList());
+// The script Terminal.app runs on macOS: removes itself, sets Environment and
+// starts the command. It is in a private file only until the window opens, about
+// a second, and holds the token of the password offer until then
+QByteArray TerminalScript(const QStringList & Arguments, const QStringList & Environment);
 
 // ---- Desktop icon (Login dialog: Tools > Desktop Icon) ----
 enum ShortCutKind { sscSite, sscFolder, sscWorkspace };

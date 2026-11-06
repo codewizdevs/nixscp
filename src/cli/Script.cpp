@@ -6,6 +6,8 @@
 #include "core/FtpFileSystem.h"
 #include "core/IniStorage.h"
 #include "core/S3FileSystem.h"
+#include "core/ScpFileSystem.h"
+#include "core/SftpFileSystem.h"
 #include "core/SiteImport.h"
 #include "core/SecureShell.h"
 #include "core/Configuration.h"
@@ -25,6 +27,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#ifdef Q_OS_WIN
+#include <io.h>
+#endif
 #include <algorithm>
 #include <cstdio>
 
@@ -84,6 +89,32 @@ QString LocalExtractFileName(const QString & Path)
   return UnixExtractFileName(Path);
 }
 
+// FindFirstFile semantics of local paths, as WinSCP: '*' and '?' are the only
+// wildcards, "a[1].txt" is a file name (and '[' a character in a mask)
+bool IsLocalMask(const QString & Mask)
+{
+  return Mask.contains(QLatin1Char('*')) || Mask.contains(QLatin1Char('?'));
+}
+
+QString LocalMask(QString Mask)
+{
+  return Mask.replace(QLatin1Char('['), QStringLiteral("[[]"));
+}
+
+// ExtractCommonPath / UnixExtractCommonPath: the directory of all the files
+QString CommonPath(const QStringList & Files)
+{
+  QString Result = Files.isEmpty() ? QString() : UnixExtractFilePath(Files.first());
+  for (const QString & File : Files)
+  {
+    while (!Result.isEmpty() && !File.startsWith(Result))
+    {
+      Result = UnixExtractFilePath(UnixExcludeTrailingBackslash(Result));
+    }
+  }
+  return Result;
+}
+
 QString LocalAbsolutePath(const QString & Path)
 {
   QString Result = Path;
@@ -133,46 +164,6 @@ QString RemoveEmptyLines(const QString & Str)
   return Result.join(QLatin1Char('\n'));
 }
 
-// XmlEscape / XmlAttributeEscape (core/SessionInfo.cpp DoXmlEscape)
-QString XmlEscape(const QString & Str, bool Attribute)
-{
-  QString Result;
-  Result.reserve(Str.size());
-  for (QChar C : Str)
-  {
-    switch (C.unicode())
-    {
-      case '&': Result += QStringLiteral("&amp;"); break;
-      case '<': Result += QStringLiteral("&lt;"); break;
-      case '>': Result += QStringLiteral("&gt;"); break;
-      case '"':
-        Result += Attribute ? QStringLiteral("&quot;") : QStringLiteral("\"");
-        break;
-      case '\r':
-      case '\n':
-        if (Attribute)
-        {
-          Result += QStringLiteral("&#%1;").arg(static_cast<int>(C.unicode()));
-        }
-        else
-        {
-          Result += C;
-        }
-        break;
-      default:
-        Result += C;
-        break;
-    }
-  }
-  return Result;
-}
-
-// StandardTimestamp (core/Common.cpp)
-QString StandardTimestamp(const QDateTime & DateTime = QDateTime::currentDateTime())
-{
-  return DateTime.toUTC().toString(QStringLiteral("yyyy-MM-dd'T'HH:mm:ss.zzz'Z'"));
-}
-
 // The shell checksum commands of TTerminal::GetShellChecksumAlgDefs
 // (Configuration ChecksumCommands default)
 QString ShellChecksumCommand(const QString & Alg)
@@ -204,8 +195,13 @@ ScriptProcParams::ScriptProcParams(const QString & AFullCommand, const QString &
   Parse(AParamsStr);
 }
 
+// TScript::SetSynchronizeParams
+static const int AcceptedSynchronizeParams = spExistingOnly | spTimestamp | spNotByTime | spBySize | spByChecksum | spCaseSensitive;
+
 Script::Script(StoredSessionList * StoredSessions) :
-  FStoredSessions(StoredSessions)
+  FStoredSessions(StoredSessions),
+  // Not 0: comparing case sensitively is the right thing on a file system that is
+  FSynchronizeParams(spDefault & AcceptedSynchronizeParams)
 {
   FSessionReopenTimeout = BatchSessionReopenTimeout;
   FInteractiveSessionReopenTimeout = 0;
@@ -242,6 +238,7 @@ Script::Script(StoredSessionList * StoredSessions) :
   Register(QStringLiteral("echo"), QStringLiteral("Displays its arguments as message"), SCRIPT_ECHO_HELP, &Script::EchoProc, -1, -1, true);
   Register(QStringLiteral("stat"), QStringLiteral("Retrieves attributes of remote file"), SCRIPT_STAT_HELP, &Script::StatProc, 1, 1, false);
   Register(QStringLiteral("checksum"), QStringLiteral("Calculates checksum of remote file"), SCRIPT_CHECKSUM_HELP, &Script::ChecksumProc, 2, 2, false);
+  Register(QStringLiteral("copyid"), QString(), "", &Script::CopyIdProc, 1, 1, false);
   // TManagementScript
   Register(QStringLiteral("exit"), QStringLiteral("Closes all sessions and terminates the program"), SCRIPT_EXIT_HELP, &Script::ExitProc, 0, 0, false);
   Register(QStringLiteral("bye"), QString(), SCRIPT_EXIT_HELP, &Script::ExitProc, 0, 0, false);
@@ -269,6 +266,22 @@ void Script::Register(const QString & Name, const QString & Description, const c
   int MinParams, int MaxParams, bool Switches)
 {
   FCommands.push_back(CommandDef{Name, Description, Help, Proc, MinParams, MaxParams, Switches});
+}
+
+void Script::SetSynchronizeParams(int Value)
+{
+  FSynchronizeParams = (Value & AcceptedSynchronizeParams);
+  FWarnNonDefaultSynchronizeParams = (FSynchronizeParams != (spDefault & AcceptedSynchronizeParams));
+}
+
+void Script::CheckDefaultSynchronizeParams()
+{
+  if (FWarnNonDefaultSynchronizeParams)
+  {
+    // SCRIPT_NON_DEFAULT_SYNC_PARAM
+    PrintLine(QStringLiteral("Using configured synchronization options different from factory defaults."));
+    FWarnNonDefaultSynchronizeParams = false;
+  }
 }
 
 void Script::SetCopyParam(const CopyParam & Value)
@@ -453,191 +466,42 @@ void Script::Log(QChar Type, const QString & Str)
 
 // --- XML log (TActionLog) ---
 
-bool Script::OpenXmlLog(const QString & FileName, bool Groups, QString & Error)
+bool Script::OpenXmlLog(const QString & FileName, bool Groups, bool Required, QString & Error)
 {
-  FXmlFile.setFileName(ExpandLogFileName(FileName, nullptr));
-  if (!FXmlFile.open(QIODevice::WriteOnly | QIODevice::Truncate))
+  auto Log = std::make_shared<ActionsLog>(FileName, nullptr);
+  if (!Log->Open(&Error, true))
   {
-    Error = FXmlFile.errorString();
     return false;
   }
+  FXmlLog = Log;
   FXmlGroups = Groups;
-  FXmlStarted = false;
-  FXmlIndent = QStringLiteral("  ");
+  FXmlRequired = Required;
+  ActionsLog::SetProcessLog(Log);
+  // the actions of the script commands, on this thread
+  ActionsLog::SetCurrent(Log);
   return true;
-}
-
-void Script::XmlAdd(const QString & Line)
-{
-  if (FXmlFile.isOpen())
-  {
-    FXmlFile.write((Line + QLatin1Char('\n')).toUtf8());
-    FXmlFile.flush();
-  }
-}
-
-void Script::XmlStart()
-{
-  if (FXmlFile.isOpen() && !FXmlStarted)
-  {
-    FXmlStarted = true;
-    XmlAdd(QStringLiteral("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
-    QString SessionName = (FSession != nullptr) ? XmlEscape(FSession->Data.SessionName(), true) : QStringLiteral("nosession");
-    XmlAdd(QStringLiteral("<session xmlns=\"http://winscp.net/schema/session/1.0\" name=\"%1\" start=\"%2\">")
-      .arg(SessionName, StandardTimestamp()));
-  }
 }
 
 void Script::CloseXmlLog()
 {
-  if (FXmlFile.isOpen())
+  if (FXmlLog)
   {
-    XmlStart();
-    if (FXmlInGroup)
-    {
-      XmlEndGroup();
-    }
-    XmlAdd(QStringLiteral("</session>"));
-    FXmlFile.close();
+    ActionsLog::SetProcessLog(nullptr);
+    ActionsLog::SetCurrent(nullptr);
+    FXmlLog->Close();
+    FXmlLog.reset();
   }
 }
 
-QStringList Script::ExceptionMessages(const ExtException & E)
+void Script::CheckXmlLog()
 {
-  // ExceptionToMoreMessages
-  QStringList Result;
-  if (!E.Message().isEmpty())
+  if (FXmlRequired && FXmlLog && FXmlLog->Failed())
   {
-    Result.append(E.Message());
+    // LOG_FATAL_ERROR; once, the script stops here
+    FXmlRequired = false;
+    NotifyAbort();
+    throw ExtException(QStringLiteral("Error occurred during logging. Cannot continue."), FXmlLog->LastError());
   }
-  if (!E.MoreMessages().isEmpty())
-  {
-    Result.append(E.MoreMessages().split(QLatin1Char('\n'), Qt::SkipEmptyParts));
-  }
-  return Result;
-}
-
-void Script::XmlRecordFile(const QString & Indent, const RemoteFile & File, bool IncludeFileName)
-{
-  XmlAdd(FXmlIndent + Indent + QStringLiteral("<file>"));
-  if (IncludeFileName)
-  {
-    XmlAdd(FXmlIndent + Indent + QStringLiteral("  <filename value=\"%1\" />").arg(XmlEscape(File.FileName, true)));
-  }
-  XmlAdd(FXmlIndent + Indent + QStringLiteral("  <type value=\"%1\" />").arg(XmlEscape(File.TypeChar().toUpper(), true)));
-  if (!File.IsDirectory)
-  {
-    XmlAdd(FXmlIndent + Indent + QStringLiteral("  <size value=\"%1\" />").arg(File.Size));
-  }
-  if (File.Modification.isValid())
-  {
-    XmlAdd(FXmlIndent + Indent + QStringLiteral("  <modification value=\"%1\" />").arg(StandardTimestamp(File.Modification)));
-  }
-  QString Rights = File.RightsText();
-  if (!Rights.isEmpty())
-  {
-    XmlAdd(FXmlIndent + Indent + QStringLiteral("  <permissions value=\"%1\" />").arg(XmlEscape(Rights, true)));
-  }
-  if (!File.Owner.isEmpty())
-  {
-    XmlAdd(FXmlIndent + Indent + QStringLiteral("  <owner value=\"%1\" />").arg(XmlEscape(File.Owner, true)));
-  }
-  if (!File.Group.isEmpty())
-  {
-    XmlAdd(FXmlIndent + Indent + QStringLiteral("  <group value=\"%1\" />").arg(XmlEscape(File.Group, true)));
-  }
-  XmlAdd(FXmlIndent + Indent + QStringLiteral("</file>"));
-}
-
-void Script::XmlRecord(const QString & Action, const std::vector<XmlParam> & Params, bool Success,
-  const QStringList & Errors, bool Recursive, const RemoteFileList * Files, const RemoteFile * File)
-{
-  if (!XmlLogging())
-  {
-    return;
-  }
-  XmlStart();
-  XmlAdd(FXmlIndent + QStringLiteral("<%1%2>").arg(Action, Recursive ? QStringLiteral(" recursive=\"true\"") : QString()));
-  for (const XmlParam & Param : Params)
-  {
-    if (Param.Value.isEmpty())
-    {
-      XmlAdd(FXmlIndent + QStringLiteral("  <%1 />").arg(Param.Name));
-    }
-    else
-    {
-      XmlAdd(FXmlIndent + QStringLiteral("  <%1 value=\"%2\" />").arg(Param.Name, XmlEscape(Param.Value, true)));
-    }
-  }
-  if (Files != nullptr)
-  {
-    XmlAdd(FXmlIndent + QStringLiteral("  <files>"));
-    for (const RemoteFile & F : *Files)
-    {
-      XmlRecordFile(QStringLiteral("    "), F, true);
-    }
-    XmlAdd(FXmlIndent + QStringLiteral("  </files>"));
-  }
-  if (File != nullptr)
-  {
-    XmlRecordFile(QStringLiteral("  "), *File, false);
-  }
-  if (!Success)
-  {
-    if (!Errors.isEmpty())
-    {
-      XmlAdd(FXmlIndent + QStringLiteral("  <result success=\"false\">"));
-      for (const QString & Message : Errors)
-      {
-        XmlAdd(FXmlIndent + QStringLiteral("    <message>%1</message>").arg(XmlEscape(Message, false)));
-      }
-      XmlAdd(FXmlIndent + QStringLiteral("  </result>"));
-    }
-    else
-    {
-      XmlAdd(FXmlIndent + QStringLiteral("  <result success=\"false\" />"));
-    }
-  }
-  else
-  {
-    XmlAdd(FXmlIndent + QStringLiteral("  <result success=\"true\" />"));
-  }
-  XmlAdd(FXmlIndent + QStringLiteral("</%1>").arg(Action));
-}
-
-void Script::XmlFailure(const ExtException & E)
-{
-  if (!XmlLogging())
-  {
-    return;
-  }
-  QStringList Messages = ExceptionMessages(E);
-  if (Messages.isEmpty())
-  {
-    return;
-  }
-  XmlStart();
-  XmlAdd(FXmlIndent + QStringLiteral("<failure>"));
-  for (const QString & Message : Messages)
-  {
-    XmlAdd(FXmlIndent + QStringLiteral("  <message>%1</message>").arg(XmlEscape(Message, false)));
-  }
-  XmlAdd(FXmlIndent + QStringLiteral("</failure>"));
-}
-
-void Script::XmlBeginGroup(const QString & Name)
-{
-  XmlStart();
-  FXmlInGroup = true;
-  XmlAdd(FXmlIndent + QStringLiteral("<group name=\"%1\" start=\"%2\">").arg(XmlEscape(Name, true), StandardTimestamp()));
-  FXmlIndent = QStringLiteral("    ");
-}
-
-void Script::XmlEndGroup()
-{
-  FXmlInGroup = false;
-  FXmlIndent = QStringLiteral("  ");
-  XmlAdd(FXmlIndent + QStringLiteral("</group>"));
 }
 
 unsigned int Script::InputTimeout() const
@@ -679,7 +543,10 @@ void Script::ShowException(const ExtException & E)
     Message += QLatin1Char('\n') + E.MoreMessages();
   }
   Log(QLatin1Char('*'), QStringLiteral("(%1) %2").arg(QStringLiteral("ExtException"), Message));
-  XmlFailure(E);
+  if (XmlLogging())
+  {
+    FXmlLog->AddFailure(E);
+  }
   if (!Message.trimmed().isEmpty())
   {
     FCommandError = true;
@@ -910,16 +777,20 @@ void Script::Command(const QString & ACmd)
         // TScript::Command: only commands run with a session open are grouped
         if (FXmlGroups && XmlLogging() && (FSession != nullptr))
         {
-          XmlBeginGroup(FLogPasswords ? LogCmd : MaskPasswordInCommand(FullCmd.trimmed(), CommandName));
+          FXmlLog->BeginGroup(FLogPasswords ? LogCmd : MaskPasswordInCommand(FullCmd.trimmed(), CommandName));
           Group = true;
         }
-        Handle([&]() { Execute(CommandName, Cmd); });
+        Handle([&]()
+        {
+          Execute(CommandName, Cmd);
+          CheckXmlLog();
+        });
       }
     }
   });
-  if (Group)
+  if (Group && FXmlLog)
   {
-    XmlEndGroup();
+    FXmlLog->EndGroup();
   }
   FInterrupted = false;
   Console::Instance().ClearPendingAbort();
@@ -1317,12 +1188,12 @@ std::vector<Script::LocalItem> Script::CreateLocalFileList(ScriptProcParams & Pa
     }
     QString AbsFileName = LocalAbsolutePath(FileName);
     QString MaskStr = LocalExtractFileName(FileName);
-    if (FileMasks::IsMask(MaskStr))
+    if (IsLocalMask(MaskStr))
     {
       QString Directory = LocalAbsolutePath(LocalExtractFilePath(FileName).isEmpty() ? QStringLiteral(".") : LocalExtractFilePath(FileName));
       QDir Dir(Directory);
       FileMasks Mask;
-      Mask.SetMask(MaskStr);
+      Mask.SetMask(LocalMask(MaskStr));
       bool AnyFound = false;
       QString Error;
       if (!Dir.exists())
@@ -1384,14 +1255,12 @@ CopyParam::TransferMode Script::ParseTransferModeName(const QString & Name)
   return static_cast<CopyParam::TransferMode>(Value);
 }
 
-void Script::TransferParamParams(ScriptProcParams & Params, bool & Move, bool & Resume)
+void Script::TransferParamParams(ScriptProcParams & Params, CopyParam & Param, bool & Move, bool & Resume)
 {
   Move = Params.FindSwitch(QStringLiteral("delete"));
   Resume = Params.FindSwitch(QStringLiteral("resume"));
-  if (!Resume && Params.FindSwitch(QStringLiteral("append")))
-  {
-    NotSupported();
-  }
+  // cpAppend
+  Param.Append = !Resume && Params.FindSwitch(QStringLiteral("append"));
 }
 
 void Script::CopyParamParams(CopyParam & Param, ScriptProcParams & Params)
@@ -1597,17 +1466,7 @@ void Script::Download(const std::vector<RemoteItem> & Files, const QString & Tar
       QString FirstTarget = QDir(TargetDir).filePath(CopyParam::ValidLocalFileName(MaskFileName(Param.ChangeFileName(UnixPath::ExtractFileName(Plain.first())), FileMask)));
       throw ExtException(QStringLiteral("Can't create file '%1'.").arg(FirstTarget), QStringLiteral("No such file or directory"));
     }
-    OperationResult Result = Wait(S, [&](Terminal::Callback Done) { S.Term->CopyToLocal(Plain, TargetDir, Param, Move, Done); }, true);
-    if (XmlLogging())
-    {
-      for (const QString & Path : Plain)
-      {
-        XmlRecord(QStringLiteral("download"), {{QStringLiteral("filename"), Path},
-          {QStringLiteral("destination"), QDir(TargetDir).filePath(CopyParam::ValidLocalFileName(Param.ChangeFileName(UnixExtractFileName(Path), true)))}},
-          Result.Ok, Result.Ok ? QStringList() : QStringList{Result.Message});
-      }
-    }
-    Check(Result);
+    Check(Wait(S, [&](Terminal::Callback Done) { S.Term->CopyToLocal(Plain, TargetDir, Param, Move, Done); }, true));
   }
 }
 
@@ -1674,17 +1533,7 @@ void Script::Upload(const std::vector<LocalItem> & Files, const QString & Target
     {
       Param.FileMask = FileMask;
     }
-    OperationResult Result = Wait(S, [&](Terminal::Callback Done) { S.Term->CopyToRemote(Plain, TargetDir, Param, Move, Done); }, true);
-    if (XmlLogging())
-    {
-      for (const QString & Path : Plain)
-      {
-        XmlRecord(QStringLiteral("upload"), {{QStringLiteral("filename"), Path},
-          {QStringLiteral("destination"), UnixPath::Combine(TargetDir, CopyParam::RestoreChars(Param.ChangeFileName(QFileInfo(Path).fileName(), true)))}},
-          Result.Ok, Result.Ok ? QStringList() : QStringList{Result.Message});
-      }
-    }
-    Check(Result);
+    Check(Wait(S, [&](Terminal::Callback Done) { S.Term->CopyToRemote(Plain, TargetDir, Param, Move, Done); }, true));
   }
 }
 
@@ -1712,14 +1561,7 @@ void Script::DownloadDirectoryAs(const RemoteItem & Item, const QString & Target
   if (!Children->isEmpty())
   {
     CopyParam ChildParam = Param;
-    OperationResult Result = Wait(S, [&](Terminal::Callback Done) { S.Term->CopyToLocal(*Children, Target, ChildParam, Move, Done); }, true);
-    for (const QString & Path : *Children)
-    {
-      XmlRecord(QStringLiteral("download"), {{QStringLiteral("filename"), Path},
-        {QStringLiteral("destination"), QDir(Target).filePath(UnixExtractFileName(Path))}},
-        Result.Ok, Result.Ok ? QStringList() : QStringList{Result.Message});
-    }
-    Check(Result);
+    Check(Wait(S, [&](Terminal::Callback Done) { S.Term->CopyToLocal(*Children, Target, ChildParam, Move, Done); }, true));
   }
   if (Param.PreserveTime && Param.PreserveTimeDirs && Item.HaveFile && Item.File.Modification.isValid())
   {
@@ -1739,7 +1581,7 @@ void Script::UploadDirectoryAs(const LocalItem & Item, const QString & Target, c
     RemoteFile Existing;
     if (!Fs.FileExists(Target, &Existing))
     {
-      Fs.CreateDirectory(Target, 0755);
+      Fs.CreateDirectory(Target, ServerDefaultMode);
     }
     else if (!Existing.IsDirectory)
     {
@@ -1755,14 +1597,7 @@ void Script::UploadDirectoryAs(const LocalItem & Item, const QString & Target, c
   if (!Children.isEmpty())
   {
     CopyParam ChildParam = Param;
-    OperationResult Result = Wait(S, [&](Terminal::Callback Done) { S.Term->CopyToRemote(Children, Target, ChildParam, Move, Done); }, true);
-    for (const QString & Path : Children)
-    {
-      XmlRecord(QStringLiteral("upload"), {{QStringLiteral("filename"), Path},
-        {QStringLiteral("destination"), UnixPath::Combine(Target, QFileInfo(Path).fileName())}},
-        Result.Ok, Result.Ok ? QStringList() : QStringList{Result.Message});
-    }
-    Check(Result);
+    Check(Wait(S, [&](Terminal::Callback Done) { S.Term->CopyToRemote(Children, Target, ChildParam, Move, Done); }, true));
   }
   if (Param.PreserveTime && Param.PreserveTimeDirs && Item.Modification.isValid())
   {
@@ -1799,6 +1634,7 @@ void Script::StreamDownload(const RemoteItem & Item, const CopyParam & Param)
   {
     throw ExtException(QStringLiteral("Cannot create temporary file: %1").arg(Temp.errorString()));
   }
+  Platform::MakePrivate(Temp);
   QString TempName = Temp.fileName();
   Temp.close();
   QString Source = Item.Path;
@@ -1820,6 +1656,11 @@ void Script::StreamDownload(const RemoteItem & Item, const CopyParam & Param)
   }
   Console & C = Console::Instance();
   C.FinishProgress();
+#ifdef Q_OS_WIN
+  // the bytes of the file, not text with its line ends changed
+  fflush(stdout);
+  int StdOutMode = _setmode(_fileno(stdout), _O_BINARY);
+#endif
   for (;;)
   {
     QByteArray Chunk = In.read(64 * 1024);
@@ -1840,8 +1681,11 @@ void Script::StreamDownload(const RemoteItem & Item, const CopyParam & Param)
   {
     C.WriteStdOut("0\r\n\r\n");
   }
-  XmlRecord(QStringLiteral("download"), {{QStringLiteral("filename"), Source}, {QStringLiteral("destination"), QStringLiteral("-")},
-    {QStringLiteral("size"), QString::number(In.size())}}, true);
+#ifdef Q_OS_WIN
+  fflush(stdout);
+  _setmode(_fileno(stdout), StdOutMode);
+#endif
+  SessionAction(laDownload, Source, QStringLiteral("-")).Commit(true, In.size());
 }
 
 void Script::StreamUpload(const QString & Target, const CopyParam & Param)
@@ -1854,6 +1698,11 @@ void Script::StreamUpload(const QString & Target, const CopyParam & Param)
   {
     throw ExtException(QStringLiteral("Cannot create temporary file: %1").arg(Temp.errorString()));
   }
+  Platform::MakePrivate(Temp);
+#ifdef Q_OS_WIN
+  // the bytes as they come: in text mode line ends change and Ctrl+Z ends the input
+  _setmode(STDIN_FILENO, _O_BINARY);
+#endif
   QByteArray Buffer(64 * 1024, Qt::Uninitialized);
   for (;;)
   {
@@ -1875,7 +1724,7 @@ void Script::StreamUpload(const QString & Target, const CopyParam & Param)
   Temp.flush();
   QString TempName = Temp.fileName();
   qint64 Size = Temp.size();
-  unsigned int Mode = Param.PreserveRights ? Param.RemoteFileRights(false) : 0644;
+  int Mode = Param.PreserveRights ? static_cast<int>(Param.RemoteFileRights(false)) : ServerDefaultMode;
   unsigned long CPSLimit = Param.CPSLimit;
   RunWorker(S, [Target, TempName, Size, Mode, CPSLimit](FileSystem & Fs, FileOperationProgress & Progress, UserInterface &)
   {
@@ -1883,11 +1732,10 @@ void Script::StreamUpload(const QString & Target, const CopyParam & Param)
     Progress.SetCPSLimit(CPSLimit);
     Progress.AddTotalSize(Size);
     Progress.SetFile(Target, Size);
-    Fs.Upload(TempName, Target, static_cast<int>(Mode), TransferParams(), Progress);
+    Fs.Upload(TempName, Target, Mode, TransferParams(), Progress);
     Progress.FileFinished();
   }, true);
-  XmlRecord(QStringLiteral("upload"), {{QStringLiteral("filename"), QStringLiteral("-")}, {QStringLiteral("destination"), Target},
-    {QStringLiteral("size"), QString::number(Size)}}, true);
+  SessionAction(laUpload, QStringLiteral("-"), Target).Commit(true, Size);
 }
 
 // --- commands ---
@@ -1956,7 +1804,7 @@ void Script::CallProc(ScriptProcParams & Params)
         ExitCode = Code;
         NewDirectory = Dir;
         Done(R);
-      });
+      }, false);
   });
   if (Result.Ok && !NewDirectory.isEmpty())
   {
@@ -1987,32 +1835,34 @@ void Script::CallProc(ScriptProcParams & Params)
       }
     }
   }
-  if (XmlLogging())
   {
-    std::vector<XmlParam> XmlParams{{QStringLiteral("command"), Params.ParamsStr}, {QStringLiteral("destination"), Directory}};
+    SessionAction Action(laCall);
+    Action.Command(Params.ParamsStr);
+    Action.Destination(Directory);
     if (!Output.isEmpty())
     {
-      XmlParams.push_back({QStringLiteral("output"), Output.join(QStringLiteral("\r\n"))});
+      Action.AddOutput(Output.join(QStringLiteral("\r\n")), false);
     }
     if (!ErrorOutput.isEmpty())
     {
-      XmlParams.push_back({QStringLiteral("erroroutput"), ErrorOutput.join(QStringLiteral("\r\n"))});
+      Action.AddOutput(ErrorOutput.join(QStringLiteral("\r\n")), true);
     }
     if (ExitCode >= 0)
     {
-      XmlParams.push_back({QStringLiteral("exitcode"), QString::number(ExitCode)});
+      Action.ExitCode(ExitCode);
     }
-    bool Success = Result.Ok && FailMessage.isEmpty();
-    QStringList Errors;
     if (!Result.Ok)
     {
-      Errors.append(Result.Message);
+      Action.Rollback(QStringList{Result.Message});
     }
     else if (!FailMessage.isEmpty())
     {
-      Errors.append(FailMessage);
+      Action.Rollback(QStringList{FailMessage});
     }
-    XmlRecord(QStringLiteral("call"), XmlParams, Success, Errors);
+    else
+    {
+      Action.Commit();
+    }
   }
   Check(Result);
   if (!FailMessage.isEmpty())
@@ -2038,8 +1888,18 @@ void Script::StatProc(ScriptProcParams & Params)
       *File = Fs.ReadFile(Path);
     }, Done);
   });
-  XmlRecord(QStringLiteral("stat"), {{QStringLiteral("filename"), Path}}, Result.Ok,
-    Result.Ok ? QStringList() : QStringList{Result.Message}, false, nullptr, Result.Ok ? File.get() : nullptr);
+  {
+    SessionAction Action(laStat, Path);
+    if (Result.Ok)
+    {
+      Action.File(*File);
+      Action.Commit();
+    }
+    else
+    {
+      Action.Rollback(QStringList{Result.Message});
+    }
+  }
   Check(Result);
   PrintLine(ListingStr(*File));
 }
@@ -2051,8 +1911,9 @@ void Script::ChecksumProc(ScriptProcParams & Params)
   // (TSCPFileSystem::CalculateFilesChecksum, the secondary shell of SFTP)
   CheckSession();
   Session & S = *FSession;
-  bool FtpChecksum = (S.Data.FSProtocol == fsFTP) && S.Term->IsCapable(fcCalculatingChecksum);
-  if (!FtpChecksum && (!S.Term->CanAnyCommand() || (S.Data.FSProtocol == fsFTP)))
+  // SFTP "check-file" too: the server may have no shell
+  bool ServerChecksum = S.Term->IsCapable(fcCalculatingChecksum);
+  if (!ServerChecksum && (!S.Term->CanAnyCommand() || (S.Data.FSProtocol == fsFTP)))
   {
     NotSupported();
   }
@@ -2070,9 +1931,9 @@ void Script::ChecksumProc(ScriptProcParams & Params)
   {
     S.Term->RunOnWorker([Checksum, UsedAlg, Path, Alg](FileSystem & Fs, FileOperationProgress & Progress, UserInterface &)
     {
-      if (FtpFileSystem * Ftp = dynamic_cast<FtpFileSystem *>(&Fs))
+      if (Fs.IsCapable(fcCalculatingChecksum, false))
       {
-        *Checksum = Ftp->CalculateFileChecksum(Path, Alg);
+        *Checksum = Fs.CalculateFileChecksum(Path, Alg);
         return;
       }
       AnyCommandFileSystem * Shell = dynamic_cast<AnyCommandFileSystem *>(&Fs);
@@ -2089,8 +1950,21 @@ void Script::ChecksumProc(ScriptProcParams & Params)
       QString Command = QStringLiteral("%1 %2").arg(AlgCommand, ShellQuoteStr(Path));
       QStringList Output;
       QStringList ErrorOutput;
-      int ExitCode = Shell->AnyCommand(Command, QString(),
-        [&](const QString & Line, bool StdError) { (StdError ? ErrorOutput : Output).append(Line); }, Progress, nullptr);
+      auto Run = [&]()
+      {
+        Output.clear();
+        ErrorOutput.clear();
+        return Shell->AnyCommand(Command, QString(),
+          [&](const QString & Line, bool StdError) { (StdError ? ErrorOutput : Output).append(Line); }, Progress, nullptr);
+      };
+      int ExitCode = Run();
+      // 126/127: the command does not exist or cannot be executed
+      QString Fallback = Terminal::ShellChecksumFallback(AlgCommand);
+      if (((ExitCode == 126) || (ExitCode == 127)) && !Fallback.isEmpty())
+      {
+        Command = QStringLiteral("%1 %2").arg(Fallback, ShellQuoteStr(Path));
+        ExitCode = Run();
+      }
       if ((ExitCode != 0) || (Output.size() != 1))
       {
         if (!ErrorOutput.isEmpty())
@@ -2101,31 +1975,27 @@ void Script::ChecksumProc(ScriptProcParams & Params)
         // INVALID_OUTPUT_ERROR
         throw ExtException(QStringLiteral("Command '%1' failed with invalid output '%2'.").arg(Command, Output.join(QLatin1Char('\n'))));
       }
-      // TSCPFileSystem::ParseFileChecksum: "<hash> <space or *><file name>";
-      // GNU tools prefix the line with a backslash for names needing escapes
-      QString Line = Output.first();
-      if (Line.startsWith(QLatin1Char('\\')))
-      {
-        Line.remove(0, 1);
-      }
-      qsizetype P = Line.indexOf(QLatin1Char(' '));
-      if ((P <= 0) || (P + 1 >= Line.size()) || ((Line[P + 1] != QLatin1Char(' ')) && (Line[P + 1] != QLatin1Char('*'))))
+      // TSCPFileSystem::ParseFileChecksum
+      QHash<QString, QString> Parsed = ParseChecksumOutput(Output);
+      if (Parsed.size() != 1)
       {
         throw ExtException(QStringLiteral("Command '%1' failed with invalid output '%2'.").arg(Command, Output.first()));
       }
-      *Checksum = Line.left(P).toLower();
+      *Checksum = Parsed.begin().value();
       *UsedAlg = Alg.toLower();
     }, Done);
   });
-  if (XmlLogging())
   {
-    std::vector<XmlParam> XmlParams{{QStringLiteral("filename"), Path}};
+    SessionAction Action(laChecksum, Path);
     if (Result.Ok)
     {
-      XmlParams.push_back({QStringLiteral("algorithm"), *UsedAlg});
-      XmlParams.push_back({QStringLiteral("checksum"), *Checksum});
+      Action.Checksum(*UsedAlg, *Checksum);
+      Action.Commit();
     }
-    XmlRecord(QStringLiteral("checksum"), XmlParams, Result.Ok, Result.Ok ? QStringList() : QStringList{Result.Message});
+    else
+    {
+      Action.Rollback(QStringList{Result.Message});
+    }
   }
   Check(Result);
   // TScript::DoCalculatedChecksum
@@ -2136,6 +2006,35 @@ void Script::PwdProc(ScriptProcParams & /*Params*/)
 {
   CheckSession();
   PrintLine(FSession->CurrentDirectory);
+  SessionAction Action(laCwd);
+  Action.Cwd(FSession->CurrentDirectory);
+  Action.Commit();
+}
+
+void Script::CopyIdProc(ScriptProcParams & Params)
+{
+  // TScript::CopyIdProc -> TTerminal::UploadPublicKey
+  CheckSession();
+  Session & S = *FSession;
+  if (!S.Data.IsSsh())
+  {
+    NotSupported();
+  }
+  QString KeyFile = Params.Param(1);
+  auto Messages = std::make_shared<QStringList>();
+  RunWorker(S, [KeyFile, Messages](FileSystem & Fs, FileOperationProgress &, UserInterface &)
+  {
+    SftpFileSystem * Sftp = dynamic_cast<SftpFileSystem *>(&Fs);
+    ScpFileSystem * Scp = ScpFileSystem::Of(Fs);
+    SecureShell & Shell = (Sftp != nullptr) ? Sftp->Shell() : Scp->Shell();
+    QString Result = Shell.InstallPublicKey(KeyFile, [Messages](const QString & Message) { Messages->append(Message); });
+    Messages->append(Result);
+  });
+  for (const QString & Message : *Messages)
+  {
+    QString Text = Message;
+    PrintMessage(Text.remove(QStringLiteral("**")));
+  }
 }
 
 void Script::CdProc(ScriptProcParams & Params)
@@ -2174,6 +2073,9 @@ void Script::CdProc(ScriptProcParams & Params)
   });
   FSession->CurrentDirectory = *Result;
   PrintLine(FSession->CurrentDirectory);
+  SessionAction Action(laCwd);
+  Action.Cwd(FSession->CurrentDirectory);
+  Action.Commit();
 }
 
 void Script::LsProc(ScriptProcParams & Params)
@@ -2225,7 +2127,12 @@ void Script::LsProc(ScriptProcParams & Params)
     }
   });
   Files->append(List);
-  XmlRecord(QStringLiteral("ls"), {{QStringLiteral("destination"), AbsDirectory}}, true, QStringList(), false, Files.get());
+  {
+    SessionAction Action(laLs);
+    Action.Destination(AbsDirectory);
+    Action.FileList(*Files);
+    Action.Commit();
+  }
   int Count = 0;
   for (const RemoteFile & File : *Files)
   {
@@ -2256,10 +2163,7 @@ void Script::RmProc(ScriptProcParams & Params)
     // Terminal::DeleteFiles moves the files to the session's remote recycle
     // bin when "Preserve deleted remote files to recycle bin" is on
     Session & S = *FSession;
-    OperationResult Result = Wait(S, [&](Terminal::Callback Done) { S.Term->DeleteFiles(QStringList{Item.Path}, Done); });
-    XmlRecord(QStringLiteral("rm"), {{QStringLiteral("filename"), Item.Path}}, Result.Ok,
-      Result.Ok ? QStringList() : QStringList{Result.Message}, Item.File.IsDirectory);
-    Check(Result);
+    Check(Wait(S, [&](Terminal::Callback Done) { S.Term->DeleteFiles(QStringList{Item.Path}, Done); }));
     // TManagementScript::TerminalOperationFinished
     PrintLine(Item.Path);
   }
@@ -2272,10 +2176,7 @@ void Script::RmDirProc(ScriptProcParams & Params)
   for (const RemoteItem & Item : Files)
   {
     Session & S = *FSession;
-    OperationResult Result = Wait(S, [&](Terminal::Callback Done) { S.Term->DeleteFiles(QStringList{Item.Path}, Done); });
-    XmlRecord(QStringLiteral("rm"), {{QStringLiteral("filename"), Item.Path}}, Result.Ok,
-      Result.Ok ? QStringList() : QStringList{Result.Message}, true);
-    Check(Result);
+    Check(Wait(S, [&](Terminal::Callback Done) { S.Term->DeleteFiles(QStringList{Item.Path}, Done); }));
     PrintLine(Item.Path);
   }
 }
@@ -2306,10 +2207,7 @@ void Script::MvProc(ScriptProcParams & Params)
       continue;
     }
     Session & S = *FSession;
-    OperationResult Result = Wait(S, [&](Terminal::Callback Done) { S.Term->RenameFile(Item.Path, NewPath, Done); });
-    XmlRecord(QStringLiteral("mv"), {{QStringLiteral("filename"), Item.Path}, {QStringLiteral("destination"), NewPath}},
-      Result.Ok, Result.Ok ? QStringList() : QStringList{Result.Message});
-    Check(Result);
+    Check(Wait(S, [&](Terminal::Callback Done) { S.Term->RenameFile(Item.Path, NewPath, Done); }));
     PrintLine(Item.Path);
   }
 }
@@ -2364,6 +2262,12 @@ void Script::CpProc(ScriptProcParams & Params)
           S3->CopyFile(Source, NewPath);
           return;
         }
+        if (Fs.IsCapable(fcRemoteCopy, false))
+        {
+          // SFTP "copy-data": no shell needed
+          Fs.CopyFile(Source, NewPath);
+          return;
+        }
         AnyCommandFileSystem * Shell = dynamic_cast<AnyCommandFileSystem *>(&Fs);
         if (Shell == nullptr)
         {
@@ -2394,8 +2298,21 @@ void Script::CpProc(ScriptProcParams & Params)
         }
       }, Done);
     });
-    XmlRecord(QStringLiteral("cp"), {{QStringLiteral("filename"), Source}, {QStringLiteral("destination"), NewPath}},
-      Result.Ok, Result.Ok ? QStringList() : QStringList{Result.Message}, Directory_);
+    {
+      SessionAction Action(laCp, Source, NewPath);
+      if (Directory_)
+      {
+        Action.Recursive();
+      }
+      if (Result.Ok)
+      {
+        Action.Commit();
+      }
+      else
+      {
+        Action.Rollback(QStringList{Result.Message});
+      }
+    }
     Check(Result);
     PrintLine(Item.Path);
   }
@@ -2421,8 +2338,18 @@ void Script::ChModProc(ScriptProcParams & Params)
         Fs.ChangeMode(Path, Mode);
       }, Done);
     });
-    XmlRecord(QStringLiteral("chmod"), {{QStringLiteral("filename"), Path}, {QStringLiteral("permissions"), Rights::ToText(Mode)}},
-      Result.Ok, Result.Ok ? QStringList() : QStringList{Result.Message});
+    {
+      SessionAction Action(laChmod, Path);
+      Action.Rights(Mode);
+      if (Result.Ok)
+      {
+        Action.Commit();
+      }
+      else
+      {
+        Action.Rollback(QStringList{Result.Message});
+      }
+    }
     Check(Result);
     PrintLine(Path);
   }
@@ -2446,10 +2373,7 @@ void Script::MkDirProc(ScriptProcParams & Params)
   CheckSession();
   QString Path = UnixExcludeTrailingBackslash(AbsolutePath(Params.Param(1)));
   Session & S = *FSession;
-  OperationResult Result = Wait(S, [&](Terminal::Callback Done) { S.Term->CreateDirectory(Path, 0755, Done); });
-  XmlRecord(QStringLiteral("mkdir"), {{QStringLiteral("filename"), Path}}, Result.Ok,
-    Result.Ok ? QStringList() : QStringList{Result.Message});
-  Check(Result);
+  Check(Wait(S, [&](Terminal::Callback Done) { S.Term->CreateDirectory(Path, ServerDefaultMode, Done); }));
 }
 
 void Script::GetProc(ScriptProcParams & Params)
@@ -2463,7 +2387,7 @@ void Script::GetProc(ScriptProcParams & Params)
   CopyParamParams(Param, Params);
   bool Move = false;
   bool Resume = false;
-  TransferParamParams(Params, Move, Resume);
+  TransferParamParams(Params, Param, Move, Resume);
   RequireParams(Params, 1);
   int LastFileParam = (Params.ParamCount() == 1) ? 1 : (Params.ParamCount() - 1);
   // "get file -" streams the file to stdout (needs /stdout)
@@ -2512,6 +2436,14 @@ void Script::GetProc(ScriptProcParams & Params)
     CheckMultiFilesToOne(static_cast<int>(Files.size()), UnixIncludeTrailingBackslash(TargetDirectory) + FileMask, false);
   }
   CheckParams(Params);
+  {
+    QStringList Paths;
+    for (const RemoteItem & Item : Files)
+    {
+      Paths.append(Item.Path);
+    }
+    Param.IncludeFileMask.SetRoots(LocalAbsolutePath(TargetDirectory), CommonPath(Paths));
+  }
   Download(Files, LocalAbsolutePath(TargetDirectory), FileMask, Param, Move, Resume);
 }
 
@@ -2525,7 +2457,7 @@ void Script::PutProc(ScriptProcParams & Params)
   CopyParamParams(Param, Params);
   bool Move = false;
   bool Resume = false;
-  TransferParamParams(Params, Move, Resume);
+  TransferParamParams(Params, Param, Move, Resume);
   RequireParams(Params, 1);
   int LastFileParam = (Params.ParamCount() == 1) ? 1 : (Params.ParamCount() - 1);
   // We use stdin only if - is the very first parameter (needs /stdin)
@@ -2553,6 +2485,10 @@ void Script::PutProc(ScriptProcParams & Params)
     StreamUpload(UnixPath::Combine(UnixExcludeTrailingBackslash(AbsolutePath(TargetDirectory)), FileName), Param);
     return;
   }
+  if (Param.Append && !FSession->Term->IsCapable(fcAppendUpload))
+  {
+    NotSupported();
+  }
   std::vector<LocalItem> Files = CreateLocalFileList(Params, 1, LastFileParam, fltMask | (Latest ? fltLatest : 0));
   QString TargetDirectory;
   QString FileMask;
@@ -2578,6 +2514,14 @@ void Script::PutProc(ScriptProcParams & Params)
     CheckMultiFilesToOne(static_cast<int>(Files.size()), UnixIncludeTrailingBackslash(TargetDirectory) + FileMask, true);
   }
   CheckParams(Params);
+  {
+    QStringList Paths;
+    for (const LocalItem & Item : Files)
+    {
+      Paths.append(Item.Path);
+    }
+    Param.IncludeFileMask.SetRoots(CommonPath(Paths), UnixExcludeTrailingBackslash(AbsolutePath(TargetDirectory)));
+  }
   Upload(Files, UnixExcludeTrailingBackslash(AbsolutePath(TargetDirectory)), FileMask, Param, Move, Resume);
 }
 
@@ -2760,6 +2704,21 @@ QString SynchronizeFileRecord(const QString & RootDirectory, const SynchronizeCh
   return QStringLiteral("%1 [%2, %3]").arg(Path).arg(Info.Size).arg(ModificationStr(Info.Modification));
 }
 
+// TSessionActionRecord::SynchronizeChecklistItem
+QString SynchronizeActionName(SynchronizeChecklist::ActionType Action)
+{
+  switch (Action)
+  {
+    case SynchronizeChecklist::saUploadNew: return QStringLiteral("uploadnew");
+    case SynchronizeChecklist::saDownloadNew: return QStringLiteral("downloadnew");
+    case SynchronizeChecklist::saUploadUpdate: return QStringLiteral("uploadupdate");
+    case SynchronizeChecklist::saDownloadUpdate: return QStringLiteral("downloadupdate");
+    case SynchronizeChecklist::saDeleteRemote: return QStringLiteral("deleteremote");
+    case SynchronizeChecklist::saDeleteLocal: return QStringLiteral("deletelocal");
+    default: return QString();
+  }
+}
+
 QString SynchronizeIntro(SynchronizeMode Mode, const QString & LocalDirectory, const QString & RemoteDirectory)
 {
   // SCRIPT_SYNCHRONIZE
@@ -2774,6 +2733,7 @@ void Script::SynchronizeProc(ScriptProcParams & Params)
   ResetTransfer();
   static const QStringList ModeNames{QStringLiteral("remote"), QStringLiteral("local"), QStringLiteral("both")};
   CheckDefaultCopyParam();
+  CheckDefaultSynchronizeParams();
   CopyParam Param = FCopyParam;
   CopyParamParams(Param, Params);
   RequireParams(Params, 1);
@@ -2791,6 +2751,7 @@ void Script::SynchronizeProc(ScriptProcParams & Params)
   QString LocalDirectory;
   QString RemoteDirectory;
   SynchronizeDirectories(Params, LocalDirectory, RemoteDirectory, 2);
+  Param.IncludeFileMask.SetRoots(LocalDirectory, RemoteDirectory);
 
   int SynchronizeParams = FSynchronizeParams | spNoConfirmation;
   QString Value;
@@ -2891,6 +2852,12 @@ void Script::SynchronizeProc(ScriptProcParams & Params)
         default: break;
       }
       PrintLine(Message);
+      // TDifferenceSessionAction
+      SessionAction Action(laDifference);
+      Action.Difference(SynchronizeActionName(Item->Action), Item->IsDirectory,
+        UnixIncludeTrailingBackslash(Item->Info1.Directory) + Item->Info1.FileName, Item->Info1.Size, Item->Info1.Modification,
+        UnixIncludeTrailingBackslash(Item->Info2.Directory) + Item->Info2.FileName, Item->Info2.Size, Item->Info2.Modification);
+      Action.Commit();
     }
     return;
   }
@@ -2924,6 +2891,7 @@ void Script::KeepUpToDateProc(ScriptProcParams & Params)
   CheckSession();
   ResetTransfer();
   CheckDefaultCopyParam();
+  CheckDefaultSynchronizeParams();
   CopyParam Param = FCopyParam;
   CopyParamParams(Param, Params);
   QString LocalDirectory;
@@ -3159,21 +3127,9 @@ void Script::Connect(const QString & SessionName, Options & Opts, bool CheckPara
     Data.KnownHostsFile = QFile::decodeName(KnownHosts);
   }
 
-  // ANY_HOSTKEY: "*" among the configured fingerprints accepts any key
-  // (VerifySessionHostKey accepts it silently)
-  bool UsesSsh = (Data.FSProtocol != fsFTP) && (Data.FSProtocol != fsWebDAV) && (Data.FSProtocol != fsS3);
-  if (UsesSsh)
+  if (FXmlLog)
   {
-    for (const QString & Key : Data.HostKey.split(QLatin1Char(';'), Qt::SkipEmptyParts))
-    {
-      if (Key.trimmed() == QStringLiteral("*"))
-      {
-        QString Message = QStringLiteral("WARNING! Giving up security and accepting any host key as configured!");
-        PrintLine(Message);
-        Log(QLatin1Char('*'), Message);
-        break;
-      }
-    }
+    FXmlLog->SetSession(Data);
   }
   Session & S = *NewSession;
   S.UI = std::make_unique<ConsoleUserInterface>(this, Data, S.Extras);
@@ -3350,7 +3306,7 @@ void Script::LLsProc(ScriptProcParams & Params)
   {
     Directory = Params.Param(1);
     Mask = LocalExtractFileName(Directory);
-    if (FileMasks::IsMask(Mask))
+    if (IsLocalMask(Mask))
     {
       Directory = LocalExtractFilePath(Directory);
     }
@@ -3374,7 +3330,7 @@ void Script::LLsProc(ScriptProcParams & Params)
     return;
   }
   FileMasks Masks;
-  Masks.SetMask(Mask);
+  Masks.SetMask(LocalMask(Mask));
   QFileInfoList Entries = Dir.entryInfoList(QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDot, QDir::Name);
   QLocale Locale;
   int Count = 0;

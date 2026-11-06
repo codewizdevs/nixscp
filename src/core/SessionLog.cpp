@@ -77,7 +77,7 @@ struct SessionLog::Writer
         Failed = true;
         return;
       }
-      File.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+      Platform::MakePrivate(File);
     }
   }
 };
@@ -627,7 +627,7 @@ bool SessionLog::DoOpen(QString * Error)
       if (!Existed)
       {
         // the log can contain sensitive data
-        W->File.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        Platform::MakePrivate(W->File);
       }
       W->Size = W->File.size();
       Registry().insert(Name, std::static_pointer_cast<void>(W));
@@ -1075,7 +1075,7 @@ void SessionLog::SetConfigurationLoaded()
 void SessionLog::AttachToWorker(QObject * Worker, const SessionData & Data)
 {
   std::shared_ptr<SessionLog> Log = ProcessLog();
-  std::shared_ptr<ActionsLog> Actions;
+  std::shared_ptr<ActionsLog> Actions = ActionsLog::ProcessLog();
   if (ConfigurationLoaded)
   {
     Configuration & Config = Configuration::Instance();

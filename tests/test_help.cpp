@@ -350,7 +350,7 @@ static void TestMessageBoxes()
     CheckModal(IsA<MessageForm>(), QStringLiteral("task_compare_directories"), QStringLiteral("Compare: no differences"), []()
     {
       QTemporaryDir Empty;
-      RunCompareDirectories(nullptr, Empty.path(), RemoteFileList(), [](const QStringList &, const QStringList &) {});
+      RunCompareDirectories(nullptr, Empty.path(), RemoteFileList(), QSet<QString>(), [](const QStringList &, const QStringList &) {});
     });
   }
 }

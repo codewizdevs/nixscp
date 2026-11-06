@@ -2743,6 +2743,13 @@ RemoteFile FtpListEntryToRemoteFile(const FtpListEntry & Entry)
   }
   File.LinkTo = Entry.LinkTarget;
   File.Modification = FtpListDateToDateTime(Entry.Date);
+  switch (FtpListDatePrecision(Entry.Date))
+  {
+    case ftpTimeNone: File.ModificationFmt = mfNone; break;
+    case ftpTimeDay: File.ModificationFmt = mfMDY; break;
+    case ftpTimeMinute: File.ModificationFmt = mfMDHM; break;
+    case ftpTimeSecond: File.ModificationFmt = mfFull; break;
+  }
   File.IsHidden = File.FileName.startsWith(QLatin1Char('.'));
   return File;
 }

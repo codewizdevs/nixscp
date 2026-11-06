@@ -54,6 +54,13 @@ namespace GuiCommandLine
   // /defaults, maintenance tasks) and unsafe raw session settings are ignored
   // when the URL handler started us (/Unsafe)
   bool CheckSafe(Options & Params);
+  // The command line of a program started by a link (/unsafe, what the URL
+  // handler passes): /unsafe and the first parameter, the URL, and nothing else.
+  // Windows puts a link in the handler's command line as it is, so one with a
+  // quote in it can add arguments of its own. No switch is needed there, and Qt
+  // must not see them either: "-platformpluginpath \\server\share" loads a DLL.
+  // Empty without /unsafe.
+  QStringList LinkArguments(const QStringList & Arguments);
 
   // Result of TStoredSessionList::ParseUrl for the GUI command line
   struct ParsedUrl
@@ -65,10 +72,17 @@ namespace GuiCommandLine
     bool PuttyProtocol = false;  // ssh:// (open in terminal, not as SFTP session)
     QString Passphrase;          // -passphrase / Passphrase raw setting
   };
-  // Unsafe (pufUnsafe): raw settings in the URL or /rawsettings must not set
-  // the shell, listing command, return variable, post login commands, recycle
-  // bin, SFTP server or proxy commands. Throws ExtException on invalid switch values.
+  // Unsafe (pufUnsafe): of the raw settings in the URL only SessionData::IsUrlSetting
+  // ones apply (WinSCP's pufUnsafe lists the ones that do not: a setting added later
+  // would be open), and no switch applies at all (not the /rawsettings of WinSCP's
+  // pufUnsafe only: a stored site must keep its host, encryption and host key).
+  // What an ad-hoc URL sets is never expanded (SessionData::NoExpansion).
+  // Throws ExtException on invalid switch values.
   ParsedUrl ParseUrl(const QString & Url, Options * Params, StoredSessionList & Stored, bool Unsafe);
+
+  // A running instance takes a forwarded command line as a link: is there no
+  // switch on this one that it would ignore?
+  bool CanForwardCommandLine(const Options & Params);
 
   // GetFolderOrWorkspaceName: the argument names a site folder or a workspace
   // (decoded); empty when it is a site or URL

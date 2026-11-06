@@ -3500,6 +3500,7 @@ void RunKeepRemoteUpToDate(QWidget * Parent, Terminal * Term, const QString & Lo
 }
 
 void RunCompareDirectories(QWidget * Parent, const QString & LocalDirectory, const RemoteFileList & RemoteFiles,
+  const QSet<QString> & LocalNames,
   std::function<void(const QStringList & LocalNames, const QStringList & RemoteNames)> Select)
 {
   // TScpCommanderForm::CompareDirectories
@@ -3507,7 +3508,7 @@ void RunCompareDirectories(QWidget * Parent, const QString & LocalDirectory, con
   QStringList LocalChanged;
   QStringList RemoteChanged;
   QApplication::setOverrideCursor(Qt::WaitCursor);
-  CompareDirectories(LocalDirectory, RemoteFiles, Config.CompareByTime, Config.CompareBySize, LocalChanged, RemoteChanged);
+  CompareDirectories(LocalDirectory, RemoteFiles, Config.CompareByTime, Config.CompareBySize, LocalChanged, RemoteChanged, &LocalNames);
   QApplication::restoreOverrideCursor();
   if (Select)
   {

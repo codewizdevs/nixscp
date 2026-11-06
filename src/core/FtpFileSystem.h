@@ -158,6 +158,7 @@ public:
   // TTerminal::VerifyCertificate / CacheCertificate on the
   // [FtpsCertificates] storage key (SiteKey = "host:port", value
   // "sha256-fingerprint;XX", XX = OpenSSL verification error in hex)
+  static bool HasCachedCertificate(const QString & SiteKey);
   static bool IsCertificateCached(const QString & SiteKey, const QString & FingerprintSHA1,
     const QString & FingerprintSHA256, int Failures);
   static void CacheCertificate(const QString & SiteKey, const QString & FingerprintSHA256, int Failures);
@@ -258,6 +259,7 @@ private:
   void DoClose();
   void Startup();
   void ProcessFeatures(const Reply & FeatReply);
+  static QStringList OverrideFeatures(const QStringList & Features, const QString & Override);
   void ProcessWelcome(const Reply & R);
   void ReadCurrentDirectory();
 
@@ -285,7 +287,9 @@ private:
 
   // Data connection (CFtpControlSocket LIST/FILETRANSFER states + CTransferSocket)
   struct DataConnection;
-  std::unique_ptr<DataConnection> OpenDataConnection(const QString & Command, qint64 * Rest, FileOperationProgress * Progress, const QString & Error);
+  // RefusedCode: the reply when the server turned down Command itself
+  std::unique_ptr<DataConnection> OpenDataConnection(const QString & Command, qint64 * Rest, FileOperationProgress * Progress, const QString & Error,
+    int * RefusedCode = nullptr);
   bool ListenForDataConnection(QTcpServer * Server, const QHostAddress & Local, QString & Error);
   QString FormatPortCommand(const QHostAddress & Local, quint16 Port) const;
   qint64 ReadData(DataConnection & Data, char * Buffer, qint64 MaxSize, FileOperationProgress * Progress, const QString & Error);

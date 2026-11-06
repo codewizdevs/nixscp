@@ -38,6 +38,7 @@ public:
   RemoteFile ReadFile(const QString & Path) override;
   bool FileExists(const QString & Path, RemoteFile * File) override;
   void CreateDirectory(const QString & Path, int Mode) override;
+  void CheckDirectory(const QString & Path) override;
   void DeleteFile(const QString & Path) override;
   void RemoveDirectory(const QString & Path) override;
   void RenameFile(const QString & From, const QString & To) override;
@@ -138,6 +139,8 @@ private:
   void RememberTokens(const QString & Owner, const QString & Group, bool IdsValid, quint32 Uid, quint32 Gid);
   bool ResolveToken(const QString & Text, const QHash<QString, quint32> & Ids, quint32 & Id) const;
   QByteArray RawOpenHandle(const QString & APath, quint32 Flags, const QString & Message);
+  // Open for Upload; Mode < 0: no permissions are sent. Throws CannotCreateFileException.
+  sftp_file OpenForUpload(const QString & RemotePath, bool Truncate, int Mode);
   void RawCloseHandle(const QByteArray & Handle);
   void ShellCopy(const QString & From, const QString & To);
 };

@@ -1,8 +1,9 @@
 // NixSCP Pro sync against a real NixSCP cloud server (core/CloudSync): two
 // computers (separate configuration folders, separate processes) sign in to
 // the same account, set up and unlock the sync password, sync sites both
-// ways, hand over the open sessions, and hit a conflict that is resolved
-// with the cloud settings.
+// ways, hand over the open sessions, hit a conflict that is resolved with the
+// cloud settings, and replace the data key, private keys of Teams included,
+// also with the process killed on the way.
 //
 // Skipped unless NIXSCP_TEST_CLOUD_COOKIE is the website session cookie
 // (nx_session) of a test account with an active license; the server is
@@ -13,9 +14,12 @@
 #include "core/ConfigVault.h"
 #include "core/Configuration.h"
 #include "core/SessionData.h"
+#include "core/TeamCrypto.h"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
+#include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QDir>
 #include <QElapsedTimer>
@@ -28,6 +32,7 @@
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QUrlQuery>
+#include <csignal>
 #include <cstdio>
 #include <memory>
 
@@ -37,6 +42,8 @@ static int Failures = 0;
   do { if (!(Cond)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #Cond); std::fflush(stdout); Failures++; } } while (0)
 
 static const QString SyncPassword = QStringLiteral("live test sync password");
+static const QString RotatedPassword = QStringLiteral("live test replaced password");
+static const QString KilledPassword = QStringLiteral("live test killed on the way");
 static const QByteArray SessionPayload = "[Sessions\\NixSCP%20Cloud%20Session/0000]\nHostName=tabs.example.com\nIsWorkspace=1\n";
 
 static bool WaitFor(const std::function<bool()> & Condition, int TimeoutMs = 30000)
@@ -123,7 +130,7 @@ static void StepFirst()
   Trace("after sign-in");
   CHECK(Sync.State() == CloudSync::csNeedKey);
   auto Probe = std::make_shared<int>(-1);
-  Sync.ProbeCloud([Probe](bool Ok, bool HasData, const QString &) { *Probe = Ok ? (HasData ? 1 : 0) : 2; });
+  Sync.ProbeCloud([Probe](bool Ok, bool HasData, bool, const QString &) { *Probe = Ok ? (HasData ? 1 : 0) : 2; });
   CHECK(WaitFor([Probe]() { return *Probe >= 0; }) && (*Probe == 0));
   AddSite(QStringLiteral("Live/A1"));
   auto Created = std::make_shared<int>(0);
@@ -270,6 +277,146 @@ static void StepUnlockPastJunk()
   CHECK(!HasSite(QStringLiteral("Evil")));
 }
 
+static CloudClient::Reply CallApi(const QByteArray & Method, const QString & Path, const QJsonObject & Body = QJsonObject())
+{
+  auto Result = std::make_shared<CloudClient::Reply>();
+  auto Done = std::make_shared<bool>(false);
+  CloudSync::Instance().Client().Api(Method, Path, Body, [Result, Done](const CloudClient::Reply & R) { *Result = R; *Done = true; });
+  WaitFor([Done]() { return *Done; });
+  return *Result;
+}
+
+static QString RotatedMarker()
+{
+  return QFileInfo(Configuration::Instance().IniFileName()).absolutePath() + QStringLiteral("/rotated");
+}
+
+static void StepRotate()
+{
+  // The keys of Teams on the real server: the replacement has to pass its signature check
+  CloudSync & Sync = CloudSync::Instance();
+  CHECK(WaitFor(Idle));
+  QByteArray Box = CloudCrypto::RandomBytes(32);
+  QByteArray Identity = CloudCrypto::RandomBytes(32);
+  QByteArray BoxPublic = TeamCrypto::PublicKey(Box);
+  QByteArray Private = Box + Identity;
+  QByteArray Signed = "NXT2-BOX-KEY|" + Sync.UserUuid().toUtf8() + '|' + BoxPublic;
+  CloudClient::Reply Put = CallApi("PUT", QStringLiteral("/v1/keys/me"),
+    {{QStringLiteral("public_key"), QString::fromLatin1(BoxPublic.toBase64())},
+     {QStringLiteral("identity_key"), QString::fromLatin1(CloudCrypto::Ed25519Public(Identity).toBase64())},
+     {QStringLiteral("key_signature"), QString::fromLatin1(CloudCrypto::Ed25519Sign(Identity, Signed).toBase64())},
+     {QStringLiteral("wrapped_private_key"), QString::fromLatin1(CloudCrypto::Seal(Sync.DataKey(), Private, QByteArray()).toBase64())}});
+  CHECK(Put.Ok());
+  QByteArray OldKey = Sync.DataKey();
+  Sync.SyncNow();
+  CHECK(WaitFor(Idle));
+  CHECK(Sync.State() == CloudSync::csIdle);
+
+  auto Result = std::make_shared<int>(0);
+  auto Text = std::make_shared<QString>();
+  CloudSync::KeyChange Change;
+  Change.Current = SyncPassword;
+  Change.NewPassword = RotatedPassword;
+  Change.RotateDataKey = true;
+  Sync.ChangeKey(Change, [Result, Text](bool Ok, const QString & Message) { *Result = Ok ? 1 : 2; *Text = Message; });
+  CHECK(WaitFor([Result]() { return *Result != 0; }, 60000));
+  if (*Result != 1) std::printf("  rotation error: %s\n", qPrintable(*Text));
+  CHECK(*Result == 1);
+  CHECK(Sync.DataKey() != OldKey);
+  CHECK(ConfigVault::Key() == Sync.DataKey());
+  // The server took the signed replacement
+  QByteArray Opened;
+  CHECK(WaitFor([&]()
+  {
+    CloudClient::Reply Keys = CallApi("GET", QStringLiteral("/v1/keys/me"));
+    QByteArray Wrapped = QByteArray::fromBase64(Keys.Json.value(QStringLiteral("wrapped_private_key")).toString().toLatin1());
+    return CloudCrypto::Open(Sync.DataKey(), Wrapped, QByteArray(), Opened);
+  }, 10000));
+  CHECK(Opened == Private);
+  // Stolen tokens cannot do the same without the identity key
+  CloudClient::Reply Keys = CallApi("GET", QStringLiteral("/v1/keys/me"));
+  QJsonObject Forged = Keys.Json;
+  Forged.insert(QStringLiteral("wrapped_private_key"), QString::fromLatin1(CloudCrypto::RandomBytes(92).toBase64()));
+  CHECK(CallApi("PUT", QStringLiteral("/v1/keys/me"), Forged).Status == 409);
+  QFile Marker(RotatedMarker());
+  CHECK(Marker.open(QIODevice::WriteOnly));
+}
+
+static void StepLeftBehind()
+{
+  // Still on the old key: stops, uploads nothing, and takes the new password
+  CloudSync & Sync = CloudSync::Instance();
+  CHECK(WaitFor([&Sync]() { return Sync.State() == CloudSync::csNeedKey; }));
+  Trace("left behind");
+  CHECK(!Sync.HasKey());
+  auto Result = std::make_shared<int>(0);
+  Sync.UnlockKey(RotatedPassword, false, [Result](bool Ok, const QString &) { *Result = Ok ? 1 : 2; });
+  CHECK(WaitFor([Result]() { return *Result != 0; }, 60000) && (*Result == 1));
+  CHECK(WaitFor(Idle));
+  CHECK(Sync.State() == CloudSync::csIdle);
+  CHECK(ConfigVault::Key() == Sync.DataKey());
+  QFile Marker(RotatedMarker());
+  CHECK(Marker.open(QIODevice::WriteOnly));
+}
+
+static void StepRotateKilled(const QByteArray & Where)
+{
+  static QByteArray KillAt;
+  KillAt = Where;
+  ConfigVault::KeyChangeStep = [](const char * Step)
+  {
+    if (KillAt == Step)
+    {
+      std::raise(SIGKILL);
+    }
+  };
+  CloudSync & Sync = CloudSync::Instance();
+  CHECK(WaitFor(Idle));
+  CloudSync::KeyChange Change;
+  Change.Current = RotatedPassword;
+  Change.NewPassword = KilledPassword;
+  Change.RotateDataKey = true;
+  auto Result = std::make_shared<int>(0);
+  Sync.ChangeKey(Change, [Result](bool Ok, const QString &) { *Result = Ok ? 1 : 2; });
+  WaitFor([Result]() { return *Result != 0; }, 60000);
+  CHECK(false);
+}
+
+static void StepRotateSettled(bool Landed)
+{
+  // What the start did by itself is over, and it decided
+  CloudSync & Sync = CloudSync::Instance();
+  QEventLoop Loop;
+  QTimer::singleShot(300, &Loop, &QEventLoop::quit);
+  Loop.exec();
+  CHECK(WaitFor(Idle));
+  Trace("settled");
+  CHECK(Sync.HasKey());
+  CHECK(Sync.State() == CloudSync::csIdle);
+  CHECK(ConfigVault::Key() == Sync.DataKey());
+  QByteArray Plain;
+  QByteArray Sealed;
+  {
+    QFile File(Configuration::Instance().IniFileName());
+    CHECK(File.open(QIODevice::ReadOnly));
+    Sealed = File.readAll();
+  }
+  CHECK(ConfigVault::OpenWithSecret(Sealed, Landed ? KilledPassword : RotatedPassword, false, Plain));
+  CHECK(Sync.PendingRecoveryKey().isEmpty() != Landed);
+  if (Landed)
+  {
+    CHECK(ConfigVault::OpenWithSecret(Sealed, Sync.PendingRecoveryKey(), true, Plain));
+  }
+  // The private keys of Teams on the real server open with the key in use
+  QByteArray Opened;
+  CHECK(WaitFor([&]()
+  {
+    CloudClient::Reply Keys = CallApi("GET", QStringLiteral("/v1/keys/me"));
+    QByteArray Wrapped = QByteArray::fromBase64(Keys.Json.value(QStringLiteral("wrapped_private_key")).toString().toLatin1());
+    return CloudCrypto::Open(Sync.DataKey(), Wrapped, QByteArray(), Opened);
+  }, 10000));
+}
+
 static void StepRemoved()
 {
   // Computer A is removed on the website: its next sync signs it out, with the reason
@@ -310,7 +457,7 @@ static int RunStep(const QString & Dir, const QString & Step)
   if (Encrypted)
   {
     CHECK(!ConfigVault::Unlock(Config.IniFileName(), QStringLiteral("wrong password"), false));
-    CHECK(ConfigVault::Unlock(Config.IniFileName(), SyncPassword, false));
+    CHECK(ConfigVault::Unlock(Config.IniFileName(), QFile::exists(RotatedMarker()) ? RotatedPassword : SyncPassword, false));
   }
   Config.Load();
   CHECK(!Config.IsLocked());
@@ -321,7 +468,13 @@ static int RunStep(const QString & Dir, const QString & Step)
   else if (Step == QStringLiteral("junk")) StepJunk();
   else if (Step == QStringLiteral("repair")) StepRepair();
   else if (Step == QStringLiteral("unlock-past-junk")) StepUnlockPastJunk();
+  else if (Step == QStringLiteral("rotate")) StepRotate();
+  else if (Step == QStringLiteral("left-behind")) StepLeftBehind();
   else if (Step == QStringLiteral("removed")) StepRemoved();
+  else if (Step == QStringLiteral("rotate-killed-uploaded")) StepRotateKilled("uploaded");
+  else if (Step == QStringLiteral("rotate-killed-committed")) StepRotateKilled("committed");
+  else if (Step == QStringLiteral("rotate-called-off")) StepRotateSettled(false);
+  else if (Step == QStringLiteral("rotate-finished")) StepRotateSettled(true);
   // with the key, the configuration is (now) encrypted on disk
   if (CloudSync::Instance().HasKey())
   {
@@ -354,7 +507,13 @@ int main(int argc, char ** argv)
     {ComputerA.path(), QStringLiteral("repair")},
     {Intruder2.path(), QStringLiteral("junk")},
     {ComputerE.path(), QStringLiteral("unlock-past-junk")},
+    {ComputerA.path(), QStringLiteral("rotate")},
+    {ComputerB.path(), QStringLiteral("left-behind")},
     {ComputerA.path(), QStringLiteral("removed")},
+    {ComputerB.path(), QStringLiteral("rotate-killed-uploaded")},
+    {ComputerB.path(), QStringLiteral("rotate-called-off")},
+    {ComputerB.path(), QStringLiteral("rotate-killed-committed")},
+    {ComputerB.path(), QStringLiteral("rotate-finished")},
   };
   for (const auto & Step : Steps)
   {
@@ -362,7 +521,14 @@ int main(int argc, char ** argv)
     Process.setProcessChannelMode(QProcess::ForwardedChannels);
     Process.start(App.applicationFilePath(), {Step.first, Step.second});
     Process.waitForFinished(120000);
-    CHECK((Process.exitStatus() == QProcess::NormalExit) && (Process.exitCode() == 0));
+    if (Step.second.startsWith(QStringLiteral("rotate-killed")))
+    {
+      CHECK(Process.exitStatus() == QProcess::CrashExit);
+    }
+    else
+    {
+      CHECK((Process.exitStatus() == QProcess::NormalExit) && (Process.exitCode() == 0));
+    }
     if (Failures > 0)
     {
       break;

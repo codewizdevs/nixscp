@@ -184,17 +184,14 @@ QStringList CheckedSites(QTreeWidget * Tree)
 
 bool TeamsDialog::TeamSite(const QString & SiteName, QString & TeamUuid, QString & Relative)
 {
-  for (const TeamSync::Team & T : TeamSync::Instance().Teams())
+  const TeamSync::Team * T = TeamSync::Instance().TeamOfSite(SiteName);
+  if (T == nullptr)
   {
-    QString Prefix = TeamSync::FolderName(T.Name) + QLatin1Char('/');
-    if (SiteName.startsWith(Prefix))
-    {
-      TeamUuid = T.Uuid;
-      Relative = SiteName.mid(Prefix.size());
-      return true;
-    }
+    return false;
   }
-  return false;
+  TeamUuid = T->Uuid;
+  Relative = SiteName.mid(T->Folder.size() + 1);
+  return true;
 }
 
 bool TeamsDialog::ShareSites(QWidget * Parent, const QStringList & Names, const QString & Subfolder, const QString & TeamUuid)
@@ -208,7 +205,7 @@ bool TeamsDialog::ShareSites(QWidget * Parent, const QStringList & Names, const 
   QList<TeamSync::Team> Teams;
   for (const TeamSync::Team & T : SortedTeams())
   {
-    if (T.CanEdit() && !T.Key.isEmpty())
+    if (T.CanEdit() && !T.Key.IsEmpty())
     {
       Teams.append(T);
     }
@@ -220,7 +217,7 @@ bool TeamsDialog::ShareSites(QWidget * Parent, const QStringList & Names, const 
     ? QStringLiteral("Share the site <b>%1</b> with a team.").arg(Names.first().section(QLatin1Char('/'), -1).toHtmlEscaped())
     : QStringLiteral("Share %1 sites with a team.").arg(Names.size());
   auto * Intro = new QLabel(What + QStringLiteral(" Every member gets it with its stored password, end-to-end encrypted. "
-    "You can stop sharing it at any time."), &Dialog);
+    "Proxy, tunnel, key file and command settings are not shared: they stay on this computer. You can stop sharing it at any time."), &Dialog);
   Intro->setWordWrap(true);
   Layout->addWidget(Intro);
   auto * Form = new QFormLayout();
@@ -313,15 +310,17 @@ bool TeamsDialog::ShareSites(QWidget * Parent, const QStringList & Names, const 
 
 bool TeamsDialog::StopSharing(QWidget * Parent, const QString & TeamUuid, const QStringList & Names)
 {
-  const TeamSync::Team * T = TeamSync::Instance().Find(TeamUuid);
-  if ((T == nullptr) || Names.isEmpty())
+  const TeamSync::Team * Found = TeamSync::Instance().Find(TeamUuid);
+  if ((Found == nullptr) || Names.isEmpty())
   {
     return false;
   }
+  // A sync may replace the teams while a dialog is open
+  const TeamSync::Team Team = *Found;
   const QString Title = QStringLiteral("Stop Sharing");
-  if (!T->CanEdit())
+  if (!Team.CanEdit())
   {
-    QMessageBox::information(Parent, Title, QStringLiteral("Only the owner and the admins of the team \"%1\" can stop sharing its sites.").arg(T->Name));
+    QMessageBox::information(Parent, Title, QStringLiteral("Only the owner and the admins of the team \"%1\" can stop sharing its sites.").arg(Team.Name));
     return false;
   }
   QString What = (Names.size() == 1)
@@ -332,7 +331,7 @@ bool TeamsDialog::StopSharing(QWidget * Parent, const QString & TeamUuid, const 
   QMessageBox Box(QMessageBox::Question, Title,
     QStringLiteral("Stop sharing %1 with the team <b>%2</b>?<br><br>The members lose it at their next sync. "
       "They could have copied the stored passwords while it was shared: change the passwords that matter.")
-      .arg(What, T->Name.toHtmlEscaped()), QMessageBox::Cancel, Parent);
+      .arg(What, Team.Name.toHtmlEscaped()), QMessageBox::Cancel, Parent);
   QPushButton * Keep = Box.addButton(QStringLiteral("Stop Sharing, &Keep My Copy"), QMessageBox::AcceptRole);
   QPushButton * Delete = Box.addButton(QStringLiteral("Stop Sharing and &Delete"), QMessageBox::DestructiveRole);
   Box.setDefaultButton(Keep);
@@ -387,7 +386,7 @@ QString TeamsDialog::Join(QWidget * Parent)
     if (!Before.contains(T.Uuid))
     {
       QMessageBox::information(Parent, QStringLiteral("Join a Team"),
-        QStringLiteral("You joined the team \"%1\". Its sites are in the folder \"%2\" of your sites.").arg(T.Name, TeamSync::FolderName(T.Name)));
+        QStringLiteral("You joined the team \"%1\". Its sites are in the folder \"%2\" of your sites.").arg(T.Name, T.Folder));
       return T.Uuid;
     }
   }
@@ -459,7 +458,8 @@ TeamsDialog::TeamsDialog(QWidget * Parent, const QString & SelectUuid) : QDialog
 
   auto * Top = new QHBoxLayout();
   auto * Intro = new QLabel(QStringLiteral("Share sites with your colleagues, end-to-end encrypted. Owners and admins share and edit "
-    "a team's sites; members use them. A team's sites are in the folder <b>Team: &lt;name&gt;</b> of your sites."), this);
+    "a team's sites; members use them. A team's sites are in the folder <b>Team: &lt;name&gt;</b> of your sites. Settings that run "
+    "commands or weaken checks are never shared."), this);
   Intro->setWordWrap(true);
   Top->addWidget(Intro, 1);
   Layout->addLayout(Top);
@@ -496,6 +496,8 @@ TeamsDialog::TeamsDialog(QWidget * Parent, const QString & SelectUuid) : QDialog
   TitleFont.setPointSizeF(TitleFont.pointSizeF() * 1.25);
   FTitle->setFont(TitleFont);
   FSubtitle = new QLabel(FDetails);
+  FTitle->setTextFormat(Qt::PlainText);
+  FSubtitle->setTextFormat(Qt::PlainText);
   Titles->addWidget(FTitle);
   Titles->addWidget(FSubtitle);
   Header->addLayout(Titles, 1);
@@ -505,6 +507,23 @@ TeamsDialog::TeamsDialog(QWidget * Parent, const QString & SelectUuid) : QDialog
   FTeamMenu->setToolButtonStyle(Qt::ToolButtonTextOnly);
   Header->addWidget(FTeamMenu, 0, Qt::AlignTop);
   DetailsLayout->addLayout(Header);
+
+  // what needs attention: a team that failed verification, a conflict
+  FBanner = new QLabel(FDetails);
+  FBanner->setWordWrap(true);
+  FBanner->setTextFormat(Qt::PlainText);
+  FBanner->setFrameShape(QFrame::StyledPanel);
+  FBanner->setContentsMargins(6, 6, 6, 6);
+  DetailsLayout->addWidget(FBanner);
+  auto * ConflictButtons = new QHBoxLayout();
+  FKeepMine = new QPushButton(QStringLiteral("&Keep My Version for Everyone"), FDetails);
+  FUseTeam = new QPushButton(QStringLiteral("&Use the Team's Version"), FDetails);
+  FForget = new QPushButton(QStringLiteral("Remove from This &Computer..."), FDetails);
+  ConflictButtons->addStretch();
+  ConflictButtons->addWidget(FUseTeam);
+  ConflictButtons->addWidget(FKeepMine);
+  ConflictButtons->addWidget(FForget);
+  DetailsLayout->addLayout(ConflictButtons);
 
   FTabs = new QTabWidget(FDetails);
   // Shared sites
@@ -530,8 +549,12 @@ TeamsDialog::TeamsDialog(QWidget * Parent, const QString & SelectUuid) : QDialog
   // Members
   auto * MembersPage = new QWidget(FTabs);
   auto * MembersLayout = new QVBoxLayout(MembersPage);
-  FMembers = NewTable(MembersPage, {QStringLiteral("E-mail"), QStringLiteral("Role"), QStringLiteral("Joined")});
+  FMembers = NewTable(MembersPage, {QStringLiteral("E-mail"), QStringLiteral("Role"), QStringLiteral("Joined"), QStringLiteral("Key fingerprint")});
   MembersLayout->addWidget(FMembers, 1);
+  FFingerprint = new QLabel(MembersPage);
+  FFingerprint->setWordWrap(true);
+  FFingerprint->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  MembersLayout->addWidget(FFingerprint);
   auto * MembersButtons = new QHBoxLayout();
   FInvite = new QPushButton(QStringLiteral("&Invite..."), MembersPage);
   FMakeAdmin = new QPushButton(QStringLiteral("Make &Admin"), MembersPage);
@@ -584,6 +607,7 @@ TeamsDialog::TeamsDialog(QWidget * Parent, const QString & SelectUuid) : QDialog
     if (T == nullptr) return;
     bool Owner = (T->Role == QStringLiteral("owner"));
     TeamMenu->addAction(QStringLiteral("&Rename..."), this, [this]() { Rename(); })->setEnabled(T->CanEdit());
+    TeamMenu->addAction(QStringLiteral("Restore from &History..."), this, [this]() { RestoreFromHistory(); })->setEnabled(T->CanEdit());
     TeamMenu->addSeparator();
     if (Owner)
     {
@@ -621,6 +645,25 @@ TeamsDialog::TeamsDialog(QWidget * Parent, const QString & SelectUuid) : QDialog
     Run([](const auto & Done) { TeamSync::Instance().SyncAll(Done); });
     LoadMembers(true);
   });
+  connect(FKeepMine, &QPushButton::clicked, this, [this]()
+  {
+    QString Uuid = SelectedUuid();
+    if (QMessageBox::question(this, windowTitle(), QStringLiteral("Replace the team's sites with the ones on this computer? "
+          "The version on the server stays in the team's history.")) == QMessageBox::Yes)
+    {
+      Run([Uuid](const auto & Done) { TeamSync::Instance().ResolveConflict(Uuid, true, Done); });
+    }
+  });
+  connect(FUseTeam, &QPushButton::clicked, this, [this]()
+  {
+    QString Uuid = SelectedUuid();
+    if (QMessageBox::question(this, windowTitle(), QStringLiteral("Replace the team's sites on this computer with the team's version? "
+          "Your changes to them are lost.")) == QMessageBox::Yes)
+    {
+      Run([Uuid](const auto & Done) { TeamSync::Instance().ResolveConflict(Uuid, false, Done); });
+    }
+  });
+  connect(FForget, &QPushButton::clicked, this, [this]() { Forget(); });
   connect(FShareSites, &QPushButton::clicked, this, [this]() { ShareSitesClicked(); });
   connect(FShareFolder, &QPushButton::clicked, this, [this]() { ShareFolderClicked(); });
   connect(FUnshare, &QPushButton::clicked, this, [this]() { UnshareClicked(); });
@@ -672,7 +715,15 @@ TeamsDialog::TeamsDialog(QWidget * Parent, const QString & SelectUuid) : QDialog
   }
   else
   {
-    Run([](const auto & Done) { TeamSync::Instance().SyncAll(Done); });
+    // What fails shows in the window, not as a box in front of it
+    QPointer<TeamsDialog> Guard(this);
+    TeamSync::Instance().SyncAll([Guard](bool, const QString &)
+    {
+      if (Guard != nullptr)
+      {
+        Guard->Reload();
+      }
+    });
   }
 }
 
@@ -736,13 +787,21 @@ void TeamsDialog::ReloadSites()
   }
   FTitle->setText(T->Name);
   FSubtitle->setText(QStringLiteral("You are %1 · %2 %3 · folder \"%4\"").arg(RoleText(T->Role).toLower())
-    .arg(T->MemberCount).arg((T->MemberCount == 1) ? QStringLiteral("person") : QStringLiteral("people"), TeamSync::FolderName(T->Name)));
+    .arg(T->MemberCount).arg((T->MemberCount == 1) ? QStringLiteral("person") : QStringLiteral("people"), T->Folder));
+  QString Attention = !T->Error.isEmpty() ? T->Error : T->Conflict;
+  FBanner->setText(Attention);
+  FBanner->setVisible(!Attention.isEmpty());
+  FBanner->setStyleSheet(!T->Error.isEmpty() ? QStringLiteral("color: #b00020;") : QString());
+  bool Decide = T->Error.isEmpty() && !T->Conflict.isEmpty();
+  FKeepMine->setVisible(Decide);
+  FUseTeam->setVisible(Decide);
+  FForget->setVisible(!T->Error.isEmpty());
   QStringList Shared = TeamSync::Instance().SharedSites(Uuid);
   FillTree(FSites, Shared, false);
   FTabs->setTabText(0, QStringLiteral("Shared Sites (%1)").arg(Shared.size()));
-  if (T->Key.isEmpty())
+  if (T->Key.IsEmpty())
   {
-    FSitesHint->setText(QStringLiteral("Waiting for the team key: an owner or admin's NixSCP hands it over at its next sync."));
+    FSitesHint->setText(QStringLiteral("The team key is not available on this computer."));
   }
   else if (Shared.isEmpty())
   {
@@ -785,8 +844,17 @@ void TeamsDialog::LoadMembers(bool Force)
       QJsonObject M = V.toObject();
       int R = Members->rowCount();
       Members->insertRow(R);
-      QStringList Cells{M.value(QStringLiteral("email")).toString(), RoleText(M.value(QStringLiteral("role")).toString()),
-        M.value(QStringLiteral("joined_at")).toString().left(10)};
+      QString Email = M.value(QStringLiteral("email")).toString();
+      if (M.value(QStringLiteral("gone")).toBool())
+      {
+        Email += QStringLiteral(" (account deleted)");
+      }
+      if (M.value(QStringLiteral("unusable")).toBool())
+      {
+        Email += QStringLiteral(" (unusable key: gets no new team key)");
+      }
+      QStringList Cells{Email, RoleText(M.value(QStringLiteral("role")).toString()),
+        M.value(QStringLiteral("joined_at")).toString().left(10), M.value(QStringLiteral("fingerprint")).toString()};
       for (int C = 0; C < Cells.size(); C++)
       {
         auto * Item = new QTableWidgetItem(Cells.at(C));
@@ -797,6 +865,8 @@ void TeamsDialog::LoadMembers(bool Force)
     }
     Members->resizeColumnsToContents();
     Guard->FTabs->setTabText(1, QStringLiteral("Members (%1)").arg(List.size()));
+    Guard->FFingerprint->setText(QStringLiteral("Your key fingerprint: %1. Compare fingerprints with your colleagues over another channel "
+      "(in person, by phone): a matching fingerprint proves the key is really theirs.").arg(TeamSync::Instance().Fingerprint()));
     Guard->UpdateButtons();
   });
   if (Edit)
@@ -840,7 +910,7 @@ QStringList TeamsDialog::SelectedShares() const
 void TeamsDialog::UpdateButtons()
 {
   const TeamSync::Team * T = TeamSync::Instance().Find(SelectedUuid());
-  bool Edit = (T != nullptr) && T->CanEdit() && !T->Key.isEmpty();
+  bool Edit = (T != nullptr) && T->CanEdit() && !T->Key.IsEmpty();
   bool Owner = (T != nullptr) && (T->Role == QStringLiteral("owner"));
   FShareSites->setVisible((T != nullptr) && T->CanEdit());
   FShareFolder->setVisible((T != nullptr) && T->CanEdit());
@@ -885,14 +955,79 @@ void TeamsDialog::Run(const std::function<void(const std::function<void(bool, co
   });
 }
 
-void TeamsDialog::ShareSitesClicked()
+void TeamsDialog::RestoreFromHistory()
 {
   QString Uuid = SelectedUuid();
-  const TeamSync::Team * T = TeamSync::Instance().Find(Uuid);
-  if (T == nullptr)
+  QPointer<TeamsDialog> Guard(this);
+  TeamSync::Instance().History(Uuid, [Guard, Uuid](bool Ok, const QString & Error, const QJsonArray & List)
+  {
+    if (Guard == nullptr)
+    {
+      return;
+    }
+    if (!Ok)
+    {
+      QMessageBox::warning(Guard, Guard->windowTitle(), Error);
+      return;
+    }
+    QStringList Items;
+    QList<qint64> Versions;
+    for (const QJsonValue & V : List)
+    {
+      QJsonObject Item = V.toObject();
+      Versions.append(Item.value(QStringLiteral("version")).toInteger());
+      Items.append(QStringLiteral("Version %1 · %2 · %3").arg(Versions.last()).arg(Item.value(QStringLiteral("created_at")).toString().left(16).replace(QLatin1Char('T'), QLatin1Char(' ')),
+        Item.value(QStringLiteral("user_email")).toString()));
+    }
+    if (Items.isEmpty())
+    {
+      QMessageBox::information(Guard, Guard->windowTitle(), QStringLiteral("The server keeps no versions of this team."));
+      return;
+    }
+    bool Accepted = false;
+    QString Choice = QInputDialog::getItem(Guard, QStringLiteral("Restore from History"),
+      QStringLiteral("The chosen version becomes the team's content for everyone, as a new version. Later versions stay in the history:"),
+      Items, 0, false, &Accepted);
+    if ((Guard != nullptr) && Accepted)
+    {
+      qint64 Version = Versions.value(Items.indexOf(Choice));
+      Guard->Run([Uuid, Version](const auto & Done) { TeamSync::Instance().Restore(Uuid, Version, Done); });
+    }
+  });
+}
+
+void TeamsDialog::Forget()
+{
+  QString Uuid = SelectedUuid();
+  const TeamSync::Team * Found = TeamSync::Instance().Find(Uuid);
+  if (Found == nullptr)
   {
     return;
   }
+  QMessageBox Box(QMessageBox::Question, windowTitle(), QStringLiteral("This computer cannot verify the team \"%1\". Remove the team from this "
+    "computer? Nothing changes for the other members, and it stays away until someone invites you again.").arg(Found->Name), QMessageBox::Cancel, this);
+  Box.setTextFormat(Qt::PlainText);
+  QPushButton * Keep = Box.addButton(QStringLiteral("Remove, &Keep the Sites as My Own"), QMessageBox::AcceptRole);
+  QPushButton * Delete = Box.addButton(QStringLiteral("Remove with the &Sites"), QMessageBox::DestructiveRole);
+  Box.setDefaultButton(Keep);
+  Box.exec();
+  if ((Box.clickedButton() == Keep) || (Box.clickedButton() == Delete))
+  {
+    bool KeepSites = (Box.clickedButton() == Keep);
+    Run([Uuid, KeepSites](const auto & Done) { TeamSync::Instance().Forget(Uuid, KeepSites, Done); });
+  }
+}
+
+void TeamsDialog::ShareSitesClicked()
+{
+  QString Uuid = SelectedUuid();
+  const TeamSync::Team * Found = TeamSync::Instance().Find(Uuid);
+  if (Found == nullptr)
+  {
+    return;
+  }
+  const TeamSync::Team Team = *Found;
+  const TeamSync::Team * T = &Team;
   QStringList Personal = PersonalSites();
   if (Personal.isEmpty())
   {
@@ -929,11 +1064,13 @@ void TeamsDialog::ShareSitesClicked()
 void TeamsDialog::ShareFolderClicked()
 {
   QString Uuid = SelectedUuid();
-  const TeamSync::Team * T = TeamSync::Instance().Find(Uuid);
-  if (T == nullptr)
+  const TeamSync::Team * Found = TeamSync::Instance().Find(Uuid);
+  if (Found == nullptr)
   {
     return;
   }
+  const TeamSync::Team Team = *Found;
+  const TeamSync::Team * T = &Team;
   QSet<QString> Folders;
   for (const QString & Name : PersonalSites())
   {
@@ -953,7 +1090,7 @@ void TeamsDialog::ShareFolderClicked()
   std::sort(List.begin(), List.end(), [](const QString & A, const QString & B) { return StoredSessionList::CompareLogicalText(A, B) < 0; });
   bool Ok = false;
   QString Folder = QInputDialog::getItem(this, QStringLiteral("Share Folder with %1").arg(T->Name),
-    QStringLiteral("The folder's sites move into the team's folder (Team: %1/<folder>) and every member gets them:").arg(T->Name),
+    QStringLiteral("The folder's sites move into the team's folder (%1/<folder>) and every member gets them:").arg(T->Folder),
     List, 0, false, &Ok);
   if (Ok && !Folder.isEmpty())
   {
@@ -972,11 +1109,14 @@ void TeamsDialog::UnshareClicked()
 void TeamsDialog::Invite()
 {
   QString Uuid = SelectedUuid();
-  const TeamSync::Team * T = TeamSync::Instance().Find(Uuid);
-  if (T == nullptr)
+  const TeamSync::Team * Found = TeamSync::Instance().Find(Uuid);
+  if (Found == nullptr)
   {
     return;
   }
+  // A sync may replace the teams while the dialog is open
+  const TeamSync::Team Team = *Found;
+  const TeamSync::Team * T = &Team;
   QDialog Dialog(this);
   Dialog.setWindowTitle(QStringLiteral("Invite to %1").arg(T->Name));
   auto * Form = new QFormLayout(&Dialog);
@@ -1070,14 +1210,16 @@ void TeamsDialog::RemoveMember()
 void TeamsDialog::Rename()
 {
   QString Uuid = SelectedUuid();
-  const TeamSync::Team * T = TeamSync::Instance().Find(Uuid);
-  if (T == nullptr)
+  const TeamSync::Team * Found = TeamSync::Instance().Find(Uuid);
+  if (Found == nullptr)
   {
     return;
   }
+  // A sync may replace the teams while the dialog is open
+  const QString Current = Found->Name;
   bool Ok = false;
-  QString Name = QInputDialog::getText(this, QStringLiteral("Rename Team"), QStringLiteral("Team &name:"), QLineEdit::Normal, T->Name, &Ok).trimmed();
-  if (Ok && !Name.isEmpty() && (Name != T->Name))
+  QString Name = QInputDialog::getText(this, QStringLiteral("Rename Team"), QStringLiteral("Team &name:"), QLineEdit::Normal, Current, &Ok).trimmed();
+  if (Ok && !Name.isEmpty() && (Name != Current))
   {
     Run([Uuid, Name](const auto & Done) { TeamSync::Instance().Rename(Uuid, Name, Done); });
   }

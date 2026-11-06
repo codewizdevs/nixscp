@@ -98,6 +98,7 @@ public:
   // Credentials were given for the session (TSecureShell::GetStoredCredentialsTried)
   bool StoredCredentialsTried() const;
   void DisplayBanner(const QString & SessionName, const QString & Banner) override;
+  void Information(const QString & Message) override;
   unsigned int QueryUser(const QString & Query, const QString & MoreMessages, unsigned int Answers) override;
   // Button aliases (captions), countdown, qpWaitInBatch, NoBatchAnswers
   unsigned int QueryUserEx(const QString & Query, const QString & MoreMessages, unsigned int Answers,

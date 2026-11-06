@@ -14,10 +14,13 @@
 //   NIXSCP_TEST_SSH_CERT_KEY   ECDSA/RSA private key, not in authorized_keys,
 //                              with "<key>-cert.pub" signed by the CA
 // The user's ~/.ssh is never touched.
+#include "core/Configuration.h"
 #include "core/SecureShell.h"
+#include "core/SessionLog.h"
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QMutex>
@@ -31,6 +34,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pwd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <atomic>
@@ -66,16 +70,22 @@ public:
   QString LastHostKeyHost;
   QString LastFingerprint;
   int HostKeyCalls = 0;
+  HostKeyState LastHostKeyState = HostKeyUnknown;
   QStringList PromptAnswers;
   QStringList PromptTexts;
   QList<unsigned int> QueryAnswers;
   QStringList Queries;
+  QStringList Informations;
+  unsigned int LastQueryTimeout = 0;
+  unsigned int LastQueryTimeoutAnswer = 0;
+
 
   HostKeyAnswer VerifyHostKey(const QString & Host, int, const QString &, const QString & FingerprintSHA256,
-    const QString &, HostKeyState) override
+    const QString &, HostKeyState State) override
   {
     QMutexLocker Lock(&Mutex);
     HostKeyCalls++;
+    LastHostKeyState = State;
     LastHostKeyHost = Host;
     LastFingerprint = FingerprintSHA256;
     return HostKeyResponse;
@@ -97,6 +107,23 @@ public:
   }
 
   void DisplayBanner(const QString &, const QString &) override {}
+
+  void Information(const QString & Message) override
+  {
+    QMutexLocker Lock(&Mutex);
+    Informations.append(Message);
+  }
+
+  unsigned int QueryUserEx(const QString & Query, const QString & MoreMessages, unsigned int Answers,
+    const QueryUserParams & Params) override
+  {
+    {
+      QMutexLocker Lock(&Mutex);
+      LastQueryTimeout = Params.Timeout;
+      LastQueryTimeoutAnswer = Params.TimeoutAnswer;
+    }
+    return QueryUser(Query, MoreMessages, Answers);
+  }
 
   unsigned int QueryUser(const QString & Query, const QString &, unsigned int) override
   {
@@ -520,6 +547,29 @@ static void TestOffline(const QString & ScratchPath)
   Data.ProxyLocalCommand = QStringLiteral("connect %host %port via %proxyhost:%proxyport as %user\\t100%%");
   CHECK_MSG(SecureShell::ProxyCommandOption(Data) == QStringLiteral("connect example.com 2200 via proxy.example:3128 as u\t100%"),
     SecureShell::ProxyCommandOption(Data));
+  // the host may be from a URL, and the command goes to a shell
+  for (const char * Host : {"$(id)", "`id`", "a;id", "a b", "a|id", "a&id", "a\nid", "a\"b", "a'b", "a\\b", "a>b"})
+  {
+    Data.HostName = QString::fromLatin1(Host);
+    bool Refused = false;
+    try
+    {
+      SecureShell::ProxyCommandOption(Data);
+    }
+    catch (const FatalException &)
+    {
+      Refused = true;
+    }
+    CHECK_MSG(Refused, QString::fromLatin1(Host));
+  }
+  Data.ProxyLocalhost = true;
+  for (const char * Host : {"example.com", "my-host_1.example", "10.0.0.1", "::1", "[fe80::1%eth0]"})
+  {
+    Data.HostName = QString::fromLatin1(Host);
+    CHECK_MSG(SecureShell::ProxyCommandOption(Data).contains(QString::fromLatin1(Host)), QString::fromLatin1(Host));
+  }
+  Data.ProxyLocalhost = false;
+  Data.HostName = QStringLiteral("example.com");
   Data.ProxyMethod = pmSocks5;
   CHECK(SecureShell::ProxyCommandOption(Data).isEmpty());
   Data.ProxyMethod = pmCmd;
@@ -646,6 +696,550 @@ static void TestWeakAlgorithms(SessionData Data)
     CHECK(TryOpen(Shell));
     CHECK(UI.Queries.isEmpty());
   }
+}
+
+// S11: the OpenSSH configuration files of the user and the system are not
+// read for a site. libssh takes the home directory from the passwd entry, so
+// the file is put in place with bwrap, in a child process of this test.
+static int ConfigProbe(SessionData Data)
+{
+  TestUserInterface UI;
+  SecureShell Shell(Data, &UI);
+  QString Error;
+  bool Opened = TryOpen(Shell, &Error);
+  std::printf("probe: opened=%d %s\n", Opened ? 1 : 0, qPrintable(Error));
+  return Opened ? 3 : 0;
+}
+
+static void TestSshConfigNotRead(const QString & ScratchPath, int Port)
+{
+  Log(QStringLiteral("~/.ssh/config"));
+  QString Bwrap = QStandardPaths::findExecutable(QStringLiteral("bwrap"));
+  struct passwd * Pw = getpwuid(getuid());
+  if (Bwrap.isEmpty() || (Pw == nullptr) || !QFileInfo::exists(QFile::decodeName(Pw->pw_dir) + QStringLiteral("/.ssh")))
+  {
+    Log(QStringLiteral("SKIPPED (no bwrap, or no ~/.ssh to bind over)"));
+    return;
+  }
+  QString Dir = QDir(ScratchPath).filePath(QStringLiteral("dotssh-config"));
+  QDir().mkpath(Dir);
+  QString Marker = QDir(ScratchPath).filePath(QStringLiteral("proxycommand-ran"));
+  QFile Config(Dir + QStringLiteral("/config"));
+  CHECK(Config.open(QIODevice::WriteOnly));
+  Config.write(QStringLiteral("Host cfgalias.test\n  HostName 127.0.0.1\n  Port %1\n  ProxyCommand sh -c 'touch %2; nc 127.0.0.1 %1'\n").arg(Port).arg(Marker).toUtf8());
+  Config.close();
+  QProcess Probe;
+  Probe.setProcessChannelMode(QProcess::MergedChannels);
+  QProcessEnvironment Env = QProcessEnvironment::systemEnvironment();
+  Env.insert(QStringLiteral("NIXSCP_TEST_CONFIG_PROBE"), QStringLiteral("1"));
+  Probe.setProcessEnvironment(Env);
+  Probe.start(Bwrap, {QStringLiteral("--dev-bind"), QStringLiteral("/"), QStringLiteral("/"), QStringLiteral("--bind"), Dir,
+    QFile::decodeName(Pw->pw_dir) + QStringLiteral("/.ssh"), QCoreApplication::applicationFilePath()});
+  CHECK(Probe.waitForFinished(60000));
+  QString Output = QString::fromUtf8(Probe.readAll());
+  Log(Output.trimmed());
+  CHECK_MSG(Probe.exitCode() == 0, Output);
+  CHECK(!QFileInfo::exists(Marker));
+}
+
+// B16: a proxy command that does not exit when its input closes
+static void TestProxyCommandExit(SessionData Data)
+{
+  Log(QStringLiteral("local proxy command that does not exit"));
+  QString Nc = QStandardPaths::findExecutable(QStringLiteral("nc"));
+  if (Nc.isEmpty())
+  {
+    Log(QStringLiteral("SKIPPED (no nc)"));
+    return;
+  }
+  Data.ProxyMethod = pmCmd;
+  Data.ProxyLocalhost = true;
+  // what makes nc stay: it keeps waiting for the server, whatever happens to its input
+  Data.ProxyLocalCommand = QStringLiteral("nc %host %port");
+  TestUserInterface UI;
+  QElapsedTimer Timer;
+  {
+    SecureShell Shell(Data, &UI);
+    CHECK(TryOpen(Shell));
+    CHECK(ExecOutput(Shell, QStringLiteral("echo through-nc")).trimmed() == QStringLiteral("through-nc"));
+    Timer.start();
+    Shell.Close();
+  }
+  Log(QStringLiteral("closed in %1 ms").arg(Timer.elapsed()));
+  CHECK(Timer.elapsed() < 5000);
+  // the command that fails at once: an error, not a hang
+  Data.ProxyLocalCommand = QStringLiteral("false");
+  SecureShell Failing(Data, &UI);
+  QString Error;
+  CHECK(!TryOpen(Failing, &Error));
+
+  // a compound command reaches its last part, "exec" would end with the first
+  for (const char * Command : {"sleep 0; nc %host %port", "true && nc %host %port", "NIXSCP_TEST=1 nc %host %port", "(nc %host %port)"})
+  {
+    Data.ProxyLocalCommand = QString::fromLatin1(Command);
+    TestUserInterface CompoundUI;
+    SecureShell Shell(Data, &CompoundUI);
+    QString CompoundError;
+    bool Opened = TryOpen(Shell, &CompoundError);
+    CHECK_MSG(Opened, QString::fromLatin1(Command) + QLatin1Char(' ') + CompoundError);
+    if (!Opened)
+    {
+      continue;
+    }
+    CHECK(ExecOutput(Shell, QStringLiteral("echo compound")).trimmed() == QStringLiteral("compound"));
+    Timer.restart();
+    Shell.Close();
+    CHECK(Timer.elapsed() < 5000);
+  }
+  // and leaves nothing behind when the session closes
+  const char * Marker = "31337.5";
+  Data.ProxyLocalCommand = QStringLiteral("sleep %1 & nc %host %port").arg(QString::fromLatin1(Marker));
+  auto Running = [Marker]()
+  {
+    QProcess List;
+    List.start(QStringLiteral("ps"), {QStringLiteral("-A"), QStringLiteral("-ww"), QStringLiteral("-o"), QStringLiteral("args=")});
+    return List.waitForFinished(10000) && List.readAllStandardOutput().contains(Marker);
+  };
+  {
+    TestUserInterface GroupUI;
+    SecureShell Shell(Data, &GroupUI);
+    CHECK(TryOpen(Shell));
+    CHECK(Running());
+    Shell.Close();
+  }
+  CHECK(!Running());
+}
+
+// B18, M14: the tunnel goes through the proxy of the session and uses the
+// algorithms of the session; its key may be given with a passphrase
+static void TestTunnel(SessionData Data, const QString & PassKey, const QString & Passphrase)
+{
+  Log(QStringLiteral("tunnel through a proxy, TunnelPassphrase"));
+  QByteArray TargetHost = Data.HostName.toUtf8();
+  Data.Tunnel = true;
+  Data.TunnelHostName = Data.HostName;
+  Data.TunnelPortNumber = Data.PortNumber;
+  Data.TunnelUserName = Data.UserName;
+  Data.TunnelPublicKeyFile = PassKey.isEmpty() ? Data.PublicKeyFile : PassKey;
+  Data.TunnelPassphrase = Passphrase;
+  Data.TunnelHostKey = QStringLiteral("*");
+  Data.HostKey = QStringLiteral("*");
+  {
+    TestProxy Proxy(TestProxy::Socks5, TargetHost, Data.PortNumber);
+    SessionData D = Data;
+    D.ProxyMethod = pmSocks5;
+    D.ProxyLocalhost = true;
+    D.ProxyHost = QStringLiteral("127.0.0.1");
+    D.ProxyPort = Proxy.Port;
+    TestUserInterface UI;
+    SecureShell Shell(D, &UI);
+    QString Error;
+    CHECK_MSG(TryOpen(Shell, &Error), Error);
+    CHECK(ExecOutput(Shell, QStringLiteral("echo tunneled")).trimmed() == QStringLiteral("tunneled"));
+    CHECK_MSG(Proxy.Relayed == 1, QString::number(Proxy.Relayed.load()));
+    CHECK_MSG(UI.PromptTexts.isEmpty(), UI.PromptTexts.join(QLatin1Char('|')));
+  }
+  {
+    // the passphrase, wrong: asked for
+    if (!PassKey.isEmpty())
+    {
+      SessionData D = Data;
+      D.TunnelPassphrase = QStringLiteral("wrong passphrase");
+      TestUserInterface UI;
+      UI.PromptAnswers = {Passphrase};
+      SecureShell Shell(D, &UI);
+      QString Error;
+      CHECK_MSG(TryOpen(Shell, &Error), Error);
+      CHECK_MSG(UI.PromptTexts.size() == 1, UI.PromptTexts.join(QLatin1Char('|')));
+    }
+  }
+  {
+    // a local proxy command takes the tunnel host too
+    SessionData D = Data;
+    D.ProxyMethod = pmCmd;
+    D.ProxyLocalhost = true;
+    D.ProxyLocalCommand = QStringLiteral("nc %host %port");
+    if (!QStandardPaths::findExecutable(QStringLiteral("nc")).isEmpty())
+    {
+      TestUserInterface UI;
+      SecureShell Shell(D, &UI);
+      QString Error;
+      CHECK_MSG(TryOpen(Shell, &Error), Error);
+      CHECK(ExecOutput(Shell, QStringLiteral("echo tunneled2")).trimmed() == QStringLiteral("tunneled2"));
+    }
+  }
+  {
+    // the algorithms of the session go to the tunnel too: the key exchange
+    // offer of the jump connection, read on its way to the tunnel host
+    int Listen = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in A{};
+    A.sin_family = AF_INET;
+    A.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(::bind(Listen, reinterpret_cast<sockaddr *>(&A), sizeof(A)) == 0);
+    CHECK(::listen(Listen, 1) == 0);
+    socklen_t Len = sizeof(A);
+    getsockname(Listen, reinterpret_cast<sockaddr *>(&A), &Len);
+    QByteArray Offer;
+    std::thread Relay([&]()
+    {
+      int Client = ::accept(Listen, nullptr, nullptr);
+      int Target = (Client >= 0) ? ConnectTo(TargetHost, Data.PortNumber) : -1;
+      if (Target >= 0)
+      {
+        pollfd P[2] = {{Client, POLLIN, 0}, {Target, POLLIN, 0}};
+        char Buffer[4096];
+        bool Open = true;
+        while (Open && (::poll(P, 2, 5000) > 0))
+        {
+          for (int I = 0; Open && (I < 2); I++)
+          {
+            if (P[I].revents != 0)
+            {
+              ssize_t N = ::recv(P[I].fd, Buffer, sizeof(Buffer), 0);
+              Open = (N > 0) && SendAll(P[1 - I].fd, QByteArray(Buffer, N));
+              if (Open && (I == 0) && (Offer.size() < 4096))
+              {
+                Offer.append(Buffer, N);
+              }
+            }
+          }
+        }
+        ::close(Target);
+      }
+      if (Client >= 0)
+      {
+        ::close(Client);
+      }
+    });
+    {
+      SessionData D = Data;
+      D.TunnelHostName = QStringLiteral("127.0.0.1");
+      D.TunnelPortNumber = ntohs(A.sin_port);
+      D.KexList = QStringLiteral("dh-group14-sha1,ecdh,WARN");
+      TestUserInterface UI;
+      SecureShell Shell(D, &UI);
+      QString Error;
+      CHECK_MSG(TryOpen(Shell, &Error), Error);
+      Shell.Close();
+    }
+    Relay.join();
+    ::close(Listen);
+    qsizetype Chosen = Offer.indexOf("diffie-hellman-group14-sha256");
+    qsizetype Default = Offer.indexOf("curve25519-sha256");
+    CHECK_MSG((Chosen >= 0) && ((Default < 0) || (Chosen < Default)), QString::fromLatin1(Offer.left(400).replace('\0', '.')));
+  }
+}
+
+// M13: the fingerprint of a URL, the administrator's policy, -hostkey=acceptnew
+static void TestHostKeyPolicies(SessionData Data, const QString & ScratchPath)
+{
+  Log(QStringLiteral("host key policies"));
+  QString KnownHosts = QDir(ScratchPath).filePath(QStringLiteral("policy_known_hosts"));
+  Data.KnownHostsFile = KnownHosts;
+  TestUserInterface Scan;
+  SecureShell Scanner(Data, &Scan);
+  QString Fingerprint = Scanner.ScanHostKey().SHA256;
+  QString Entry = (Data.PortNumber == 22) ? Data.HostName : QStringLiteral("[%1]:%2").arg(Data.HostName).arg(Data.PortNumber);
+  auto WriteKnownHosts = [&](const char * Key)
+  {
+    QFile File(KnownHosts);
+    CHECK(File.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    File.write(Entry.toUtf8() + " ssh-ed25519 " + Key + "\n");
+  };
+  {
+    // acceptnew stores an unknown key, and asks nobody
+    QFile::remove(KnownHosts);
+    SessionData D = Data;
+    D.HostKey = QStringLiteral("acceptnew");
+    TestUserInterface UI;
+    SecureShell Shell(D, &UI);
+    CHECK(TryOpen(Shell));
+    CHECK(UI.HostKeyCalls == 0);
+    QFile File(KnownHosts);
+    CHECK(File.open(QIODevice::ReadOnly) && !File.readAll().isEmpty());
+  }
+  {
+    // a changed key is no new key
+    WriteKnownHosts("AAAAC3NzaC1lZDI1NTE5AAAAIJ7JYDOxW+0ViCHOQNLEaFcv4UUxbM+AYD+kUYfMdHAh");
+    SessionData D = Data;
+    D.HostKey = QStringLiteral("acceptnew");
+    TestUserInterface UI;
+    UI.HostKeyResponse = UserInterface::HostKeyCancel;
+    SecureShell Shell(D, &UI);
+    CHECK(!TryOpen(Shell));
+    CHECK(UI.HostKeyCalls == 1);
+  }
+  {
+    // ";fingerprint=" of the very key the server has does not silence a
+    // mismatch with the known one, -hostkey does
+    SessionData D = Data;
+    D.HostKey = Fingerprint;
+    D.HostKeyFromUrl = true;
+    TestUserInterface UI;
+    UI.HostKeyResponse = UserInterface::HostKeyCancel;
+    SecureShell Shell(D, &UI);
+    CHECK(!TryOpen(Shell));
+    CHECK(UI.HostKeyCalls == 1);
+    D.HostKeyFromUrl = false;
+    TestUserInterface UI2;
+    SecureShell Shell2(D, &UI2);
+    CHECK(TryOpen(Shell2));
+    CHECK(UI2.HostKeyCalls == 0);
+  }
+  {
+    // with nothing known, it is checked as any configured key
+    QFile::remove(KnownHosts);
+    SessionData D = Data;
+    D.HostKey = QStringLiteral("SHA256:AAAAshZP/98IzuhyeJScnasKJpGTQS8VxhfaqpVwPm8");
+    D.HostKeyFromUrl = true;
+    TestUserInterface UI;
+    SecureShell Shell(D, &UI);
+    QString Error;
+    CHECK(!TryOpen(Shell, &Error));
+    CHECK_MSG(Error.contains(QStringLiteral("does not match")), Error);
+    CHECK(UI.HostKeyCalls == 0);
+    D.HostKey = Fingerprint;
+    SecureShell Shell2(D, &UI);
+    CHECK(TryOpen(Shell2));
+  }
+  {
+    // a URL's key known already connects, whatever the fingerprint says
+    SessionData First = Data;
+    TestUserInterface UI;
+    SecureShell Shell(First, &UI);
+    CHECK(TryOpen(Shell));
+    Shell.Close();
+    SessionData D = Data;
+    D.HostKey = QStringLiteral("SHA256:AAAAshZP/98IzuhyeJScnasKJpGTQS8VxhfaqpVwPm8");
+    D.HostKeyFromUrl = true;
+    TestUserInterface UI2;
+    SecureShell Shell2(D, &UI2);
+    CHECK(TryOpen(Shell2));
+  }
+  // "*" and "acceptnew" of a URL give up nothing, known host or not, in any spelling
+  for (const char * Keys : {"*", " * ", "acceptnew", "AcceptNew", "*;acceptnew", ";*;"})
+  {
+    QFile::remove(KnownHosts);
+    SessionData D = Data;
+    D.HostKey = QString::fromLatin1(Keys);
+    D.HostKeyFromUrl = true;
+    TestUserInterface Unknown;
+    Unknown.HostKeyResponse = UserInterface::HostKeyCancel;
+    {
+      SecureShell Shell(D, &Unknown);
+      CHECK_MSG(!TryOpen(Shell), QString::fromLatin1(Keys));
+    }
+    CHECK(Unknown.HostKeyCalls == 1);
+    CHECK(Unknown.LastHostKeyState == UserInterface::HostKeyUnknown);
+    CHECK_MSG(!QFile::exists(KnownHosts) || (QFileInfo(KnownHosts).size() == 0), QString::fromLatin1(Keys));
+    CHECK(Unknown.Informations.isEmpty());
+    WriteKnownHosts("AAAAC3NzaC1lZDI1NTE5AAAAIJ7JYDOxW+0ViCHOQNLEaFcv4UUxbM+AYD+kUYfMdHAh");
+    TestUserInterface Changed;
+    Changed.HostKeyResponse = UserInterface::HostKeyCancel;
+    {
+      SecureShell Shell(D, &Changed);
+      CHECK_MSG(!TryOpen(Shell), QString::fromLatin1(Keys));
+    }
+    CHECK(Changed.HostKeyCalls == 1);
+    CHECK(Changed.LastHostKeyState == UserInterface::HostKeyChanged);
+  }
+  {
+    // in a list too: the real fingerprint is what is left of it
+    QFile::remove(KnownHosts);
+    SessionData D = Data;
+    D.HostKey = QStringLiteral("SHA256:AAAAshZP/98IzuhyeJScnasKJpGTQS8VxhfaqpVwPm8;*");
+    D.HostKeyFromUrl = true;
+    TestUserInterface UI;
+    SecureShell Shell(D, &UI);
+    QString Error;
+    CHECK(!TryOpen(Shell, &Error));
+    CHECK_MSG(Error.contains(QStringLiteral("does not match")), Error);
+    CHECK(UI.HostKeyCalls == 0);
+  }
+  {
+    // a switch or a site says what it means: "*" with a changed key connects
+    WriteKnownHosts("AAAAC3NzaC1lZDI1NTE5AAAAIJ7JYDOxW+0ViCHOQNLEaFcv4UUxbM+AYD+kUYfMdHAh");
+    SessionData D = Data;
+    D.HostKey = QStringLiteral("*");
+    TestUserInterface UI;
+    SecureShell Shell(D, &UI);
+    CHECK(TryOpen(Shell));
+    CHECK(UI.HostKeyCalls == 0);
+  }
+  {
+    // the jump host: the same, through TunnelHostKey
+    WriteKnownHosts("AAAAC3NzaC1lZDI1NTE5AAAAIJ7JYDOxW+0ViCHOQNLEaFcv4UUxbM+AYD+kUYfMdHAh");
+    SessionData D = Data;
+    D.HostKey = Fingerprint;
+    D.Tunnel = true;
+    D.TunnelHostName = Data.HostName;
+    D.TunnelPortNumber = Data.PortNumber;
+    D.TunnelUserName = Data.UserName;
+    D.TunnelPublicKeyFile = Data.PublicKeyFile;
+    for (const QString & Keys : {QStringLiteral("*"), Fingerprint})
+    {
+      D.TunnelHostKey = Keys;
+      D.TunnelHostKeyFromUrl = true;
+      TestUserInterface UI;
+      UI.HostKeyResponse = UserInterface::HostKeyCancel;
+      SecureShell Shell(D, &UI);
+      CHECK_MSG(!TryOpen(Shell), Keys);
+      CHECK_MSG(UI.HostKeyCalls == 1, Keys);
+      CHECK(UI.LastHostKeyState == UserInterface::HostKeyChanged);
+    }
+    D.TunnelHostKey = QStringLiteral("*");
+    D.TunnelHostKeyFromUrl = false;
+    TestUserInterface UI;
+    SecureShell Shell(D, &UI);
+    QString Error;
+    CHECK_MSG(TryOpen(Shell, &Error), Error);
+    CHECK(UI.HostKeyCalls == 0);
+  }
+  {
+    // ANY_HOSTKEY reaches the user in every front end
+    SessionData D = Data;
+    D.HostKey = QStringLiteral("*");
+    TestUserInterface UI;
+    SecureShell Shell(D, &UI);
+    CHECK(TryOpen(Shell));
+    CHECK_MSG(UI.Informations.contains(QStringLiteral("WARNING! Giving up security and accepting any host key as configured!")), UI.Informations.join(QLatin1Char('|')));
+  }
+}
+
+// D-05: "When SFTP connection is rejected, knock FTP port"
+static void TestTryFtp(const QString & Host)
+{
+  Log(QStringLiteral("FTP suggestion"));
+  // Needs port 22 closed and 21 open on the host, which a test cannot have
+  // here: what it can check is that other sites do not knock at all
+  SessionData Data;
+  Data.HostName = Host;
+  Data.PortNumber = 1;
+  Data.FSProtocol = fsSFTPonly;
+  Data.TryAgent = false;
+  Data.Timeout = 3;
+  TestUserInterface UI;
+  SecureShell Shell(Data, &UI);
+  QString Error;
+  CHECK(!TryOpen(Shell, &Error));
+  CHECK_MSG(!Error.contains(QStringLiteral("listens for FTP")), Error);
+}
+
+// D-03: a stalled session is given up after SessionReopenAutoStall
+static void TestStall(SessionData Data)
+{
+  Log(QStringLiteral("stalled session"));
+  Data.Timeout = 1;
+  Configuration::Instance().SessionReopenAutoStall = 12345;
+  TestUserInterface UI;
+  UI.QueryAnswers = {qaAbort};
+  SecureShell Shell(Data, &UI);
+  CHECK(TryOpen(Shell));
+  bool Fatal = false;
+  SshChannel Channel(Shell);
+  Channel.OpenExec(QStringLiteral("sleep 30"));
+  try
+  {
+    Channel.ReceiveLine();
+  }
+  catch (const FatalException & E)
+  {
+    Fatal = true;
+    CHECK_MSG(E.MoreMessages().contains(QStringLiteral("not communicating")), E.MoreMessages());
+  }
+  CHECK(Fatal);
+  CHECK(UI.Queries.size() == 1);
+  CHECK(UI.LastQueryTimeout == 12345);
+  CHECK(UI.LastQueryTimeoutAnswer == qaAbort);
+  Configuration::Instance().SessionReopenAutoStall = 0;
+  Channel.Close();
+  Shell.Close();
+  TestUserInterface UI2;
+  UI2.QueryAnswers = {qaAbort};
+  SecureShell Shell2(Data, &UI2);
+  CHECK(TryOpen(Shell2));
+  SshChannel Channel2(Shell2);
+  Channel2.OpenExec(QStringLiteral("sleep 30"));
+  try
+  {
+    Channel2.ReceiveLine();
+  }
+  catch (const FatalException &)
+  {
+  }
+  CHECK(UI2.LastQueryTimeout == 0);
+}
+
+// L14: without a key file, only the keys of the agent are offered
+// L14: libssh looks in the home directory of the passwd entry, so the key is
+// put in place with bwrap, in a child process, as for TestSshConfigNotRead
+static void TestDefaultKeys(const SessionData & Data, const QString & ScratchPath)
+{
+  Log(QStringLiteral("no default keys"));
+  QString Bwrap = QStandardPaths::findExecutable(QStringLiteral("bwrap"));
+  struct passwd * Pw = getpwuid(getuid());
+  if (Bwrap.isEmpty() || (Pw == nullptr) || !QFileInfo::exists(QFile::decodeName(Pw->pw_dir) + QStringLiteral("/.ssh")))
+  {
+    Log(QStringLiteral("SKIPPED (no bwrap, or no ~/.ssh to bind over)"));
+    return;
+  }
+  QString Dir = QDir(ScratchPath).filePath(QStringLiteral("dotssh-keys"));
+  QDir().mkpath(Dir);
+  // the key would log in; it must not be touched
+  CHECK(QFile::copy(Data.PublicKeyFile, Dir + QStringLiteral("/id_ed25519")));
+  QFile::setPermissions(Dir + QStringLiteral("/id_ed25519"), QFile::ReadOwner | QFile::WriteOwner);
+  QProcess Probe;
+  Probe.setProcessChannelMode(QProcess::MergedChannels);
+  QProcessEnvironment Env = QProcessEnvironment::systemEnvironment();
+  Env.insert(QStringLiteral("NIXSCP_TEST_CONFIG_PROBE"), QStringLiteral("keys"));
+  Env.remove(QStringLiteral("SSH_AUTH_SOCK"));
+  Probe.setProcessEnvironment(Env);
+  Probe.start(Bwrap, {QStringLiteral("--dev-bind"), QStringLiteral("/"), QStringLiteral("/"), QStringLiteral("--bind"), Dir,
+    QFile::decodeName(Pw->pw_dir) + QStringLiteral("/.ssh"), QCoreApplication::applicationFilePath()});
+  CHECK(Probe.waitForFinished(60000));
+  QString Output = QString::fromUtf8(Probe.readAll());
+  Log(Output.trimmed());
+  CHECK_MSG(Probe.exitCode() == 0, Output);
+}
+
+// L14: the password prompt that follows is not left without a reason
+static void TestDefaultKeysLogged(SessionData Data, const QString & ScratchPath)
+{
+  Log(QStringLiteral("default keys not tried: logged"));
+  QString Home = QDir(ScratchPath).filePath(QStringLiteral("logged-home"));
+  QDir().mkpath(Home + QStringLiteral("/.ssh"));
+  QByteArray OldHome = qgetenv("HOME");
+  qputenv("HOME", Home.toUtf8());
+  QString LogFile = QDir(ScratchPath).filePath(QStringLiteral("default-keys.log"));
+  SessionLogOptions Options;
+  Options.Logging = true;
+  Options.FileName = LogFile;
+  Data.PublicKeyFile.clear();
+  Data.TryAgent = false;
+  Data.HostKey = QStringLiteral("*");
+  auto Attempt = [&]()
+  {
+    QFile::remove(LogFile);
+    auto SessionLogger = std::make_shared<SessionLog>(Options);
+    SessionLog::SetCurrent(SessionLogger);
+    TestUserInterface UI;
+    SecureShell Shell(Data, &UI);
+    CHECK(!TryOpen(Shell));
+    SessionLog::SetCurrent(nullptr);
+    SessionLogger.reset();
+    QFile File(LogFile);
+    (void)File.open(QIODevice::ReadOnly);
+    return QString::fromUtf8(File.readAll());
+  };
+  // no such key: nothing to explain
+  QString Content = Attempt();
+  CHECK_MSG(!Content.contains(QStringLiteral("default keys")), Content);
+  QFile Key(Home + QStringLiteral("/.ssh/id_ed25519"));
+  CHECK(Key.open(QIODevice::WriteOnly));
+  Key.close();
+  Content = Attempt();
+  CHECK_MSG(Content.contains(QStringLiteral("default keys of OpenSSH are not offered")) && Content.contains(QStringLiteral("id_ed25519")), Content);
+  qputenv("HOME", OldHome);
 }
 
 static void TestLogicalHostName(SessionData Data, const QString & ScratchPath)
@@ -979,6 +1573,26 @@ int main(int argc, char ** argv)
   QTemporaryDir Scratch;
   CHECK(Scratch.isValid());
 
+  if (qEnvironmentVariableIsSet("NIXSCP_TEST_CONFIG_PROBE"))
+  {
+    SessionData Probe = BaseData(QString(), qEnvironmentVariableIntValue("NIXSCP_TEST_SSH_PORT"),
+      qEnvironmentVariable("NIXSCP_TEST_SSH_USER", qEnvironmentVariable("USER")), qEnvironmentVariable("NIXSCP_TEST_SSH_KEY"),
+      Scratch.filePath(QStringLiteral("known_hosts")));
+    Probe.HostKey = QStringLiteral("*");
+    Probe.Timeout = 5;
+    if (qEnvironmentVariable("NIXSCP_TEST_CONFIG_PROBE") == QStringLiteral("keys"))
+    {
+      Probe.HostName = qEnvironmentVariable("NIXSCP_TEST_SSH_HOST", QStringLiteral("127.0.0.1"));
+      Probe.PublicKeyFile.clear();
+      Probe.TryAgent = true;
+    }
+    else
+    {
+      Probe.HostName = QStringLiteral("cfgalias.test");
+    }
+    return ConfigProbe(Probe);
+  }
+
   TestOffline(Scratch.path());
 
   QByteArray PortStr = qgetenv("NIXSCP_TEST_SSH_PORT");
@@ -1005,6 +1619,14 @@ int main(int argc, char ** argv)
     TestWeakAlgorithms(Data);
     TestLogicalHostName(Data, Scratch.path());
     TestProxies(Data);
+    TestSshConfigNotRead(Scratch.path(), PortStr.toInt());
+    TestProxyCommandExit(Data);
+    TestTunnel(Data, qEnvironmentVariable("NIXSCP_TEST_SSH_PASSKEY"), qEnvironmentVariable("NIXSCP_TEST_SSH_PASSPHRASE"));
+    TestHostKeyPolicies(Data, Scratch.path());
+    TestTryFtp(Host);
+    TestStall(Data);
+    TestDefaultKeys(Data, Scratch.path());
+    TestDefaultKeysLogged(Data, Scratch.path());
     TestAgent(Data, KeyFile, WrongKey, Scratch.path());
 
     QByteArray CaPort = qgetenv("NIXSCP_TEST_SSH_CA_PORT");

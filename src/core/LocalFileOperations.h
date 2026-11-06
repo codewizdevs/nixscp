@@ -35,21 +35,24 @@ struct LocalOperationResult
   bool Aborted = false;       // cancelled by the user (or Abort answer)
   QString Message;            // the error that ended the operation
   QString MoreMessages;
-  int Processed = 0;          // top level items copied/moved
+  int Processed = 0;          // top level items copied/moved/deleted
   int Skipped = 0;            // files/directories skipped (No / Skip answers)
-  QStringList Targets;        // full target paths of the processed top level items
+  QStringList Targets;        // full target paths of the processed top level items (opDelete: the deleted ones)
 };
 
 class LocalFileOperations
 {
 public:
-  enum Operation { opCopy, opMove };
+  enum Operation { opCopy, opMove, opDelete };
 
   struct Params
   {
     Operation Op = opCopy;
     QStringList Sources;            // absolute local paths
-    QString TargetDirectory;        // existing local directory
+    QString TargetDirectory;        // existing local directory (not of opDelete)
+    // opDelete: to the desktop trash, offering to delete permanently what
+    // cannot go there, as the Windows shell does for drives without a Recycle Bin
+    bool ToTrash = false;
     // Single source only: name of the copy (empty = the source name)
     QString NewName;
     // Copy onto itself (paste into the same directory): create "name (copy).ext"

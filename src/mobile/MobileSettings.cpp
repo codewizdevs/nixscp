@@ -14,8 +14,11 @@ MobileSettings::MobileSettings(QObject * Parent) :
 
 void MobileSettings::ApplyToConfiguration()
 {
-  // the transfer confirmations live in the configuration's copy settings
-  Configuration::Instance().DefaultCopyParam().ConfirmOverwriting = confirmOverwrite();
+  // the transfer confirmations live in the configuration's copy settings;
+  // a cloud pull brings another device's, the phone's stay over them
+  Configuration & Config = Configuration::Instance();
+  Config.DefaultCopyParam().ConfirmOverwriting = confirmOverwrite();
+  connect(&Config, &Configuration::Changed, this, &MobileSettings::ApplyToConfiguration, Qt::UniqueConnection);
 }
 
 int MobileSettings::Int(const QString & Key, int Default) const
@@ -52,7 +55,7 @@ void MobileSettings::setConfirmOverwrite(bool Value)
 
 QStringList MobileSettings::recentFolders(const QString & Site) const
 {
-  return FSettings.value(QStringLiteral("RecentFolders/") + QString::fromLatin1(Site.toUtf8().toBase64(QByteArray::Base64UrlEncoding))).toStringList();
+  return FPrivate.Strings(QStringLiteral("folders/") + Site);
 }
 
 void MobileSettings::addRecentFolder(const QString & Site, const QString & Folder)
@@ -61,9 +64,8 @@ void MobileSettings::addRecentFolder(const QString & Site, const QString & Folde
   {
     return;
   }
-  // the site's name as a key (it may hold '/' and spaces)
-  QString Key = QStringLiteral("RecentFolders/") + QString::fromLatin1(Site.toUtf8().toBase64(QByteArray::Base64UrlEncoding));
-  QStringList List = FSettings.value(Key).toStringList();
+  QString Key = QStringLiteral("folders/") + Site;
+  QStringList List = FPrivate.Strings(Key);
   if (!List.isEmpty() && (List.first() == Folder))
   {
     return;
@@ -74,33 +76,17 @@ void MobileSettings::addRecentFolder(const QString & Site, const QString & Folde
   {
     List.removeLast();
   }
-  FSettings.setValue(Key, List);
-}
-
-namespace
-{
-QString SiteKeyName(const QString & Site)
-{
-  return QStringLiteral("SiteKeys/") + QString::fromLatin1(Site.toUtf8().toBase64(QByteArray::Base64UrlEncoding));
-}
+  FPrivate.SetStrings(Key, List);
 }
 
 QString MobileSettings::siteKey(const QString & Site) const
 {
-  return FSettings.value(SiteKeyName(Site)).toString();
+  return FPrivate.Strings(QStringLiteral("key/") + Site).value(0);
 }
 
 void MobileSettings::setSiteKey(const QString & Site, const QString & KeyName)
 {
-  if (KeyName.isEmpty())
-  {
-    FSettings.remove(SiteKeyName(Site));
-  }
-  else
-  {
-    FSettings.setValue(SiteKeyName(Site), KeyName);
-  }
-  FSettings.sync();
+  FPrivate.SetStrings(QStringLiteral("key/") + Site, KeyName.isEmpty() ? QStringList() : QStringList{KeyName});
 }
 
 void MobileSettings::Apply(SessionData & Data) const

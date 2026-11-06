@@ -275,7 +275,12 @@ static QProcessEnvironment CliEnvironment()
   QProcessEnvironment Env = QProcessEnvironment::systemEnvironment();
   Env.insert(QStringLiteral("XDG_CONFIG_HOME"), ScratchDir + QStringLiteral("/xdg"));
   Env.insert(QStringLiteral("NIXSCP_KNOWN_HOSTS"), ScratchDir + QStringLiteral("/known_hosts"));
+#ifdef Q_OS_MACOS
+  // no C.UTF-8 there, and Qt says so on stderr
+  Env.insert(QStringLiteral("LC_ALL"), QStringLiteral("en_US.UTF-8"));
+#else
   Env.insert(QStringLiteral("LC_ALL"), QStringLiteral("C.UTF-8"));
+#endif
   Env.remove(QStringLiteral("SSH_AUTH_SOCK"));
   return Env;
 }

@@ -1,7 +1,10 @@
 #include "mobile/AndroidFiles.h"
+#include "mobile/PrivateState.h"
+#include "mobile/TextFile.h"
 
 #include <QDesktopServices>
 #include <QDir>
+#include <QDirIterator>
 #include <QStandardPaths>
 #include <QFile>
 #include <QFileInfo>
@@ -107,20 +110,30 @@ bool AndroidFiles::open(const QString & Path)
 #endif
 }
 
-void AndroidFiles::keepAlive(bool Busy, const QString & Text, int Percent)
+void AndroidFiles::keepAlive(bool Busy, const QString & Text, int Percent, const QString & Who)
 {
-#ifdef Q_OS_ANDROID
-  QJniObject Ctx = Context();
   if (Busy)
   {
+    FKeepers.insert(Who, Keeper{Text, Percent});
+  }
+  else
+  {
+    FKeepers.remove(Who);
+  }
+#ifdef Q_OS_ANDROID
+  QJniObject Ctx = Context();
+  if (!FKeepers.isEmpty())
+  {
+    // the transfers' progress before anything else
+    const Keeper Shown = FKeepers.value(QStringLiteral("transfers"), FKeepers.first());
     // the notification at most about once a second (a new text at once)
     qint64 Now = QDateTime::currentMSecsSinceEpoch();
-    if (FKeptAlive && (Text == FLastText) && ((Percent == FLastPercent) || (Now - FLastUpdate < 1000)))
+    if (FKeptAlive && (Shown.Text == FLastText) && ((Shown.Percent == FLastPercent) || (Now - FLastUpdate < 1000)))
     {
       return;
     }
-    FLastText = Text;
-    FLastPercent = Percent;
+    FLastText = Shown.Text;
+    FLastPercent = Shown.Percent;
     FLastUpdate = Now;
     if (!FAskedNotifications && (QNativeInterface::QAndroidApplication::sdkVersion() >= 33))
     {
@@ -134,8 +147,8 @@ void AndroidFiles::keepAlive(bool Busy, const QString & Text, int Percent)
       Env.checkAndClearExceptions();
     }
     QJniObject::callStaticMethod<void>("com/nixscp/android/TransferService", "start",
-      "(Landroid/content/Context;Ljava/lang/String;I)V", Ctx.object(), QJniObject::fromString(Text).object<jstring>(),
-      jint(Percent));
+      "(Landroid/content/Context;Ljava/lang/String;I)V", Ctx.object(), QJniObject::fromString(Shown.Text).object<jstring>(),
+      jint(Shown.Percent));
     FKeptAlive = true;
   }
   else if (FKeptAlive)
@@ -148,11 +161,25 @@ void AndroidFiles::keepAlive(bool Busy, const QString & Text, int Percent)
   }
   QJniEnvironment Env;
   Env.checkAndClearExceptions();
-#else
-  Q_UNUSED(Busy);
-  Q_UNUSED(Text);
-  Q_UNUSED(Percent);
 #endif
+}
+
+QList<QPair<QString, QString>> AndroidFiles::FilesToPublish(const QString & Path)
+{
+  QFileInfo Info(Path);
+  if (!Info.isDir())
+  {
+    return {{Path, QString()}};
+  }
+  QList<QPair<QString, QString>> Result;
+  QDir Parent = Info.dir();
+  QDirIterator It(Path, QDir::Files | QDir::Hidden | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+  while (It.hasNext())
+  {
+    It.next();
+    Result.append({It.filePath(), Parent.relativeFilePath(It.fileInfo().absolutePath())});
+  }
+  return Result;
 }
 
 QStringList AndroidFiles::publish(const QStringList & Paths)
@@ -162,15 +189,36 @@ QStringList AndroidFiles::publish(const QStringList & Paths)
   QJniObject Ctx = Context();
   for (const QString & Path : Paths)
   {
-    QJniObject Where = QJniObject::callStaticObjectMethod("com/nixscp/android/PublicDownloads", "save",
-      "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", Ctx.object(),
-      QJniObject::fromString(Path).object<jstring>(), QJniObject::fromString(MimeType(Path)).object<jstring>());
-    QJniEnvironment Env;
-    Env.checkAndClearExceptions();
-    QString Place = Where.isValid() ? Where.toString() : QString();
-    if (!Place.isEmpty())
+    // a folder goes file by file (MediaStore has no folders of its own)
+    QString Place;
+    bool All = true;
+    const QList<QPair<QString, QString>> Files = FilesToPublish(Path);
+    for (const auto & [File, Folder] : Files)
     {
-      QFile::remove(Path);   // not kept twice
+      QJniObject Where = QJniObject::callStaticObjectMethod("com/nixscp/android/PublicDownloads", "save",
+        "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", Ctx.object(),
+        QJniObject::fromString(File).object<jstring>(), QJniObject::fromString(MimeType(File)).object<jstring>(),
+        QJniObject::fromString(Folder).object<jstring>());
+      QJniEnvironment Env;
+      Env.checkAndClearExceptions();
+      QString Saved = Where.isValid() ? Where.toString() : QString();
+      if (Saved.isEmpty())
+      {
+        All = false;
+      }
+      else
+      {
+        QFile::remove(File);   // not kept twice
+        Place = Saved;
+      }
+    }
+    if (QFileInfo(Path).isDir())
+    {
+      if (All)
+      {
+        QDir(Path).removeRecursively();
+      }
+      Place = All ? (QStringLiteral("Download/NixSCP/") + QFileInfo(Path).fileName()) : QString();
     }
     Result.append(Place);
   }
@@ -178,6 +226,48 @@ QStringList AndroidFiles::publish(const QStringList & Paths)
   Result = Paths;
 #endif
   return Result;
+}
+
+QString AndroidFiles::saveCopy(const QString & Name, const QString & Text, const QString & Encoding)
+{
+  QByteArray Data;
+  if (!TextFile::Encode(Text, Encoding, Data) && !TextFile::Encode(Text, QLatin1String(TextFile::Utf8), Data))
+  {
+    return QString();
+  }
+  // session 0: nobody's, gone at the next start at the latest
+  QString Folder = MobileCache::Folder(QStringLiteral("edit"), 0) + QStringLiteral("/copy");
+  QDir().mkpath(Folder);
+  QString Path = Folder + QLatin1Char('/') + Name;
+  QFile File(Path);
+  if (!File.open(QIODevice::WriteOnly) || (File.write(Data) != Data.size()) || !File.flush())
+  {
+    File.remove();
+    return QString();
+  }
+  File.close();
+  QString Place = publish({Path}).value(0);
+#ifdef Q_OS_ANDROID
+  QFile::remove(Path);
+#endif
+  return Place;
+}
+
+void AndroidFiles::SecureWindow()
+{
+#ifdef Q_OS_ANDROID
+  QNativeInterface::QAndroidApplication::runOnAndroidMainThread([]()
+  {
+    const jint FlagSecure = 0x00002000;   // WindowManager.LayoutParams.FLAG_SECURE
+    QJniEnvironment Env;
+    QJniObject Window = Context().callObjectMethod("getWindow", "()Landroid/view/Window;");
+    if (Window.isValid())
+    {
+      Window.callMethod<void>("setFlags", "(II)V", FlagSecure, FlagSecure);
+    }
+    Env.checkAndClearExceptions();
+  });
+#endif
 }
 
 bool AndroidFiles::edit(const QString & Path, const QString & Package)

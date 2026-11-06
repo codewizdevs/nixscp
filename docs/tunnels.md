@@ -6,15 +6,15 @@ SSH connection to a host and port as seen from the server, like `ssh -L`. Typica
 panel or other service that only listens on the server (or on its private network).
 
 Free; no NixSCP Pro account needed. WinSCP has no equivalent (its own "tunnel" setting is a jump host for the
-connection itself, which NixSCP supports too, under Advanced > Connection > Tunnel).
+connection itself, which NixSCP supports too, under Advanced > Connection > Tunnel, for SFTP and SCP sites only).
 
 ## Adding a tunnel
 
-1. Save the SFTP or SCP site first; tunnels go through its SSH connection.
+1. Save the SFTP or SCP site first; tunnels go through its SSH connection, so FTP, WebDAV and S3 sites have none.
 2. Open **Tunnels > Manage Tunnels...** and click **Add...**.
 3. Fill in:
    - **Site**: the saved site to tunnel through.
-   - **Name**: a name for the tunnel, unique within the site (e.g. `postgres`).
+   - **Name**: a name for the tunnel, unique within the site (e.g. `postgres`). It may contain any character.
    - **Local port (127.0.0.1)**: the port on this computer, 1024 to 65535.
    - **Forward to host** and **Forward to port**: the target as seen from the server. `localhost` is the server
      itself; a private address or name reaches another machine the server can reach.
@@ -28,7 +28,8 @@ Example: Local port `5433`, host `localhost`, port `5432` makes the server's Pos
 ## Starting and stopping
 
 Select a tunnel and click **Start**. NixSCP opens a separate SSH connection for it (with the site's stored
-credentials and its usual host key check and prompts) and starts listening. The **Status** column shows
+credentials, its proxy and algorithm settings, and its usual host key check and prompts) and starts listening. The
+**Status** column shows
 `Connecting...`, `Running`, `Stopped` or `Failed: <reason>`, and **Connections** shows how many connections are
 open through it. **Stop** closes it.
 
@@ -42,15 +43,19 @@ open through it. **Stop** closes it.
 - If the server refuses to forward a connection (for example `AllowTcpForwarding no` in its `sshd_config`, or nothing
   listens on the target), the tunnel stays up and the status shows the reason, e.g.
   `Running; The server refused to forward the connection to localhost:5432: ...`.
-- If the SSH connection breaks, the tunnel stops and shows the error.
+- If the SSH connection breaks, the tunnel stops and shows the error. An idle tunnel notices this too: it sends a
+  keepalive at the site's keepalive interval (every 30 seconds if the site has none) and stops if the server does not
+  answer within the site's timeout.
+- A connection stays usable in one direction when the other side has finished sending (half-close), so a client can
+  end its request and still read the answer.
 - A local port that is already in use fails with `Cannot listen on 127.0.0.1:<port>`.
 
 ## Where tunnels are stored
 
 Tunnels are part of the site, in the `PortForwards` value of the site in `nixscp.ini` (one line per tunnel:
-`name|local port|host|port`). So they are included in exports, [cloud sync](cloud-sync.md) and, for team sites,
-shared with the [team](teams.md). WinSCP does not know this value. Tunnels cannot be set through a session URL or
-`/rawconfig`.
+`name|local port|host|port`, with `%`, `|` and line breaks in a field escaped). So they are included in exports and
+[cloud sync](cloud-sync.md). They are **not** shared with a [team](teams.md): tunnels of a team site stay on your
+computer. WinSCP does not know this value. Tunnels cannot be set through a session URL or `/rawconfig`.
 
 ## Tunnels for agents
 

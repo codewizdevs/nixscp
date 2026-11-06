@@ -4,6 +4,8 @@
 #include "mobile/MobileSettings.h"
 #include "mobile/MobileUserInterface.h"
 #include "mobile/MobileQueue.h"
+#include "mobile/PrivateState.h"
+#include "mobile/TextFile.h"
 
 #include "core/Bookmarks.h"
 #include "core/FileFind.h"
@@ -11,16 +13,21 @@
 #include "core/Configuration.h"
 #include "core/SessionData.h"
 
+#include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QDirIterator>
+#include <QThread>
 #include <QTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QLocale>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QUrl>
 #include <QtCore/private/qzipwriter_p.h>
+
+#include <atomic>
 
 namespace
 {
@@ -52,11 +59,16 @@ QString DataSize(qint64 Bytes)
 {
   return QLocale().formattedDataSize(Bytes, 1, QLocale::DataSizeTraditionalFormat);
 }
+
+int NextCacheId = 0;
+std::atomic<int> ClosingConnections{0};
+// QZipWriter holds a file in memory while it adds it
+const qint64 MaxZippedFile = 256 * 1024 * 1024;
 }
 
 //---------------------------------------------------------------------------
 RemoteSession::RemoteSession(MobileUserInterface * UI, MobileSettings * Settings, MobileQueue * Queue, QObject * Parent) :
-  QObject(Parent), FUI(UI), FSettings(Settings), FQueue(Queue)
+  QObject(Parent), FUI(UI), FSettings(Settings), FQueue(Queue), FCacheId(++NextCacheId)
 {
   FProgressTimer.setInterval(250);
   connect(&FProgressTimer, &QTimer::timeout, this, &RemoteSession::UpdateProgress);
@@ -74,6 +86,21 @@ RemoteSession::RemoteSession(MobileUserInterface * UI, MobileSettings * Settings
       if ((Id == FBackItem) && (FBack != nullptr))
       {
         FBack->Progress().Cancel();
+      }
+    });
+    // a file came into the folder shown here (from any tab)
+    connect(FQueue, &MobileQueue::uploadEnded, this, [this](const QString & Directory)
+    {
+      if (connected() && (Directory == FDirectory))
+      {
+        if (FBusy)
+        {
+          FStale = true;
+        }
+        else
+        {
+          refresh();
+        }
       }
     });
   }
@@ -127,6 +154,19 @@ void RemoteSession::SetBusy(bool Busy, const QString & Status)
     emit statusChanged();
   }
   emit stateChanged();
+  if (!Busy)
+  {
+    // what waited for the connection
+    if (std::any_of(FEdits.cbegin(), FEdits.cend(), [](const Edit & E) { return E.HasUnsent && !E.Failed; }))
+    {
+      QTimer::singleShot(0, this, &RemoteSession::SendEdits);
+    }
+    if (FStale && connected())
+    {
+      FStale = false;
+      QTimer::singleShot(0, this, &RemoteSession::refresh);
+    }
+  }
 }
 
 bool RemoteSession::Failed(const OperationResult & Result)
@@ -135,7 +175,8 @@ bool RemoteSession::Failed(const OperationResult & Result)
   {
     return false;
   }
-  if (!Result.Aborted)
+  // after close(): what was running ends, nobody is waiting for it
+  if (!Result.Aborted && (FTerminal != nullptr))
   {
     emit error(Result.Message, Result.MoreMessages);
   }
@@ -229,8 +270,11 @@ void RemoteSession::open(const QString & SiteName)
   if (Data == nullptr)
   {
     emit error(QStringLiteral("The site \"%1\" no longer exists.").arg(SiteName), QString());
+    // a shortcut of a deleted site: no tab remains for it
+    emit closed();
     return;
   }
+  FAsker = FUI->NewAsker();
   FSite = SiteName;
   FData = *Data;
   SessionData Open = *Data;
@@ -242,23 +286,15 @@ void RemoteSession::open(const QString & SiteName)
   QDir().mkpath(SshDir);
   QFile::setPermissions(SshDir, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
   Open.KnownHostsFile = SshDir + QStringLiteral("/known_hosts");
-  // the key: this phone's choice (decrypted while the session lasts); a key
-  // file of another device does not exist here
+  // the key: this phone's choice (the core opens an encrypted key in memory);
+  // a key that was deleted, or a key file of another device, does not exist
+  // here: the password is asked for instead
   QString KeyName = FSettings->siteKey(SiteName);
-  QString KeyPath = !KeyName.isEmpty() ? (KeyStore::Folder() + QLatin1Char('/') + KeyName)
-    : (Open.PublicKeyFile.startsWith(KeyStore::Folder() + QLatin1Char('/')) ? Open.PublicKeyFile : QString());
-  if (!KeyPath.isEmpty())
-  {
-    QString Plain = KeyStore::PlainKeyFile(KeyPath);
-    Open.PublicKeyFile = Plain;
-    FTemporaryKey = (Plain != KeyPath) ? Plain : QString();
-  }
-  else if (!Open.PublicKeyFile.isEmpty() && !QFileInfo::exists(Open.PublicKeyFile))
-  {
-    Open.PublicKeyFile.clear();
-  }
+  QString KeyPath = !KeyName.isEmpty() ? (KeyStore::Folder() + QLatin1Char('/') + KeyName) : Open.PublicKeyFile;
+  Open.PublicKeyFile = QFileInfo::exists(KeyPath) ? KeyPath : QString();
   FOpenData = Open;
-  Terminal * Term = new Terminal(Open, FUI, this);
+  Terminal * Term = new Terminal(Open, FAsker.get(), this);
+  KeepAsker(Term);
   FTerminal = Term;
   connect(Term, &Terminal::Disconnected, this, [this, Term](const QString & Message, const QString & More)
   {
@@ -283,24 +319,84 @@ void RemoteSession::open(const QString & SiteName)
       close();
       return;
     }
+    // what a new host's key added to known_hosts: the name no longer readable
+    KeyStore::HashKnownHosts(FOpenData.KnownHostsFile);
     emit established();
     Load(FTerminal->CurrentDirectory());
   });
 }
 
+void RemoteSession::KeepAsker(QObject * Connection)
+{
+  connect(Connection, &QObject::destroyed, [Asker = FAsker]() {});
+}
+
+void RemoteSession::Dispose(Terminal * Term)
+{
+  // on its own: this session (its parent) may be gone first at the app's end
+  disconnect(Term, nullptr, this, nullptr);
+  Term->setParent(nullptr);
+  Term->Close();
+  ClosingConnections++;
+  connect(Term, &QObject::destroyed, []() { ClosingConnections--; });
+  FClosing++;
+  connect(Term, &QObject::destroyed, this, [this]()
+  {
+    if (--FClosing == 0)
+    {
+      // what the worker was still writing
+      MobileCache::RemoveSession(FCacheId);
+      if (FDeleteClosed)
+      {
+        deleteLater();
+      }
+    }
+  });
+  // ~Terminal waits for its worker with touches held back: only when the
+  // worker is idle, so that a server that does not answer freezes nothing
+  if (Term->Busy())
+  {
+    connect(Term, &Terminal::BusyChanged, Term, [Term](bool Busy)
+    {
+      if (!Busy)
+      {
+        Term->deleteLater();
+      }
+    });
+  }
+  else
+  {
+    Term->deleteLater();
+  }
+}
+
+void RemoteSession::DeleteWhenClosed()
+{
+  FDeleteClosed = true;
+  if (FClosing == 0)
+  {
+    deleteLater();
+  }
+}
+
+int RemoteSession::Closing()
+{
+  return ClosingConnections + TerminalSession::Ending();
+}
+
 void RemoteSession::close()
 {
   bool Ended = (FTerminal != nullptr);
+  // nothing waits for a dialog of this session any more
+  if (FAsker != nullptr)
+  {
+    FAsker->Cancel();
+  }
   if (FTerminal != nullptr)
   {
     Terminal * Term = FTerminal;
     FTerminal = nullptr;
-    // on its own: ~Terminal waits for its worker in an event loop, in which
-    // this session (its parent) may be deleted too (a closed tab)
-    disconnect(Term, nullptr, this, nullptr);
-    Term->setParent(nullptr);
-    Term->Close();
-    Term->deleteLater();
+    Dispose(Term);
   }
   FProgressTimer.stop();
   FTransferring = false;
@@ -311,18 +407,42 @@ void RemoteSession::close()
   FThumbs.clear();
   stopSearch();
   DropBack();
-  KeyStore::RemoveTemporary(FTemporaryKey);
-  FTemporaryKey.clear();
   if (FShell != nullptr)
   {
     disconnect(FShell, nullptr, this, nullptr);
     FShell->setParent(nullptr);
-    FShell->deleteLater();
+    FShell->Dispose();
     FShell = nullptr;
     emit terminalChanged();
   }
   FFiles.SetEntries({});
+  // what another app changed and could not be uploaded is not thrown away
+  QStringList Unsent;
+  for (const Edit & E : std::as_const(FEdits))
+  {
+    QFileInfo Info(E.Local);
+    if (!E.BuiltIn && Info.exists() && ((Info.lastModified() != E.Modified) || (Info.size() != E.Size)))
+    {
+      QString Kept = MobileCache::Folder(QStringLiteral("edit"), 0) + QLatin1Char('/') + QString::number(FCacheId) + QLatin1Char('/') +
+        QFileInfo(Info.path()).fileName();
+      QDir().mkpath(Kept);
+      Kept += QLatin1Char('/') + Info.fileName();
+      if (QFile::rename(E.Local, Kept))
+      {
+        Unsent.append(Kept);
+      }
+    }
+  }
   FEdits.clear();
+  FUploadingEdit.clear();
+  FStale = false;
+  // nothing of this session stays in the cache
+  MobileCache::RemoveSession(FCacheId);
+  // a host accepted on another connection of the session
+  if (Ended)
+  {
+    KeyStore::HashKnownHosts(FOpenData.KnownHostsFile);
+  }
   FSite.clear();
   FDirectory.clear();
   FBusy = false;
@@ -331,6 +451,10 @@ void RemoteSession::close()
   emit statusChanged();
   emit directoryChanged();
   emit stateChanged();
+  for (const QString & Kept : std::as_const(Unsent))
+  {
+    emit editUnsent(Kept);
+  }
   if (Ended)
   {
     emit closed();
@@ -346,6 +470,11 @@ void RemoteSession::Load(const QString & Path)
   SetBusy(true, QStringLiteral("Reading %1...").arg(Path));
   FTerminal->ReadDirectory(Path, [this, Path](const OperationResult & Result, const QString & Directory, const RemoteFileList & Files)
   {
+    // closed meanwhile
+    if (FTerminal == nullptr)
+    {
+      return;
+    }
     SetBusy(false);
     if (Failed(Result))
     {
@@ -398,7 +527,7 @@ void RemoteSession::refresh()
 
 //---------------------------------------------------------------------------
 void RemoteSession::Fetch(const QStringList & Names, const QString & Target, bool Clean, const QString & Status,
-  std::function<void(const QStringList &)> Done)
+  std::function<void(const QStringList &)> Done, bool Exact)
 {
   if ((FTerminal == nullptr) || Names.isEmpty())
   {
@@ -414,10 +543,15 @@ void RemoteSession::Fetch(const QStringList & Names, const QString & Target, boo
   for (const QString & Name : Names)
   {
     Paths.append(RemotePath(Name));
-    Local.append(Target + QLatin1Char('/') + Name);
+    Local.append(Target + QLatin1Char('/') + Name.mid(Name.lastIndexOf(QLatin1Char('/')) + 1));
   }
   StartTransfer(Status);
-  FTerminal->CopyToLocal(Paths, Target, Configuration::Instance().DefaultCopyParam(), false,
+  CopyParam Param = Configuration::Instance().DefaultCopyParam();
+  if (Exact)
+  {
+    Param.Mode = CopyParam::tmBinary;
+  }
+  FTerminal->CopyToLocal(Paths, Target, Param, false,
     [this, Local, Done](const OperationResult & Result)
   {
     StopTransfer();
@@ -441,7 +575,7 @@ void RemoteSession::download(const QStringList & Names, const QString & TargetDi
 
 void RemoteSession::openFile(const QString & Name, bool Share)
 {
-  QString Target = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/open");
+  QString Target = MobileCache::Folder(QStringLiteral("open"), FCacheId);
   Fetch({Name}, Target, true, QStringLiteral("Opening %1...").arg(Name), [this, Share](const QStringList & Local)
   {
     emit opened(Local.first(), Share);
@@ -450,7 +584,7 @@ void RemoteSession::openFile(const QString & Name, bool Share)
 
 void RemoteSession::shareFiles(const QStringList & Names)
 {
-  QString Target = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/open");
+  QString Target = MobileCache::Folder(QStringLiteral("open"), FCacheId);
   Fetch(Names, Target, true, QStringLiteral("Preparing %1 files...").arg(Names.size()), [this](const QStringList & Local)
   {
     emit shared(Local);
@@ -476,8 +610,8 @@ static QString LocalCopy(const QString & Path, const QString & CacheDir, int Ind
   {
     Name = QStringLiteral("upload-%1").arg(Index + 1);
   }
-  QString Target = CacheDir + QLatin1Char('/') + Name;
-  QFile::remove(Target);
+  // two documents of the same name are two files
+  QString Target = CacheDir + QLatin1Char('/') + TextFile::UniqueName(CacheDir, Name);
   // by hand: QFile::copy() takes over the document's permissions, and a
   // content:// document has none (the copy could not be read)
   QFile Source(Path);
@@ -486,14 +620,11 @@ static QString LocalCopy(const QString & Path, const QString & CacheDir, int Ind
   {
     return QString();
   }
-  QByteArray Buffer;
-  while (!(Buffer = Source.read(1024 * 1024)).isEmpty())
+  // all of it or nothing: a read error is not the end of the document
+  if (!TextFile::Copy(Source, Copy) || !Copy.flush())
   {
-    if (Copy.write(Buffer) != Buffer.size())
-    {
-      Copy.remove();
-      return QString();
-    }
+    Copy.remove();
+    return QString();
   }
   Copy.close();
   Copy.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
@@ -507,24 +638,58 @@ void RemoteSession::upload(const QStringList & Sources)
     return;
   }
   // a folder per upload: queued uploads keep their copies until they run
-  QString CacheDir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) +
-    QStringLiteral("/upload/%1").arg(++FUploadCounter);
-  QDir(CacheDir).removeRecursively();
+  QString CacheDir = MobileCache::Folder(QStringLiteral("upload"), FCacheId) + QLatin1Char('/') + QString::number(++FUploadCounter);
   QDir().mkpath(CacheDir);
-  QStringList LocalPaths;
-  for (int I = 0; I < Sources.size(); I++)
+  QString Target = FDirectory;
+  SetBusy(true, QStringLiteral("Preparing the files..."));
+  // documents of other apps may be large or far away: not on the GUI thread
+  QPointer<RemoteSession> Self(this);
+  QThread * Worker = QThread::create([Self, Sources, CacheDir, Target]()
   {
-    QString Local = LocalCopy(Sources.at(I), CacheDir, I);
-    if (Local.isEmpty())
+    QStringList LocalPaths;
+    QString Bad;
+    for (int I = 0; (I < Sources.size()) && Bad.isEmpty(); I++)
     {
-      emit error(QStringLiteral("Cannot read the file %1.").arg(Sources.at(I)), QString());
-      return;
+      QString Local = LocalCopy(Sources.at(I), CacheDir, I);
+      if (Local.isEmpty())
+      {
+        Bad = Sources.at(I);
+      }
+      LocalPaths.append(Local);
     }
-    LocalPaths.append(Local);
+    QMetaObject::invokeMethod(QCoreApplication::instance(), [Self, LocalPaths, Bad, CacheDir, Target]()
+    {
+      if (Self != nullptr)
+      {
+        Self->CopiesReady(LocalPaths, Bad, CacheDir, Target);
+      }
+      else
+      {
+        QDir(CacheDir).removeRecursively();
+      }
+    }, Qt::QueuedConnection);
+  });
+  connect(Worker, &QThread::finished, Worker, &QObject::deleteLater);
+  Worker->start();
+}
+
+void RemoteSession::CopiesReady(const QStringList & LocalPaths, const QString & Bad, const QString & CacheDir, const QString & Target)
+{
+  if (FTerminal == nullptr)
+  {
+    QDir(CacheDir).removeRecursively();
+    return;
+  }
+  SetBusy(false);
+  if (!Bad.isEmpty())
+  {
+    QDir(CacheDir).removeRecursively();
+    emit error(QStringLiteral("Cannot read the file %1.").arg(Bad), QString());
+    return;
   }
   if (FQueue != nullptr)
   {
-    FQueue->Add(this, MobileQueue::Upload, LocalPaths, FDirectory, false);
+    FQueue->Add(this, MobileQueue::Upload, LocalPaths, Target, false, CacheDir);
   }
 }
 
@@ -541,6 +706,8 @@ void RemoteSession::UploadTo(const QStringList & LocalPaths, const QString & Rem
   if (Overwrite)
   {
     Param.ConfirmOverwriting = false;
+    // an edited file: its bytes, whatever the transfer settings are
+    Param.Mode = CopyParam::tmBinary;
   }
   FTerminal->CopyToRemote(LocalPaths, RemoteDir, Param, false,
     [this, Done](const OperationResult & Result)
@@ -646,51 +813,281 @@ void RemoteSession::Command(const QString & Cmd, const QString & Status,
 }
 
 //---------------------------------------------------------------------------
-void RemoteSession::editFile(const QString & Name)
+RemoteSession::Edit * RemoteSession::FindEdit(const QString & Local)
 {
-  QString Target = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) +
-    QStringLiteral("/edit/%1").arg(++FEditCounter);
-  QString RemoteDir = FDirectory;
+  for (Edit & E : FEdits)
+  {
+    if (E.Local == Local)
+    {
+      return &E;
+    }
+  }
+  return nullptr;
+}
+
+void RemoteSession::FetchEdit(const QString & Name, bool Adopt)
+{
+  QString Target = MobileCache::Folder(QStringLiteral("edit"), FCacheId) + QLatin1Char('/') + QString::number(++FEditCounter);
   QString Remote = RemotePath(Name);
-  Fetch({Name}, Target, true, QStringLiteral("Opening %1...").arg(Name), [this, RemoteDir, Remote](const QStringList & Local)
+  QString RemoteDir = Remote.left(Remote.lastIndexOf(QLatin1Char('/')));
+  if (RemoteDir.isEmpty())
+  {
+    RemoteDir = QStringLiteral("/");
+  }
+  Fetch({Name}, Target, true, QStringLiteral("Opening %1...").arg(Remote.mid(Remote.lastIndexOf(QLatin1Char('/')) + 1)),
+    [this, RemoteDir, Remote, Adopt](const QStringList & Local)
   {
     QFileInfo Info(Local.first());
-    FEdits.append(Edit{Local.first(), RemoteDir, Info.lastModified(), Info.size()});
-    emit editReady(Local.first(), Remote);
-  });
+    Edit E;
+    E.Local = Local.first();
+    E.RemoteDir = RemoteDir;
+    E.Modified = Info.lastModified();
+    E.Size = Info.size();
+    FEdits.append(E);
+    if (Adopt)
+    {
+      emit editAdopted(Local.first(), Remote);
+    }
+    else
+    {
+      emit editReady(Local.first(), Remote);
+    }
+  }, true);
+}
+
+void RemoteSession::editFile(const QString & Name)
+{
+  FetchEdit(Name, false);
+}
+
+void RemoteSession::adoptEdit(const QString & RemotePath)
+{
+  FetchEdit(RemotePath, true);
 }
 
 void RemoteSession::checkEdits()
 {
-  if (!connected() || FBusy)
+  // failed ones get another try now
+  for (Edit & E : FEdits)
+  {
+    E.Failed = false;
+  }
+  SendEdits();
+}
+
+bool RemoteSession::WriteEdit(const Edit & E)
+{
+  // the file as it was until the new one is complete: full storage must not
+  // end as an empty file on the server
+  QDir().mkpath(QFileInfo(E.Local).absolutePath());
+  QSaveFile File(E.Local);
+  if (!File.open(QIODevice::WriteOnly) || (File.write(E.Sending) != E.Sending.size()) || !File.commit())
+  {
+    emit error(QStringLiteral("Cannot save %1.").arg(QFileInfo(E.Local).fileName()), File.errorString());
+    return false;
+  }
+  return true;
+}
+
+void RemoteSession::SendEdits()
+{
+  if (!connected() || FBusy || !FUploadingEdit.isEmpty())
   {
     return;
   }
   for (Edit & E : FEdits)
   {
-    QFileInfo Info(E.Local);
-    if (!Info.exists() || ((Info.lastModified() == E.Modified) && (Info.size() == E.Size)))
+    if (E.Failed)
     {
       continue;
     }
-    E.Modified = Info.lastModified();
-    E.Size = Info.size();
-    QString Name = Info.fileName();
-    QString RemoteDir = E.RemoteDir;
-    UploadTo({E.Local}, RemoteDir, [this, Name, RemoteDir](bool Ok)
+    QFileInfo Info(E.Local);
+    if (E.BuiltIn)
     {
-      if (Ok)
+      if (!E.HasUnsent)
       {
-        emit notice(QStringLiteral("Changes of %1 uploaded.").arg(Name));
-        if (RemoteDir == FDirectory)
-        {
-          refresh();
-        }
+        continue;
       }
-      // the next changed file, if any
-      QTimer::singleShot(0, this, &RemoteSession::checkEdits);
-    }, true);   // an edited file replaces its original, as WinSCP's editing
+      E.Sending = E.Unsent;
+      if (!WriteEdit(E))
+      {
+        E.Failed = true;
+        emit editSaved(E.Local, false);
+        return;
+      }
+      Info.refresh();
+    }
+    else if (!Info.exists() || ((Info.lastModified() == E.Modified) && (Info.size() == E.Size)))
+    {
+      continue;
+    }
+    QString Local = E.Local;
+    QDateTime Modified = Info.lastModified();
+    qint64 Size = Info.size();
+    FUploadingEdit = Local;
+    UploadTo({Local}, E.RemoteDir, [this, Local, Modified, Size](bool Ok) { EditUploaded(Local, Ok, Modified, Size); },
+      true);   // an edited file replaces its original, as WinSCP's editing
     return;   // one upload at a time
+  }
+}
+
+void RemoteSession::EditUploaded(const QString & Local, bool Ok, const QDateTime & Modified, qint64 Size)
+{
+  FUploadingEdit.clear();
+  Edit * E = FindEdit(Local);
+  if (E == nullptr)
+  {
+    return;
+  }
+  QString Name = QFileInfo(Local).fileName();
+  QString RemoteDir = E->RemoteDir;
+  bool BuiltIn = E->BuiltIn;
+  if (BuiltIn)
+  {
+    // no copy stays; the changes wait in memory for another try
+    QFile::remove(Local);
+  }
+  E->Failed = !Ok;
+  // saved again during the upload: the page goes on waiting for what it saved last
+  bool Newer = false;
+  if (Ok)
+  {
+    E->Modified = Modified;
+    E->Size = Size;
+    if (BuiltIn)
+    {
+      E->Original = E->Sending;
+      Newer = E->HasUnsent && (E->Unsent != E->Sending);
+      if (!Newer)
+      {
+        E->Unsent.clear();
+        E->HasUnsent = false;
+      }
+    }
+    if (E->Closed && !Newer)
+    {
+      FEdits.removeAt(E - FEdits.data());
+      E = nullptr;
+    }
+    if (!Newer)
+    {
+      emit notice(QStringLiteral("Changes of %1 uploaded.").arg(Name));
+    }
+    if (RemoteDir == FDirectory)
+    {
+      refresh();
+    }
+  }
+  if (E != nullptr)
+  {
+    E->Sending.clear();
+  }
+  if (!Newer)
+  {
+    emit editSaved(Local, Ok);
+  }
+  // the next changed file, if any (a failed one waits: the same error again and again helps nobody)
+  if (Ok)
+  {
+    QTimer::singleShot(0, this, &RemoteSession::SendEdits);
+  }
+}
+
+QVariantMap RemoteSession::readEdit(const QString & LocalPath, const QString & Encoding)
+{
+  Edit * E = FindEdit(LocalPath);
+  if (E == nullptr)
+  {
+    return {{QStringLiteral("error"), QStringLiteral("This file is no longer open.")}};
+  }
+  QString Name = QFileInfo(LocalPath).fileName();
+  if (!E->BuiltIn)
+  {
+    QFile File(LocalPath);
+    if (File.size() > 5 * 1024 * 1024)
+    {
+      return {{QStringLiteral("error"), QStringLiteral("The file is too large for the editor (over 5 MB).")}};
+    }
+    if (!File.open(QIODevice::ReadOnly))
+    {
+      return {{QStringLiteral("error"), QStringLiteral("Cannot read %1.").arg(Name)}};
+    }
+    E->Original = File.readAll();
+    File.close();
+    E->BuiltIn = true;
+    // from here on in memory only
+    QFile::remove(LocalPath);
+  }
+  if (E->Original.contains('\0'))
+  {
+    return {{QStringLiteral("error"), QStringLiteral("This is not a text file.")}};
+  }
+  QString Use = Encoding;
+  bool Ask = Use.isEmpty() && !TextFile::IsUtf8(E->Original);
+  if (Use.isEmpty())
+  {
+    Use = Ask ? TextFile::LegacyEncodings().first() : QLatin1String(TextFile::Utf8);
+  }
+  QString Text;
+  if (!TextFile::Decode(E->Original, Use, Text))
+  {
+    return {{QStringLiteral("error"), QStringLiteral("%1 is not in %2.").arg(Name, Use)}};
+  }
+  QVariantMap Result{{QStringLiteral("text"), Text}, {QStringLiteral("encoding"), Use},
+    {QStringLiteral("lineEnding"), TextFile::LineEnding(E->Original)}, {QStringLiteral("sample"), TextFile::Sample(Text)}};
+  if (Ask)
+  {
+    Result.insert(QStringLiteral("needsEncoding"), true);
+    Result.insert(QStringLiteral("encodings"), TextFile::LegacyEncodings());
+  }
+  return Result;
+}
+
+void RemoteSession::saveText(const QString & LocalPath, const QString & Text, const QString & Encoding)
+{
+  Edit * E = FindEdit(LocalPath);
+  if (E == nullptr)
+  {
+    emit editSaved(LocalPath, false);
+    return;
+  }
+  QByteArray Data;
+  QString Problem;
+  if (!TextFile::Merge(E->Original, Text, Encoding, Data, Problem))
+  {
+    emit error(QStringLiteral("Cannot save %1.").arg(QFileInfo(LocalPath).fileName()), Problem);
+    emit editSaved(LocalPath, false);
+    return;
+  }
+  // what the server has already, and goes on having: with an upload on its way,
+  // even the original text is a change to what that one leaves there
+  if ((Data == E->Original) && (FUploadingEdit != LocalPath))
+  {
+    E->HasUnsent = false;
+    E->Unsent.clear();
+    emit editSaved(LocalPath, true);
+    return;
+  }
+  E->Unsent = Data;
+  E->HasUnsent = true;
+  E->Failed = false;
+  // now, or as soon as the connection is free
+  SendEdits();
+}
+
+void RemoteSession::closeEdit(const QString & LocalPath)
+{
+  Edit * E = FindEdit(LocalPath);
+  if (E == nullptr)
+  {
+    return;
+  }
+  E->Closed = true;
+  // on its way to the server: the end of the upload forgets it
+  if (FUploadingEdit != LocalPath)
+  {
+    QFile::remove(LocalPath);
+    FEdits.removeAt(E - FEdits.data());
   }
 }
 
@@ -710,20 +1107,10 @@ QVariantMap RemoteSession::readText(const QString & LocalPath) const
   {
     return {{QStringLiteral("error"), QStringLiteral("This is not a text file.")}};
   }
-  return {{QStringLiteral("text"), QString::fromUtf8(Data)}};
-}
-
-void RemoteSession::saveText(const QString & LocalPath, const QString & Text)
-{
-  QFile File(LocalPath);
-  if (!File.open(QIODevice::WriteOnly | QIODevice::Truncate) || (File.write(Text.toUtf8()) < 0))
-  {
-    emit error(QStringLiteral("Cannot save %1.").arg(QFileInfo(LocalPath).fileName()), File.errorString());
-    return;
-  }
-  File.close();
-  // uploaded by checkEdits, as after an external editor
-  checkEdits();
+  // only shown: a file that is not UTF-8 in the first code page offered
+  QString Text;
+  TextFile::Decode(Data, TextFile::IsUtf8(Data) ? QLatin1String(TextFile::Utf8) : TextFile::LegacyEncodings().first(), Text);
+  return {{QStringLiteral("text"), Text}};
 }
 
 void RemoteSession::createFile(const QString & Name)
@@ -738,8 +1125,7 @@ void RemoteSession::createFile(const QString & Name)
     emit error(QStringLiteral("%1 already exists.").arg(Name), QString());
     return;
   }
-  QString Target = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) +
-    QStringLiteral("/edit/%1").arg(++FEditCounter);
+  QString Target = MobileCache::Folder(QStringLiteral("edit"), FCacheId) + QLatin1Char('/') + QString::number(++FEditCounter);
   QDir().mkpath(Target);
   QString Local = Target + QLatin1Char('/') + Name;
   QFile File(Local);
@@ -759,9 +1145,14 @@ void RemoteSession::createFile(const QString & Name)
     }
     refresh();
     QFileInfo Info(Local);
-    FEdits.append(Edit{Local, RemoteDir, Info.lastModified(), Info.size()});
+    Edit E;
+    E.Local = Local;
+    E.RemoteDir = RemoteDir;
+    E.Modified = Info.lastModified();
+    E.Size = Info.size();
+    FEdits.append(E);
     emit editReady(Local, Remote);
-  });
+  }, true);
 }
 
 //---------------------------------------------------------------------------
@@ -796,7 +1187,7 @@ void RemoteSession::archive(const QStringList & Names, const QString & Format, c
   {
     Base += QDateTime::currentDateTime().toString(QStringLiteral("-yyyyMMdd-HHmm"));
   }
-  if (!FTerminal->CanAnyCommand())
+  if (!canRunCommands())
   {
     ZipLocally(Names, Base + QStringLiteral(".zip"), TargetDir);
     return;
@@ -876,7 +1267,7 @@ void RemoteSession::archive(const QStringList & Names, const QString & Format, c
 // and packed on the phone
 void RemoteSession::ZipLocally(const QStringList & Names, const QString & ArchiveName, const QString & TargetDir)
 {
-  QString Work = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/archive");
+  QString Work = MobileCache::Folder(QStringLiteral("archive"), FCacheId);
   Fetch(Names, Work, true, QStringLiteral("Downloading %1 items...").arg(Names.size()),
     [this, Work, ArchiveName, TargetDir](const QStringList &)
   {
@@ -884,47 +1275,72 @@ void RemoteSession::ZipLocally(const QStringList & Names, const QString & Archiv
     QDir().mkpath(Target);
     QString Local = Target + QLatin1Char('/') + ArchiveName;
     SetBusy(true, QStringLiteral("Packing %1...").arg(ArchiveName));
+    QPointer<RemoteSession> Self(this);
+    // not on the GUI thread: compressing takes its time
+    QThread * Worker = QThread::create([Self, Work, Local, TargetDir]()
     {
-      QZipWriter Zip(Local);
-      Zip.setCompressionPolicy(QZipWriter::AutoCompress);
-      QDir Root(Work);
-      QDirIterator It(Work, QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot,
-        QDirIterator::Subdirectories);
-      while (It.hasNext())
+      QString Problem;
       {
-        QString Path = It.next();
-        QString Relative = Root.relativeFilePath(Path);
-        if (It.fileInfo().isDir())
+        QZipWriter Zip(Local);
+        Zip.setCompressionPolicy(QZipWriter::AutoCompress);
+        QDir Root(Work);
+        QDirIterator It(Work, QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot,
+          QDirIterator::Subdirectories);
+        while (It.hasNext() && Problem.isEmpty())
         {
-          Zip.addDirectory(Relative);
+          QString Path = It.next();
+          QString Relative = Root.relativeFilePath(Path);
+          if (It.fileInfo().isDir())
+          {
+            Zip.addDirectory(Relative);
+          }
+          else if (It.fileInfo().size() > MaxZippedFile)
+          {
+            Problem = QStringLiteral("%1 is too large to be packed on the phone. Download it without an archive.").arg(Relative);
+          }
+          else
+          {
+            QFile File(Path);
+            if (File.open(QIODevice::ReadOnly))
+            {
+              Zip.addFile(Relative, &File);
+            }
+          }
+        }
+        Zip.close();
+        if (Problem.isEmpty() && (Zip.status() != QZipWriter::NoError))
+        {
+          Problem = QStringLiteral("Cannot write %1.").arg(Local);
+        }
+      }
+      QDir(Work).removeRecursively();
+      if (!Problem.isEmpty())
+      {
+        QFile::remove(Local);
+      }
+      QMetaObject::invokeMethod(QCoreApplication::instance(), [Self, Local, TargetDir, Problem]()
+      {
+        if ((Self == nullptr) || (Self->FTerminal == nullptr))
+        {
+          return;
+        }
+        Self->SetBusy(false);
+        if (!Problem.isEmpty())
+        {
+          emit Self->error(Problem, QString());
+        }
+        else if (TargetDir.isEmpty())
+        {
+          emit Self->downloaded({Local});
         }
         else
         {
-          QFile File(Path);
-          if (File.open(QIODevice::ReadOnly))
-          {
-            Zip.addFile(Relative, &File);
-          }
+          emit Self->archived(Local);
         }
-      }
-      Zip.close();
-      if (Zip.status() != QZipWriter::NoError)
-      {
-        SetBusy(false);
-        emit error(QStringLiteral("Cannot write %1.").arg(Local), QString());
-        return;
-      }
-    }
-    QDir(Work).removeRecursively();
-    SetBusy(false);
-    if (TargetDir.isEmpty())
-    {
-      emit downloaded({Local});
-    }
-    else
-    {
-      emit archived(Local);
-    }
+      }, Qt::QueuedConnection);
+    });
+    connect(Worker, &QThread::finished, Worker, &QObject::deleteLater);
+    Worker->start();
   });
 }
 
@@ -966,7 +1382,8 @@ TerminalSession * RemoteSession::openTerminal(int Cols, int Rows)
     {
       Data.Password = FTerminal->RememberedPassword();
     }
-    FShell = new TerminalSession(Data, FUI, this);
+    FShell = new TerminalSession(Data, FAsker.get(), this);
+    KeepAsker(FShell);
     emit terminalChanged();
   }
   if (!FShell->running() && !FShell->connecting())
@@ -982,7 +1399,7 @@ TerminalSession * RemoteSession::openTerminal(int Cols, int Rows)
 }
 
 //---------------------------------------------------------------------------
-void RemoteSession::setProperties(const QStringList & Names, int Mode, const QString & Owner, const QString & Group,
+void RemoteSession::setProperties(const QStringList & Names, int Set, int Unset, const QString & Owner, const QString & Group,
   bool Recursive)
 {
   if ((FTerminal == nullptr) || Names.isEmpty())
@@ -990,11 +1407,11 @@ void RemoteSession::setProperties(const QStringList & Names, int Mode, const QSt
     return;
   }
   RemoteProperties Properties;
-  if (Mode >= 0)
+  if ((Set | Unset) != 0)
   {
     Properties.ValidRights = true;
-    Properties.RightsSet = static_cast<unsigned int>(Mode) & 07777;
-    Properties.RightsUnset = ~static_cast<unsigned int>(Mode) & 07777;
+    Properties.RightsSet = static_cast<unsigned int>(Set) & 07777;
+    Properties.RightsUnset = static_cast<unsigned int>(Unset) & 07777;
   }
   Properties.Owner = Owner.trimmed();
   Properties.Group = Group.trimmed();
@@ -1061,7 +1478,11 @@ bool RemoteSession::addBookmark(const QString & Name, const QString & Path)
   }
   All.SetList(Key, List);
   All.Save(Config.Ini());
-  Config.Save();
+  if (!Config.Save())
+  {
+    emit error(QStringLiteral("The bookmark could not be saved."), QString());
+    return false;
+  }
   return true;
 }
 
@@ -1089,7 +1510,10 @@ void RemoteSession::removeBookmark(const QString & Name)
     List.Delete(Index);
     All.SetList(Key, List);
     All.Save(Config.Ini());
-    Config.Save();
+    if (!Config.Save())
+    {
+      emit error(QStringLiteral("The bookmark could not be removed."), QString());
+    }
   }
 }
 
@@ -1101,10 +1525,7 @@ void RemoteSession::installPublicKey(const QString & Key)
   {
     return;
   }
-  QString Cmd = QStringLiteral(
-    "umask 077 && mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && "
-    "(grep -qxF %1 ~/.ssh/authorized_keys || echo %1 >> ~/.ssh/authorized_keys)").arg(Quote(Line));
-  Command(Cmd, QStringLiteral("Installing the key..."), [this](int Exit, const QStringList & Output)
+  Command(InstallKeyCommand(Line), QStringLiteral("Installing the key..."), [this](int Exit, const QStringList & Output)
   {
     if (Exit == 0)
     {
@@ -1115,6 +1536,22 @@ void RemoteSession::installPublicKey(const QString & Key)
       emit error(QStringLiteral("The key could not be installed."), Output.join(QLatin1Char('\n')).trimmed());
     }
   });
+}
+
+QString RemoteSession::InstallKeyCommand(const QString & Line)
+{
+  // a file without a final newline: the key must start a line of its own;
+  // the last grep tells whether it is there, whatever came before
+  return QStringLiteral(
+    "umask 077 && mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && "
+    "(grep -qxF %1 ~/.ssh/authorized_keys || { "
+    "if [ -s ~/.ssh/authorized_keys ] && [ -n \"$(tail -c 1 ~/.ssh/authorized_keys)\" ]; then echo >> ~/.ssh/authorized_keys; fi; "
+    "echo %1 >> ~/.ssh/authorized_keys; }) && grep -qxF %1 ~/.ssh/authorized_keys").arg(Quote(Line));
+}
+
+bool RemoteSession::hasTransfers() const
+{
+  return FTransferring || ((FQueue != nullptr) && FQueue->HasActive(this));
 }
 
 //---------------------------------------------------------------------------
@@ -1129,10 +1566,7 @@ void RemoteSession::DropBack()
   {
     Terminal * Back = FBack;
     FBack = nullptr;
-    disconnect(Back, nullptr, this, nullptr);
-    Back->setParent(nullptr);
-    Back->Close();
-    Back->deleteLater();
+    Dispose(Back);
   }
 }
 
@@ -1153,7 +1587,8 @@ void RemoteSession::WithBack(std::function<void(bool)> Ready)
   {
     Data.Password = FTerminal->RememberedPassword();
   }
-  Terminal * Back = new Terminal(Data, FUI, this);
+  Terminal * Back = new Terminal(Data, FAsker.get(), this);
+  KeepAsker(Back);
   // errors of single files end the operation with all of them (no
   // Retry/Skip question for every thumbnail)
   Terminal::Settings Settings = Terminal::ConfigurationSettings();
@@ -1166,7 +1601,14 @@ void RemoteSession::WithBack(std::function<void(bool)> Ready)
     // reopened for the next item
     if ((FBack == Back) && (FBackItem == 0) && !FBackThumb)
     {
-      QTimer::singleShot(0, this, &RemoteSession::DropBack);
+      // this one only: the next item may have opened a new one meanwhile
+      QTimer::singleShot(0, this, [this, Back]()
+      {
+        if (FBack == Back)
+        {
+          DropBack();
+        }
+      });
     }
   });
   QPointer<Terminal> Guard(Back);
@@ -1180,7 +1622,14 @@ void RemoteSession::WithBack(std::function<void(bool)> Ready)
     if (!Result.Ok)
     {
       QString Message = Result.Message;
-      QTimer::singleShot(0, this, &RemoteSession::DropBack);
+      Terminal * Failed = Guard;
+      QTimer::singleShot(0, this, [this, Failed]()
+      {
+        if (FBack == Failed)
+        {
+          DropBack();
+        }
+      });
       // the waiting transfers cannot run
       while (const MobileQueue::Item * I = FQueue->Next(this))
       {
@@ -1223,44 +1672,39 @@ void RemoteSession::RunItem(int Id)
   MobileQueue::Direction Dir = I->Dir;
   QStringList Sources = I->Sources;
   QString Target = I->Target;
-  auto Done = [this, Id, Dir, Sources, Target](const OperationResult & Result)
+  auto Done = [this, Id, Dir, Target](const OperationResult & Result)
   {
     FBackTimer.stop();
     FBackItem = 0;
     if (Result.Ok)
     {
       FQueue->SetState(Id, MobileQueue::Done);
-      if ((Dir == MobileQueue::Upload) && (Target == FDirectory))
-      {
-        refresh();
-      }
     }
     else
     {
+      // an upload keeps its cache copies for Retry
       FQueue->SetState(Id, Result.Aborted ? MobileQueue::Cancelled : MobileQueue::Failed,
         Result.MoreMessages.isEmpty() ? Result.Message : (Result.Message + QLatin1Char('\n') + Result.MoreMessages));
     }
-    // the cache copies of an upload are no longer needed
+    // partly done is new files too
     if (Dir == MobileQueue::Upload)
     {
-      QString Cache = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
-      for (const QString & Source : Sources)
-      {
-        if (Source.startsWith(Cache))
-        {
-          QFile::remove(Source);
-        }
-      }
+      emit FQueue->uploadEnded(Target);
     }
     QTimer::singleShot(0, this, &RemoteSession::RunNext);
   };
+  CopyParam Param = Configuration::Instance().DefaultCopyParam();
+  // the queue resumes without asking: with ContinueOnError the question
+  // would count as an error though the file then arrives (a Retry after a
+  // partial transfer would end as Failed)
+  Param.ConfirmResume = false;
   if (Dir == MobileQueue::Download)
   {
-    FBack->CopyToLocal(Sources, Target, Configuration::Instance().DefaultCopyParam(), false, Done);
+    FBack->CopyToLocal(Sources, Target, Param, false, Done);
   }
   else
   {
-    FBack->CopyToRemote(Sources, Target, Configuration::Instance().DefaultCopyParam(), false, Done);
+    FBack->CopyToRemote(Sources, Target, Param, false, Done);
   }
 }
 
@@ -1272,7 +1716,7 @@ void RemoteSession::QueueThumbnails(const RemoteFileList & Files)
   {
     return;
   }
-  QString Folder = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/thumbs");
+  QString Folder = MobileCache::Thumbnails(FCacheId);
   QDir().mkpath(Folder);
   for (const RemoteFile & F : Files)
   {
@@ -1319,7 +1763,7 @@ void RemoteSession::NextThumbnail()
       return;
     }
     Thumb T = FThumbs.takeFirst();
-    QString Temp = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/thumbs/fetch");
+    QString Temp = MobileCache::Folder(QStringLiteral("thumbfetch"), FCacheId);
     QDir(Temp).removeRecursively();
     QDir().mkpath(Temp);
     FBackThumb = true;
@@ -1342,11 +1786,20 @@ void RemoteSession::NextThumbnail()
 //---------------------------------------------------------------------------
 void RemoteSession::previewFile(const QString & Name)
 {
-  QString Target = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/open");
+  QString Target = MobileCache::Folder(QStringLiteral("open"), FCacheId);
   Fetch({Name}, Target, true, QStringLiteral("Opening %1...").arg(Name), [this, Name](const QStringList & Local)
   {
     emit previewReady(Local.first(), Name);
   });
+}
+
+void RemoteSession::closePreview(const QString & LocalPath)
+{
+  // the phone's own files are previewed in place
+  if (LocalPath.startsWith(MobileCache::Folder(QStringLiteral("open"), FCacheId) + QLatin1Char('/')))
+  {
+    QFile::remove(LocalPath);
+  }
 }
 
 bool RemoteSession::findFiles(const QString & Text)

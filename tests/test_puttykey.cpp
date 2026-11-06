@@ -462,8 +462,59 @@ static void TestServerAuthentication()
   }
 }
 
+// Save: PuTTYgen's format, read back by the loader
+static void TestSave()
+{
+  QTemporaryDir Dir;
+  struct { enum ssh_keytypes_e Type; int Bits; } Keys[] = {
+    {SSH_KEYTYPE_ED25519, 0}, {SSH_KEYTYPE_RSA, 2048}, {SSH_KEYTYPE_ECDSA_P256, 256}, {SSH_KEYTYPE_ECDSA_P384, 384}, {SSH_KEYTYPE_ECDSA_P521, 521}};
+  for (const auto & K : Keys)
+  {
+    ssh_key Key = nullptr;
+    CHECK(ssh_pki_generate(K.Type, K.Bits, &Key) == SSH_OK);
+    QString Expected = PublicKeyString(Key);
+    for (const QString & Passphrase : {QString(), TestPassphrase, TestUtf8Passphrase})
+    {
+      QString File = Dir.filePath(QStringLiteral("saved.ppk"));
+      QString Error;
+      CHECK_MSG(PuttyKey::Save(File, Key, QStringLiteral("a comment"), Passphrase, &Error), Error);
+      CHECK(PuttyKey::IsPuttyKeyFile(File));
+      CHECK(QFile::permissions(File) == (QFile::ReadOwner | QFile::WriteOwner | QFile::ReadUser | QFile::WriteUser));
+      CHECK(PuttyKey::ReadComment(File) == QStringLiteral("a comment"));
+      QByteArray Text = ReadFile(File);
+      CHECK(Text.startsWith("PuTTY-User-Key-File-3: "));
+      CHECK(Text.contains(Passphrase.isEmpty() ? "Encryption: none\n" : "Encryption: aes256-cbc\n"));
+      CHECK(Passphrase.isEmpty() == !Text.contains("Key-Derivation: Argon2id\n"));
+      PromptRecorder Prompt;
+      Prompt.Answers = {Passphrase};
+      ssh_key Loaded = nullptr;
+      CHECK_MSG(LoadKey(File, Prompt, &Loaded, Error) == PuttyKey::lrOk, Error);
+      if (Loaded != nullptr)
+      {
+        CHECK(PublicKeyString(Loaded) == Expected);
+        CHECK(ssh_key_is_private(Loaded));
+        ssh_key_free(Loaded);
+      }
+      if (!Passphrase.isEmpty())
+      {
+        PromptRecorder Wrong;
+        Wrong.Answers = {QStringLiteral("x"), QStringLiteral("y"), QStringLiteral("z")};
+        CHECK(LoadKey(File, Wrong, &Loaded, Error) == PuttyKey::lrError);
+      }
+    }
+    ssh_key_free(Key);
+  }
+  ssh_key Key = nullptr;
+  CHECK(ssh_pki_generate(SSH_KEYTYPE_ED25519, 0, &Key) == SSH_OK);
+  QString Error;
+  CHECK(!PuttyKey::Save(Dir.filePath(QStringLiteral("two.ppk")), Key, QStringLiteral("two\nlines"), QString(), &Error));
+  CHECK(!PuttyKey::Save(Dir.filePath(QStringLiteral("no/such/dir/key.ppk")), Key, QString(), QString(), &Error));
+  ssh_key_free(Key);
+}
+
 int main()
 {
+  TestSave();
   std::printf("Test data: %s\n", qPrintable(DataDir()));
   if (!QDir(DataDir()).exists())
   {

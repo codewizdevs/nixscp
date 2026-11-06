@@ -1,6 +1,7 @@
 #include "gui/AgentMcp.h"
 
 #include "core/AgentAccess.h"
+#include "core/CopyParam.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -11,12 +12,14 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLocalSocket>
+#include <QList>
 #include <QTimer>
 
 #include <cstdio>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 
 using namespace AgentAccess;
 
@@ -24,7 +27,6 @@ namespace
 {
 
 constexpr int ChunkSize = 64 * 1024;
-constexpr qint64 UploadWindow = 4 * 1024 * 1024;
 constexpr qint64 DefaultMaxOutput = 100 * 1024;
 constexpr qint64 LimitMaxOutput = 2 * 1024 * 1024;
 // the MCP protocol versions this server speaks (newest first)
@@ -42,6 +44,10 @@ struct Outcome
   QByteArray List;        // frList
 };
 
+// Set while a request runs: aborting the socket ends it, and the broker then
+// stops the work on the server
+QLocalSocket * GRunningSocket = nullptr;
+
 Outcome Request(const QJsonObject & Req, const QByteArray & Stdin, const QString & LocalFile, qint64 MaxOutput)
 {
   Outcome Result;
@@ -52,17 +58,14 @@ Outcome Request(const QJsonObject & Req, const QByteArray & Stdin, const QString
     Result.Error = QStringLiteral("NixSCP is not running. The user needs to start NixSCP to use its sites.");
     return Result;
   }
-  QString Op = Req.value(QStringLiteral("op")).toString();
-  std::unique_ptr<QFile> Output, Input;
-  if (Op == QStringLiteral("get"))
+  if (!PeerIsSameUser(Socket.socketDescriptor()))
   {
-    Output.reset(new QFile(LocalFile));
-    if (!Output->open(QIODevice::WriteOnly | QIODevice::Truncate))
-    {
-      Result.Error = QStringLiteral("Cannot write \"%1\".").arg(LocalFile);
-      return Result;
-    }
+    Result.Error = QStringLiteral("Refusing the agent socket \"%1\": it belongs to another user.").arg(SocketName());
+    return Result;
   }
+  QString Op = Req.value(QStringLiteral("op")).toString();
+  std::unique_ptr<DownloadFile> Output;
+  std::unique_ptr<QFile> Input;
   if (Op == QStringLiteral("put"))
   {
     Input.reset(new QFile(LocalFile));
@@ -75,7 +78,9 @@ Outcome Request(const QJsonObject & Req, const QByteArray & Stdin, const QString
   QEventLoop Loop;
   FrameReader Reader;
   bool Done = false;
+  bool Downloaded = false;
   bool Uploading = false;
+  bool Feeding = false;
   qint64 Sent = 0, Acked = 0;
   auto Finish = [&]() { Done = true; Loop.quit(); };
   auto Keep = [&](QByteArray & Buffer, const QByteArray & Data)
@@ -86,7 +91,7 @@ Outcome Request(const QJsonObject & Req, const QByteArray & Stdin, const QString
   };
   auto SendUpload = [&]()
   {
-    while (Uploading && (Sent - Acked < UploadWindow))
+    while (Uploading && (Sent - Acked < InputWindow))
     {
       QByteArray Chunk = Input->read(ChunkSize);
       if (Chunk.isEmpty())
@@ -96,6 +101,22 @@ Outcome Request(const QJsonObject & Req, const QByteArray & Stdin, const QString
         break;
       }
       Socket.write(Frame(frData, Chunk));
+      Sent += Chunk.size();
+    }
+  };
+  // in frames the broker takes, and only as far as the flow control allows
+  auto SendStdin = [&]()
+  {
+    while (Feeding && (Sent - Acked < InputWindow))
+    {
+      if (Sent >= Stdin.size())
+      {
+        Socket.write(Frame(frStdinEof));
+        Feeding = false;
+        break;
+      }
+      QByteArray Chunk = Stdin.mid(Sent, ChunkSize);
+      Socket.write(Frame(frStdin, Chunk));
       Sent += Chunk.size();
     }
   };
@@ -112,13 +133,27 @@ Outcome Request(const QJsonObject & Req, const QByteArray & Stdin, const QString
         case frStdout: Keep(Result.Stdout, Payload); break;
         case frStderr: Keep(Result.Stderr, Payload); break;
         case frData:
-          if (Output) Output->write(Payload);
+          if (Output && !Output->Write(Payload))
+          {
+            Result.Error = QStringLiteral("Cannot write \"%1\": %2").arg(LocalFile, Output->ErrorString());
+            Finish();
+          }
           break;
         case frDataEnd:
-          if (Output) Output->close();
+          Downloaded = true;
           break;
         case frInfo:
-          if (Op == QStringLiteral("put"))
+          if (Op == QStringLiteral("get"))
+          {
+            // not before the broker accepted the request and found the file
+            Output.reset(new DownloadFile(LocalFile));
+            if (!Output->Open())
+            {
+              Result.Error = QStringLiteral("Cannot write \"%1\": %2").arg(LocalFile, Output->ErrorString());
+              Finish();
+            }
+          }
+          else if (Op == QStringLiteral("put"))
           {
             Uploading = true;
             SendUpload();
@@ -127,12 +162,17 @@ Outcome Request(const QJsonObject & Req, const QByteArray & Stdin, const QString
         case frAck:
           Acked = Payload.toLongLong();
           SendUpload();
+          SendStdin();
           break;
         case frList:
           Result.List = Payload;
           break;
         case frExit:
           Result.Code = QJsonDocument::fromJson(Payload).object().value(QStringLiteral("code")).toInt(0);
+          if ((Op == QStringLiteral("get")) && (Result.Code == 0) && (!Output || !Downloaded || !Output->Commit()))
+          {
+            Result.Error = QStringLiteral("Cannot write \"%1\": %2").arg(LocalFile, Output ? Output->ErrorString() : QString());
+          }
           Finish();
           break;
         case frError:
@@ -162,20 +202,14 @@ Outcome Request(const QJsonObject & Req, const QByteArray & Stdin, const QString
   Socket.write(Frame(frRequest, QJsonDocument(Req).toJson(QJsonDocument::Compact)));
   if (Op == QStringLiteral("exec"))
   {
-    if (!Stdin.isEmpty())
-    {
-      Socket.write(Frame(frStdin, Stdin));
-    }
-    Socket.write(Frame(frStdinEof));
+    Feeding = true;
+    SendStdin();
   }
   if (!Done)
   {
+    GRunningSocket = &Socket;
     Loop.exec();
-  }
-  if (!Result.Error.isEmpty() && Output)
-  {
-    Output->close();
-    Output->remove();
+    GRunningSocket = nullptr;
   }
   return Result;
 }
@@ -292,7 +326,7 @@ QJsonObject CallTool(const QString & Name, const QJsonObject & Args)
     }
     if (QFileInfo(Local).isDir())
     {
-      Local = QDir(Local).filePath(RemoteName);
+      Local = QDir(Local).filePath(CopyParam::ValidLocalFileName(RemoteName));
     }
     Outcome R = Request(QJsonObject{{QStringLiteral("op"), QStringLiteral("get")}, {QStringLiteral("site"), Str("site")},
       {QStringLiteral("remote"), Remote}}, QByteArray(), Local, 0);
@@ -322,22 +356,248 @@ QJsonObject CallTool(const QString & Name, const QJsonObject & Args)
   return QJsonObject();
 }
 
-void Reply(const QJsonValue & Id, const QJsonObject & Result)
+QJsonObject ResultMessage(const QJsonValue & Id, const QJsonObject & Result)
 {
-  QJsonObject Message{{QStringLiteral("jsonrpc"), QStringLiteral("2.0")}, {QStringLiteral("id"), Id}, {QStringLiteral("result"), Result}};
-  std::fputs(QJsonDocument(Message).toJson(QJsonDocument::Compact).constData(), stdout);
+  return QJsonObject{{QStringLiteral("jsonrpc"), QStringLiteral("2.0")}, {QStringLiteral("id"), Id}, {QStringLiteral("result"), Result}};
+}
+
+QJsonObject ErrorMessage(const QJsonValue & Id, int Code, const QString & Message)
+{
+  return QJsonObject{{QStringLiteral("jsonrpc"), QStringLiteral("2.0")}, {QStringLiteral("id"), Id},
+    {QStringLiteral("error"), QJsonObject{{QStringLiteral("code"), Code}, {QStringLiteral("message"), Message}}}};
+}
+
+void Print(const QByteArray & Json)
+{
+  std::fputs(Json.constData(), stdout);
   std::fputc('\n', stdout);
   std::fflush(stdout);
 }
 
-void ReplyError(const QJsonValue & Id, int Code, const QString & Message)
+// The replies of a JSON-RPC batch go out together, as one array
+struct Batch
 {
-  QJsonObject Out{{QStringLiteral("jsonrpc"), QStringLiteral("2.0")}, {QStringLiteral("id"), Id},
-    {QStringLiteral("error"), QJsonObject{{QStringLiteral("code"), Code}, {QStringLiteral("message"), Message}}}};
-  std::fputs(QJsonDocument(Out).toJson(QJsonDocument::Compact).constData(), stdout);
-  std::fputc('\n', stdout);
-  std::fflush(stdout);
-}
+  QJsonArray Replies;
+  int Waiting = 0;      // tool calls still to finish
+  bool Read = false;    // all its requests were looked at
+};
+
+// A tool call waiting for its turn
+struct Call
+{
+  QJsonValue Id;
+  QString Tool;
+  QJsonObject Arguments;
+  std::shared_ptr<Batch> InBatch;
+};
+
+// Standard input is read by a thread, so messages also arrive while a tool call
+// runs (in the event loop of Request): ping is answered and a call cancelled at
+// once. Tool calls themselves run one at a time, in the order they came.
+class Server : public QObject
+{
+public:
+  int Run()
+  {
+    std::thread([this]()
+    {
+      std::string Line;
+      while (std::getline(std::cin, Line))
+      {
+        QByteArray Message = QByteArray::fromStdString(Line);
+        QMetaObject::invokeMethod(this, [this, Message]() { Receive(Message); }, Qt::QueuedConnection);
+      }
+      QMetaObject::invokeMethod(this, [this]()
+      {
+        FInputEnded = true;
+        ExitWhenDone();
+      }, Qt::QueuedConnection);
+    }).detach();
+    return QCoreApplication::exec();
+  }
+
+private:
+  QList<Call> FCalls;
+  bool FBusy = false;
+  bool FCancelled = false;
+  QJsonValue FRunningId;
+  bool FInputEnded = false;
+
+  void ExitWhenDone()
+  {
+    if (FInputEnded && !FBusy && FCalls.isEmpty())
+    {
+      QCoreApplication::exit(0);
+    }
+  }
+
+  void Receive(const QByteArray & Line)
+  {
+    if (Line.trimmed().isEmpty())
+    {
+      return;
+    }
+    QJsonParseError ParseError;
+    QJsonDocument Doc = QJsonDocument::fromJson(Line, &ParseError);
+    if (ParseError.error != QJsonParseError::NoError)
+    {
+      Print(QJsonDocument(ErrorMessage(QJsonValue(), -32700, QStringLiteral("Parse error"))).toJson(QJsonDocument::Compact));
+    }
+    else if (Doc.isObject())
+    {
+      Handle(Doc.object(), nullptr);
+    }
+    else if (Doc.isArray() && !Doc.array().isEmpty())
+    {
+      auto InBatch = std::make_shared<Batch>();
+      for (const QJsonValue & Element : Doc.array())
+      {
+        if (Element.isObject())
+        {
+          Handle(Element.toObject(), InBatch);
+        }
+        else
+        {
+          InBatch->Replies.append(ErrorMessage(QJsonValue(), -32600, QStringLiteral("Invalid request")));
+        }
+      }
+      InBatch->Read = true;
+      FlushBatch(InBatch);
+    }
+    else
+    {
+      Print(QJsonDocument(ErrorMessage(QJsonValue(), -32600, QStringLiteral("Invalid request"))).toJson(QJsonDocument::Compact));
+    }
+    RunCalls();
+  }
+
+  void Reply(const QJsonObject & Message, const std::shared_ptr<Batch> & InBatch)
+  {
+    if (InBatch != nullptr)
+    {
+      InBatch->Replies.append(Message);
+    }
+    else
+    {
+      Print(QJsonDocument(Message).toJson(QJsonDocument::Compact));
+    }
+  }
+
+  void FlushBatch(const std::shared_ptr<Batch> & InBatch)
+  {
+    if (InBatch->Read && (InBatch->Waiting == 0) && !InBatch->Replies.isEmpty())
+    {
+      Print(QJsonDocument(InBatch->Replies).toJson(QJsonDocument::Compact));
+      InBatch->Replies = QJsonArray();
+    }
+  }
+
+  void Cancel(const QJsonValue & Id)
+  {
+    for (qsizetype I = 0; I < FCalls.size(); I++)
+    {
+      if (FCalls.at(I).Id == Id)
+      {
+        std::shared_ptr<Batch> InBatch = FCalls.at(I).InBatch;
+        FCalls.removeAt(I);
+        if (InBatch != nullptr)
+        {
+          InBatch->Waiting--;
+          FlushBatch(InBatch);
+        }
+        return;
+      }
+    }
+    if (FBusy && (FRunningId == Id))
+    {
+      // a cancelled request gets no reply
+      FCancelled = true;
+      if (GRunningSocket != nullptr)
+      {
+        GRunningSocket->abort();
+      }
+    }
+  }
+
+  void Handle(const QJsonObject & Message, const std::shared_ptr<Batch> & InBatch)
+  {
+    QString Method = Message.value(QStringLiteral("method")).toString();
+    QJsonValue Id = Message.value(QStringLiteral("id"));
+    QJsonObject Params = Message.value(QStringLiteral("params")).toObject();
+    if (Method == QStringLiteral("notifications/cancelled"))
+    {
+      Cancel(Params.value(QStringLiteral("requestId")));
+      return;
+    }
+    if (!Message.contains(QStringLiteral("id")) || Method.isEmpty())
+    {
+      // other notifications (initialized) and responses need no answer
+      return;
+    }
+    if (Method == QStringLiteral("initialize"))
+    {
+      QString Wanted = Params.value(QStringLiteral("protocolVersion")).toString();
+      Reply(ResultMessage(Id, QJsonObject{
+        {QStringLiteral("protocolVersion"), ProtocolVersions.contains(Wanted) ? Wanted : ProtocolVersions.first()},
+        {QStringLiteral("capabilities"), QJsonObject{{QStringLiteral("tools"), QJsonObject{{QStringLiteral("listChanged"), false}}}}},
+        {QStringLiteral("serverInfo"), QJsonObject{{QStringLiteral("name"), QStringLiteral("nixscp")},
+          {QStringLiteral("version"), QCoreApplication::applicationVersion()}}},
+        {QStringLiteral("instructions"), QStringLiteral("NixSCP gives you the user's SSH servers without their passwords or keys. "
+          "Call list_sites first and use site names exactly as listed. Some sites restrict commands or need the user's "
+          "approval for each request (the call then waits).")},
+      }), InBatch);
+    }
+    else if (Method == QStringLiteral("ping"))
+    {
+      Reply(ResultMessage(Id, QJsonObject()), InBatch);
+    }
+    else if (Method == QStringLiteral("tools/list"))
+    {
+      Reply(ResultMessage(Id, QJsonObject{{QStringLiteral("tools"), Tools()}}), InBatch);
+    }
+    else if (Method == QStringLiteral("tools/call"))
+    {
+      FCalls.append(Call{Id, Params.value(QStringLiteral("name")).toString(), Params.value(QStringLiteral("arguments")).toObject(), InBatch});
+      if (InBatch != nullptr)
+      {
+        InBatch->Waiting++;
+      }
+    }
+    else
+    {
+      Reply(ErrorMessage(Id, -32601, QStringLiteral("Method not found: %1").arg(Method)), InBatch);
+    }
+  }
+
+  void RunCalls()
+  {
+    if (FBusy)
+    {
+      // the running call goes on to the next one
+      return;
+    }
+    FBusy = true;
+    while (!FCalls.isEmpty())
+    {
+      Call Next = FCalls.takeFirst();
+      FRunningId = Next.Id;
+      FCancelled = false;
+      QJsonObject Result = CallTool(Next.Tool, Next.Arguments);
+      if (!FCancelled)
+      {
+        Reply(Result.isEmpty() ? ErrorMessage(Next.Id, -32602, QStringLiteral("Unknown tool: %1").arg(Next.Tool)) : ResultMessage(Next.Id, Result),
+          Next.InBatch);
+      }
+      if (Next.InBatch != nullptr)
+      {
+        Next.InBatch->Waiting--;
+        FlushBatch(Next.InBatch);
+      }
+    }
+    FBusy = false;
+    ExitWhenDone();
+  }
+};
 
 }
 
@@ -346,69 +606,8 @@ namespace AgentMcp
 
 int Serve()
 {
-  std::string Line;
-  while (std::getline(std::cin, Line))
-  {
-    if (Line.find_first_not_of(" \t\r") == std::string::npos)
-    {
-      continue;
-    }
-    QJsonParseError ParseError;
-    QJsonDocument Doc = QJsonDocument::fromJson(QByteArray::fromStdString(Line), &ParseError);
-    if (ParseError.error != QJsonParseError::NoError || !Doc.isObject())
-    {
-      ReplyError(QJsonValue(), -32700, QStringLiteral("Parse error"));
-      continue;
-    }
-    QJsonObject Message = Doc.object();
-    QString Method = Message.value(QStringLiteral("method")).toString();
-    QJsonValue Id = Message.value(QStringLiteral("id"));
-    bool IsRequest = Message.contains(QStringLiteral("id")) && !Method.isEmpty();
-    if (!IsRequest)
-    {
-      // notifications (initialized, cancelled) and responses need no answer
-      continue;
-    }
-    QJsonObject Params = Message.value(QStringLiteral("params")).toObject();
-    if (Method == QStringLiteral("initialize"))
-    {
-      QString Wanted = Params.value(QStringLiteral("protocolVersion")).toString();
-      Reply(Id, QJsonObject{
-        {QStringLiteral("protocolVersion"), ProtocolVersions.contains(Wanted) ? Wanted : ProtocolVersions.first()},
-        {QStringLiteral("capabilities"), QJsonObject{{QStringLiteral("tools"), QJsonObject{{QStringLiteral("listChanged"), false}}}}},
-        {QStringLiteral("serverInfo"), QJsonObject{{QStringLiteral("name"), QStringLiteral("nixscp")},
-          {QStringLiteral("version"), QCoreApplication::applicationVersion()}}},
-        {QStringLiteral("instructions"), QStringLiteral("NixSCP gives you the user's SSH servers without their passwords or keys. "
-          "Call list_sites first and use site names exactly as listed. Some sites restrict commands or need the user's "
-          "approval for each request (the call then waits).")},
-      });
-    }
-    else if (Method == QStringLiteral("ping"))
-    {
-      Reply(Id, QJsonObject());
-    }
-    else if (Method == QStringLiteral("tools/list"))
-    {
-      Reply(Id, QJsonObject{{QStringLiteral("tools"), Tools()}});
-    }
-    else if (Method == QStringLiteral("tools/call"))
-    {
-      QJsonObject Result = CallTool(Params.value(QStringLiteral("name")).toString(), Params.value(QStringLiteral("arguments")).toObject());
-      if (Result.isEmpty())
-      {
-        ReplyError(Id, -32602, QStringLiteral("Unknown tool: %1").arg(Params.value(QStringLiteral("name")).toString()));
-      }
-      else
-      {
-        Reply(Id, Result);
-      }
-    }
-    else
-    {
-      ReplyError(Id, -32601, QStringLiteral("Method not found: %1").arg(Method));
-    }
-  }
-  return 0;
+  Server Instance;
+  return Instance.Run();
 }
 
 }

@@ -510,6 +510,8 @@ ProgressDialog::ProgressDialog(FileOperationProgress & Progress, QWidget * Paren
     connect(Item, &QAction::triggered, this, [this, Operation]() { SetOnceDoneOperation(Operation); });
   }
   d->OnceDoneItems[odoIdle]->setChecked(true);
+  d->OnceDoneItems[odoSuspend]->setVisible(OperationSupported(odoSuspend));
+  d->OnceDoneItems[odoShutDown]->setVisible(OperationSupported(odoShutDown));
   d->CycleOnceDoneButton = new QToolButton();
   d->CycleOnceDoneButton->setToolButtonStyle(Qt::ToolButtonIconOnly);
   d->CycleOnceDoneButton->setPopupMode(QToolButton::MenuButtonPopup);

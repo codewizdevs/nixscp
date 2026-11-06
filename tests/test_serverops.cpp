@@ -133,6 +133,10 @@ static void UnitTests()
   CHECK(Terminal::ShellChecksumCommand(QStringLiteral("sha-256")) == QStringLiteral("sha256sum"));
   CHECK(Terminal::ShellChecksumCommand(QStringLiteral("SHA1")) == QStringLiteral("sha1sum"));
   CHECK(Terminal::ShellChecksumCommand(QStringLiteral("md5")) == QStringLiteral("md5sum"));
+  CHECK(Terminal::ShellChecksumFallback(QStringLiteral("sha256sum")) == QStringLiteral("shasum -a 256"));
+  CHECK(Terminal::ShellChecksumFallback(QStringLiteral("sha1sum")) == QStringLiteral("shasum -a 1"));
+  CHECK(Terminal::ShellChecksumFallback(QStringLiteral("md5sum")) == QStringLiteral("md5 -r"));
+  CHECK(Terminal::ShellChecksumFallback(QStringLiteral("xxhsum")).isEmpty());
   CHECK(Terminal::ShellChecksumCommand(QStringLiteral("whirlpool")).isEmpty());
   CHECK(Terminal::ShellChecksumAlgs().first() == QStringLiteral("sha-512"));
 }
@@ -222,6 +226,9 @@ static void ServerTests(const SessionData & AData, TFSProtocol Protocol, const Q
     CHECK((Pw != nullptr) && (Gr != nullptr));
     if ((Pw != nullptr) && (Gr != nullptr))
     {
+      // BSD: a new file gets the group of its folder, on macOS one of /tmp that
+      // the user does not need to be in. The own group is the one tested
+      CHECK(chown(QFile::encodeName(A).constData(), static_cast<uid_t>(-1), getgid()) == 0);
       // the listing makes the names known (SFTP v3 changes ownership by ID)
       QEventLoop Loop;
       T.ReadDirectory(Base, [&](const OperationResult &, const QString &, const RemoteFileList &) { Loop.quit(); });

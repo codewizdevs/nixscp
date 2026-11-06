@@ -50,7 +50,7 @@
         <activity
             android:name="org.qtproject.qt.android.bindings.QtActivity"
             android:configChanges="orientation|uiMode|screenLayout|screenSize|smallestScreenSize|layoutDirection|locale|fontScale|keyboard|keyboardHidden|navigation|mcc|mnc|density"
-            android:launchMode="singleTop"
+            android:launchMode="singleTask"
             android:screenOrientation="unspecified"
             android:windowSoftInputMode="adjustNothing"
             android:exported="true">
@@ -64,6 +64,15 @@
                 <action android:name="android.intent.action.SEND_MULTIPLE" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="*/*" />
+            </intent-filter>
+            <!-- "Back to NixSCP" on the sign-in page: browsers open only BROWSABLE
+                 targets. It carries nothing and only brings the app to the front;
+                 singleTask: the one activity, whichever app sends us here -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="nixscp" android:host="signed-in" />
             </intent-filter>
 
           <!-- keep Qt's event loop running in the background: transfer callbacks

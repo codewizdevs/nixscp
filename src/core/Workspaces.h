@@ -20,7 +20,8 @@
 //   IsWorkspace=1                        password only when "Save passwords"
 //   ...
 //
-// Saving a workspace replaces all sites under "<workspace>/" (NewWorkspace).
+// Saving a workspace replaces its entries under "<workspace>/" (NewWorkspace);
+// unlike WinSCP not sites that happen to be there too.
 #pragma once
 
 #include "core/SessionData.h"
@@ -39,7 +40,8 @@ namespace Workspaces
   // TStoredSessionList::GetWorkspaces: names of all workspaces (folder part of
   // the IsWorkspace sites), sorted, case insensitively unique
   QStringList WorkspaceNames(const StoredSessionList & Sessions);
-  // TStoredSessionList::IsWorkspace / IsFolder / HasAnyWorkspace
+  // TStoredSessionList::IsWorkspace / IsFolder / HasAnyWorkspace: a workspace
+  // entry / a site has the name (both, when a folder shares it with a workspace)
   bool IsWorkspace(const StoredSessionList & Sessions, const QString & Name);
   bool IsFolder(const StoredSessionList & Sessions, const QString & Name);
   bool HasAnyWorkspace(const StoredSessionList & Sessions);
@@ -49,7 +51,9 @@ namespace Workspaces
   // TStoredSessionList::GetFolderOrWorkspace: the sessions to open, one per tab,
   // in tab order. Links are resolved to (copies of) the stored sites with the
   // saved tab state applied; links to sites that no longer exist and sites
-  // that cannot be opened (no host name) are skipped. Ad-hoc sessions keep
+  // that cannot be opened are skipped. A local tab has no host name but both
+  // directories (SessionData::IsLocalBrowser). When Name is a workspace, sites
+  // of a folder of the same name are left out. Ad-hoc sessions keep
   // IsWorkspace=true and get their NameOverride as Name (empty if none), so
   // saving the workspace again keeps them ad-hoc - clear IsWorkspace before
   // saving such a session as a stored site (as CloneCurrentSessionData does).
@@ -73,19 +77,26 @@ namespace Workspaces
   // password clearing): replaces workspace Name with the given tabs. Each tab
   // is the session data of the tab with its current directories in
   // RemoteDirectory/LocalDirectory (and the session password in Password, if
-  // it should be saved with an ad-hoc session). Tabs of stored sites (same
+  // it should be saved with an ad-hoc session); a local tab has no host name
+  // and its right panel in OtherLocalDirectory. Tabs of stored sites (same
   // Name, see FindSame) are saved as links; others completely, without
-  // passwords unless SavePasswords. Only modifies the list: call
+  // passwords (ClearSessionPasswords) unless SavePasswords. Sites under
+  // "Name/" stay, also when they share the name by accident (an auto-saved
+  // workspace named like a site folder). Only modifies the list: call
   // Configuration::Save() (or StoredSessionList::Save) afterwards.
   void SaveWorkspace(StoredSessionList & Sessions, const QString & Name, const QList<SessionData> & Tabs, bool SavePasswords);
-  // Removes the workspace (all sites under "Name/", as the Login dialog does);
-  // returns the number of removed sessions
+  // Removes the workspace (its entries under "Name/", never sites); returns
+  // the number of removed entries
   int DeleteWorkspace(StoredSessionList & Sessions, const QString & Name);
+  // A site (with Folder: all sites of a folder) was renamed or moved: the
+  // workspace entries linking to it follow. Returns the number of changed links.
+  int UpdateLinks(StoredSessionList & Sessions, const QString & OldName, const QString & NewName, bool Folder = false);
 
   // TSessionData::HasStateData / CopyStateData
   bool HasStateData(const SessionData & Data);
   void CopyStateData(SessionData & Target, const SessionData & Source);
-  // TSessionData::HasAnySessionPassword / ClearSessionPasswords
+  // TSessionData::HasAnySessionPassword / ClearSessionPasswords: session,
+  // tunnel and proxy passwords and the S3 session token
   bool HasAnySessionPassword(const SessionData & Data);
   void ClearSessionPasswords(SessionData & Data);
 

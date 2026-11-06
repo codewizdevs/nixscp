@@ -26,7 +26,12 @@ Page {
         }
         return closeSession()
     }
-    function closeSession() { sessions.closeCurrent(); return true }
+    // closing a tab stops what runs in it: only when the user says so
+    function closeSession() {
+        if (session.busy || session.hasTransfers()) closeDialog.open()
+        else sessions.closeCurrent()
+        return true
+    }
 
     header: Column {
         ToolBar {
@@ -35,7 +40,7 @@ Page {
             Material.foreground: "white"
             RowLayout {
                 anchors.fill: parent
-                ToolButton { icon.source: "icons/close.svg"; icon.color: "white"; Accessible.name: qsTr("Disconnect"); onClicked: sessions.closeCurrent() }
+                ToolButton { icon.source: "icons/close.svg"; icon.color: "white"; Accessible.name: qsTr("Disconnect"); onClicked: page.closeSession() }
                 Label {
                     text: session.site
                     font.pixelSize: 17
@@ -133,6 +138,22 @@ Page {
             Layout.preferredWidth: page.width / 2
             onActivated: page.remoteActive = true
         }
+    }
+
+    Dialog {
+        id: closeDialog
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 32, 420)
+        modal: true
+        title: qsTr("Close %1?").arg(session.site)
+        standardButtons: Dialog.Cancel | Dialog.Yes
+        Label {
+            width: closeDialog.availableWidth
+            wrapMode: Text.Wrap
+            text: qsTr("Something is still running on this connection. Closing it stops its transfers.")
+        }
+        onAccepted: sessions.closeCurrent()
     }
 
     footer: ColumnLayout {

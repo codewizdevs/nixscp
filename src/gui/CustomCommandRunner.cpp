@@ -10,6 +10,7 @@
 #include "gui/EditMaskDialog.h"
 
 #include "core/Configuration.h"
+#include "core/CopyParam.h"
 #include "core/Platform.h"
 #include "core/SecureShell.h"
 #include "core/Terminal.h"
@@ -718,12 +719,13 @@ void Runner::LocalCommandPure(bool FileListCommand, bool LocalFileCommand)
     Finish();
     return;
   }
+  Platform::MakeDirectoryPrivate(FTempDir->path());
   QStringList RemotePaths;
   for (const QString & Name : FContext.SelectedRemoteFiles)
   {
     QString RemotePath = AbsoluteRemotePath(FContext.CurrentRemoteDir, Name);
     RemotePaths.append(RemotePath);
-    FTempToRemote.insert(UnixPath::ExtractFileName(RemotePath), RemotePath);
+    FTempToRemote.insert(CopyParam::ValidLocalFileName(UnixPath::ExtractFileName(RemotePath)), RemotePath);
   }
   CopyParam Param = Configuration::Instance().DefaultCopyParam().TemporaryFileCopyParam();
   Param.ConfirmOverwriting = false;
@@ -747,7 +749,8 @@ void Runner::LocalCommandPure(bool FileListCommand, bool LocalFileCommand)
       QStringList RemoteFileList;
       for (const QString & RemotePath : RemotePaths)
       {
-        QString Path = TempDir + QLatin1Char('/') + UnixPath::ExtractFileName(RemotePath);
+        // as the download named it: on Windows the name of the server is not a local one
+        QString Path = TempDir + QLatin1Char('/') + CopyParam::ValidLocalFileName(UnixPath::ExtractFileName(RemotePath));
         QFileInfo Info(Path);
         if (!Info.exists())
         {

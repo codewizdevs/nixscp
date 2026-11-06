@@ -189,6 +189,13 @@ static OperationResult DoList(Terminal & T, const QString & Path, RemoteFileList
   return W.Result;
 }
 
+static OperationResult DoJob(Terminal & T, Terminal::WorkerJob Job)
+{
+  Waiter W;
+  T.RunOnWorker(std::move(Job), W.Cb());
+  return W.Wait();
+}
+
 static const RemoteFile * Find(const RemoteFileList & Files, const QString & Name)
 {
   for (const RemoteFile & F : Files)
@@ -224,6 +231,12 @@ static void WriteFile(const QString & FileName, const QByteArray & Data, qint64 
   F.close();
   struct timespec Times[2] = {{static_cast<time_t>(MTime), 0}, {static_cast<time_t>(MTime), 0}};
   utimensat(AT_FDCWD, QFile::encodeName(FileName).constData(), Times, 0);
+}
+
+static QByteArray ReadFile(const QString & FileName)
+{
+  QFile F(FileName);
+  return F.open(QIODevice::ReadOnly) ? F.readAll() : QByteArray();
 }
 
 static QByteArray RandomData(qint64 Size)
@@ -303,6 +316,262 @@ static unsigned int LocalMode(const QString & Path)
   return St.st_mode & 07777;
 }
 
+// B8, L13, B9: new files and folders, .filepart that cannot be created,
+// a file that cannot be overwritten; L: SFTPRealPath, TrimVMSVersions
+static void TestUploadTargets(SessionData Data, TestUserInterface & UI, CopyParam Param, const QString & Scratch)
+{
+  QString Dir = QDir(Scratch).filePath(QStringLiteral("uptargets"));
+  QDir().mkpath(Dir);
+  QString Local = QDir(Scratch).filePath(QStringLiteral("uplocal"));
+  QDir().mkpath(Local);
+  // above the 100 KB of the smart resume: goes through .filepart
+  QString Big = Local + QStringLiteral("/big.bin");
+  WriteFile(Big, RandomData(300000), 1600000000);
+
+  auto Upload = [&](Terminal & T, const QStringList & Files, const QString & Target, const CopyParam & P)
+  {
+    Waiter W;
+    T.CopyToRemote(Files, Target, P, false, W.Cb());
+    return W.Wait();
+  };
+
+  std::printf("[upload: .filepart cannot be created]\n");
+  {
+    UI.Reset();
+    Terminal T(Data, &UI);
+    OperationResult R = DoOpen(T);
+    CHECK_MSG(R.Ok, Describe(R));
+    // a folder where the existing file can be written, but no file created
+    QString NoCreate = Dir + QStringLiteral("/nocreate");
+    QDir().mkpath(NoCreate);
+    WriteFile(NoCreate + QStringLiteral("/big.bin"), "old", 1500000000);
+    QFile::setPermissions(NoCreate, QFile::ReadOwner | QFile::ExeOwner | QFile::ReadUser | QFile::ExeUser);
+    CopyParam Overwrite = Param;
+    Overwrite.ConfirmOverwriting = false;
+    // writing over the target is no longer safe from a failed upload, so
+    // nobody asked (script in batch mode, background queue) means no
+    QString Target = NoCreate + QStringLiteral("/big.bin");
+    for (unsigned int Answer : {qaSkip, qaAbort})
+    {
+      UI.Reset();
+      UI.QueryAnswers = {Answer};
+      R = Upload(T, {Big}, NoCreate, Overwrite);
+      CHECK_MSG(!UI.Queries.isEmpty() && UI.Queries.first().contains(QStringLiteral("big.bin.filepart")), UI.Queries.join(QLatin1Char('|')));
+      CHECK(ReadFile(Target) == "old");
+    }
+    UI.Reset();
+    UI.QueryAnswers = {qaYes};
+    R = Upload(T, {Big}, NoCreate, Overwrite);
+    CHECK_MSG(R.Ok, Describe(R));
+    CHECK(UI.Queries.size() == 1);
+    CHECK(Sha256(Target) == Sha256(Big));
+    CHECK(!QFile::exists(NoCreate + QStringLiteral("/big.bin.filepart")));
+    // the upload fails after the answer: what there is stays, even if it is not much
+    {
+      QString Huge = Local + QStringLiteral("/huge/big.bin");
+      QDir().mkpath(Local + QStringLiteral("/huge"));
+      WriteFile(Huge, RandomData(32 * 1024 * 1024), 1600000000);
+      UI.Reset();
+      UI.QueryAnswers = {qaYes};
+      auto Timer = new QTimer();
+      Timer->setInterval(0);
+      QObject::connect(Timer, &QTimer::timeout, Timer, [&T, Timer]()
+      {
+        if (T.Progress().Get().FileTransferred > 0)
+        {
+          T.Progress().Cancel();
+          Timer->stop();
+        }
+      });
+      Timer->start();
+      CopyParam Slow = Overwrite;
+      Slow.CPSLimit = 2 * 1024 * 1024;
+      R = Upload(T, {Huge}, NoCreate, Slow);
+      delete Timer;
+      CHECK_MSG(!R.Ok, Describe(R));
+      CHECK(QFile::exists(Target));
+      QFile::remove(Huge);
+    }
+    QFile::setPermissions(NoCreate, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner | QFile::ReadUser | QFile::WriteUser | QFile::ExeUser);
+    UI.Reset();
+    WriteFile(NoCreate + QStringLiteral("/big.bin"), "old", 1500000000);
+    // with resume forced there is no fallback (rsOn, as WinSCP)
+    QFile::setPermissions(NoCreate, QFile::ReadOwner | QFile::ExeOwner | QFile::ReadUser | QFile::ExeUser);
+    CopyParam Forced = Overwrite;
+    Forced.ResumeSupport = CopyParam::rsOn;
+    R = Upload(T, {Big}, NoCreate, Forced);
+    QFile::setPermissions(NoCreate, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner | QFile::ReadUser | QFile::WriteUser | QFile::ExeUser);
+    CHECK_MSG(!R.Ok && !R.Fatal, Describe(R));
+    // no such target either: the error of the file itself
+    QString NoFile = Dir + QStringLiteral("/nofile");
+    QDir().mkpath(NoFile);
+    QFile::setPermissions(NoFile, QFile::ReadOwner | QFile::ExeOwner | QFile::ReadUser | QFile::ExeUser);
+    R = Upload(T, {Big}, NoFile, Param);
+    QFile::setPermissions(NoFile, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner | QFile::ReadUser | QFile::WriteUser | QFile::ExeUser);
+    CHECK_MSG(!R.Ok && !R.Fatal, Describe(R));
+  }
+
+  std::printf("[upload: target cannot be overwritten]\n");
+  {
+    UI.Reset();
+    Terminal T(Data, &UI);
+    OperationResult R = DoOpen(T);
+    CHECK_MSG(R.Ok, Describe(R));
+    QString Small = Local + QStringLiteral("/small.txt");
+    WriteFile(Small, "new contents", 1600000000);
+    QString Target = Dir + QStringLiteral("/small.txt");
+    WriteFile(Target, "old", 1500000000);
+    QFile::setPermissions(Target, QFile::ReadOwner | QFile::ReadUser);
+    CopyParam NoConfirm = Param;
+    NoConfirm.ConfirmOverwriting = false;
+    // Abort keeps it
+    UI.QueryAnswers = {qaAbort};
+    R = Upload(T, {Small}, Dir, NoConfirm);
+    CHECK_MSG(!R.Ok, Describe(R));
+    CHECK_MSG((UI.Queries.size() == 1) && UI.Queries.value(0).contains(QStringLiteral("Cannot overwrite remote file")) &&
+      UI.Queries.value(0).contains(QStringLiteral("Press 'Delete'")), UI.Queries.join(QLatin1Char('|')));
+    QFile Old(Target);
+    CHECK(Old.open(QIODevice::ReadOnly) && (Old.readAll() == "old"));
+    Old.close();
+    // Delete replaces it
+    UI.Reset();
+    UI.QueryAnswers = {qaRetry};
+    R = Upload(T, {Small}, Dir, NoConfirm);
+    CHECK_MSG(R.Ok, Describe(R));
+    CHECK(Sha256(Target) == Sha256(Small));
+  }
+
+  std::printf("[new files and folders: the rights are the server's]\n");
+  {
+    // a server with umask 002, as a shared group folder: 0664/0775 unless set
+    SessionData Group = Data;
+    QString SftpServer = qEnvironmentVariable("NIXSCP_TEST_SFTP_SERVER");
+    for (const char * Candidate : {"/usr/lib/openssh/sftp-server", "/usr/libexec/openssh/sftp-server", "/usr/libexec/sftp-server"})
+    {
+      if (SftpServer.isEmpty() && QFileInfo(QString::fromLatin1(Candidate)).isExecutable())
+      {
+        SftpServer = QString::fromLatin1(Candidate);
+      }
+    }
+    if (SftpServer.isEmpty())
+    {
+      Log(QStringLiteral("SKIPPED: no sftp-server to run with its own umask (set NIXSCP_TEST_SFTP_SERVER)"));
+    }
+    else
+    {
+      Group.SftpServer = SftpServer + QStringLiteral(" -u 002");
+      UI.Reset();
+      Terminal T(Group, &UI);
+      OperationResult R = DoOpen(T);
+      CHECK_MSG(R.Ok, Describe(R));
+      QString Target = Dir + QStringLiteral("/rights");
+      QDir().mkpath(Target);
+      QString Tree = Local + QStringLiteral("/tree");
+      QDir().mkpath(Tree + QStringLiteral("/sub"));
+      WriteFile(Tree + QStringLiteral("/sub/f.txt"), "x", 1600000000);
+      WriteFile(Local + QStringLiteral("/plain.txt"), "x", 1600000000);
+      QFile::setPermissions(Local + QStringLiteral("/plain.txt"), QFile::ReadOwner | QFile::WriteOwner | QFile::ReadUser | QFile::WriteUser);
+      R = Upload(T, {Tree, Local + QStringLiteral("/plain.txt"), Big}, Target, Param);
+      CHECK_MSG(R.Ok, Describe(R));
+      CHECK_MSG(LocalMode(Target + QStringLiteral("/plain.txt")) == 0664, QString::number(LocalMode(Target + QStringLiteral("/plain.txt")), 8));
+      CHECK_MSG(LocalMode(Target + QStringLiteral("/big.bin")) == 0664, QString::number(LocalMode(Target + QStringLiteral("/big.bin")), 8));
+      CHECK_MSG(LocalMode(Target + QStringLiteral("/tree")) == 0775, QString::number(LocalMode(Target + QStringLiteral("/tree")), 8));
+      CHECK_MSG(LocalMode(Target + QStringLiteral("/tree/sub")) == 0775, QString::number(LocalMode(Target + QStringLiteral("/tree/sub")), 8));
+      CHECK_MSG(LocalMode(Target + QStringLiteral("/tree/sub/f.txt")) == 0664, QString::number(LocalMode(Target + QStringLiteral("/tree/sub/f.txt")), 8));
+      {
+        Waiter W;
+        T.CreateDirectory(Target + QStringLiteral("/made"), ServerDefaultMode, W.Cb());
+        R = W.Wait();
+        CHECK_MSG(R.Ok, Describe(R));
+        CHECK(LocalMode(Target + QStringLiteral("/made")) == 0775);
+      }
+      // "Set permissions" still rules
+      CopyParam Set = Param;
+      Set.PreserveRights = true;
+      Set.Rights = 0600;
+      WriteFile(Local + QStringLiteral("/set.txt"), "x", 1600000000);
+      R = Upload(T, {Local + QStringLiteral("/set.txt")}, Target, Set);
+      CHECK_MSG(R.Ok, Describe(R));
+      CHECK(LocalMode(Target + QStringLiteral("/set.txt")) == 0600);
+      // an overwritten file keeps its rights
+      QFile::setPermissions(Target + QStringLiteral("/plain.txt"), QFile::ReadOwner | QFile::WriteOwner | QFile::ReadUser | QFile::WriteUser);
+      CopyParam Overwrite = Param;
+      Overwrite.ConfirmOverwriting = false;
+      R = Upload(T, {Local + QStringLiteral("/plain.txt")}, Target, Overwrite);
+      CHECK_MSG(R.Ok, Describe(R));
+      CHECK_MSG(LocalMode(Target + QStringLiteral("/plain.txt")) == 0600, QString::number(LocalMode(Target + QStringLiteral("/plain.txt")), 8));
+    }
+  }
+
+  std::printf("[SFTPRealPath off: no SSH_FXP_REALPATH]\n");
+  {
+    SessionData NoReal = Data;
+    NoReal.SFTPRealPath = asOff;
+    NoReal.RemoteDirectory = Dir;
+    UI.Reset();
+    Terminal T(NoReal, &UI);
+    OperationResult R = DoOpen(T);
+    CHECK_MSG(R.Ok, Describe(R));
+    CHECK_MSG(T.CurrentDirectory() == Dir, T.CurrentDirectory());
+    // resolved locally, "/./" and ".." and all
+    QString Result;
+    R = DoJob(T, [&](FileSystem & Fs, FileOperationProgress &, UserInterface &)
+    {
+      Result = Fs.CanonicalizePath(Dir + QStringLiteral("/./rights/../rights"));
+    });
+    CHECK_MSG(R.Ok, Describe(R));
+    CHECK_MSG(Result == Dir + QStringLiteral("/rights"), Result);
+  }
+
+  std::printf("[PreserveReadOnly]\n");
+  {
+    QString Remote = Dir + QStringLiteral("/readonly.txt");
+    WriteFile(Remote, "ro", 1600000000);
+    QFile::setPermissions(Remote, QFile::ReadOwner | QFile::ReadUser | QFile::ReadGroup);
+    QString Target = QDir(Scratch).filePath(QStringLiteral("rodown"));
+    QDir().mkpath(Target);
+    UI.Reset();
+    Terminal T(Data, &UI);
+    CHECK_MSG(DoOpen(T).Ok, QStringLiteral("open"));
+    CopyParam ReadOnly = Param;
+    ReadOnly.PreserveReadOnly = true;
+    Waiter W;
+    T.CopyToLocal({Remote}, Target, ReadOnly, false, W.Cb());
+    OperationResult R = W.Wait();
+    CHECK_MSG(R.Ok, Describe(R));
+    CHECK_MSG((LocalMode(Target + QStringLiteral("/readonly.txt")) & 0222) == 0, QString::number(LocalMode(Target + QStringLiteral("/readonly.txt")), 8));
+    // without the option the file stays writable
+    QFile::setPermissions(Target + QStringLiteral("/readonly.txt"), QFile::ReadOwner | QFile::WriteOwner | QFile::ReadUser | QFile::WriteUser);
+    QFile::remove(Target + QStringLiteral("/readonly.txt"));
+    Waiter W2;
+    T.CopyToLocal({Remote}, Target, Param, false, W2.Cb());
+    R = W2.Wait();
+    CHECK_MSG(R.Ok, Describe(R));
+    CHECK((LocalMode(Target + QStringLiteral("/readonly.txt")) & 0200) != 0);
+  }
+
+  std::printf("[TrimVMSVersions]\n");
+  {
+    SessionData Trim = Data;
+    Trim.TrimVMSVersions = true;
+    QString Remote = Dir + QStringLiteral("/vms");
+    QDir().mkpath(Remote);
+    WriteFile(Remote + QStringLiteral("/report.txt;12"), "vms", 1600000000);
+    QString Target = QDir(Scratch).filePath(QStringLiteral("vmsdown"));
+    QDir().mkpath(Target);
+    UI.Reset();
+    Terminal T(Trim, &UI);
+    OperationResult R = DoOpen(T);
+    CHECK_MSG(R.Ok, Describe(R));
+    Waiter W;
+    T.CopyToLocal({Remote}, Target, Param, false, W.Cb());
+    R = W.Wait();
+    CHECK_MSG(R.Ok, Describe(R));
+    CHECK(QFile::exists(Target + QStringLiteral("/vms/report.txt")));
+    CHECK(!QFile::exists(Target + QStringLiteral("/vms/report.txt;12")));
+  }
+}
+
 int main(int argc, char ** argv)
 {
   QCoreApplication App(argc, argv);
@@ -342,6 +611,66 @@ int main(int argc, char ** argv)
 
   TestUserInterface UI;
   CopyParam Param;
+
+  {
+    SessionData TargetsData = Data;
+    TargetsData.HostKey = QStringLiteral("*");
+    TestUploadTargets(TargetsData, UI, Param, Scratch.path());
+  }
+
+  std::printf("[initial directory]\n");
+  {
+    SessionData Missing = Data;
+    Missing.HostKey = QStringLiteral("*");
+    Missing.RemoteDirectory = Scratch.filePath(QStringLiteral("no/such/directory"));
+    // a stored site with UpdateDirectories falls back to the home directory
+    {
+      UI.Reset();
+      Terminal T(Missing, &UI);
+      OperationResult R = DoOpen(T);
+      CHECK_MSG(R.Ok, Describe(R));
+      CHECK_MSG(T.CurrentDirectory() != Missing.RemoteDirectory, T.CurrentDirectory());
+    }
+    // OpenSSH canonicalizes a missing last component: still an error
+    Missing.RemoteDirectory = Scratch.filePath(QStringLiteral("missing"));
+    Missing.RequireDirectories = true;
+    {
+      UI.Reset();
+      Terminal T(Missing, &UI);
+      OperationResult R = DoOpen(T);
+      CHECK_MSG(!R.Ok && R.Message.contains(QStringLiteral("Error changing directory")), Describe(R));
+      CHECK(!T.Active());
+    }
+    Missing.RequireDirectories = false;
+    Missing.UpdateDirectories = false;
+    {
+      UI.Reset();
+      Terminal T(Missing, &UI);
+      OperationResult R = DoOpen(T);
+      CHECK_MSG(!R.Ok, Describe(R));
+    }
+    // a file is no directory
+    QString File = Scratch.filePath(QStringLiteral("afile"));
+    WriteFile(File, "x", 1600000000);
+    Missing.RemoteDirectory = File;
+    Missing.RequireDirectories = true;
+    Missing.UpdateDirectories = true;
+    {
+      UI.Reset();
+      Terminal T(Missing, &UI);
+      OperationResult R = DoOpen(T);
+      CHECK_MSG(!R.Ok, Describe(R));
+    }
+    // an existing one is simply used
+    Missing.RemoteDirectory = Scratch.path();
+    {
+      UI.Reset();
+      Terminal T(Missing, &UI);
+      OperationResult R = DoOpen(T);
+      CHECK_MSG(R.Ok, Describe(R));
+      CHECK_MSG(T.CurrentDirectory() == QDir(Scratch.path()).canonicalPath(), T.CurrentDirectory());
+    }
+  }
 
   // ---------------------------------------------------------------- host keys
   std::printf("[host key: cancel]\n");
@@ -431,8 +760,18 @@ int main(int argc, char ** argv)
     UI.Reset();
     Terminal T(Wrong, &UI);
     OperationResult R = DoOpen(T);
-    CHECK_MSG(!R.Ok && R.Fatal, Describe(R));
-    CHECK(R.Message == QStringLiteral("Authentication failed."));
+    CHECK_MSG(!R.Ok, Describe(R));
+    // a server that takes passwords too, as the one of macOS, is asked for no less
+    // and the question is answered with Cancel; one that takes keys only says no
+    if (UI.PromptKinds.isEmpty())
+    {
+      CHECK_MSG(R.Fatal, Describe(R));
+      CHECK(R.Message == QStringLiteral("Authentication failed."));
+    }
+    else
+    {
+      CHECK_MSG(R.Aborted, Describe(R));
+    }
     Log(Describe(R));
   }
   std::printf("[auth: missing key file]\n");

@@ -122,6 +122,16 @@ bool IsNewer(const QString & Latest, const QString & Current)
   return !L.isNull() && (QVersionNumber::compare(L, C) > 0);
 }
 
+bool CheckDue(const QDateTime & LastCheck, const QDateTime & Now)
+{
+  if (!LastCheck.isValid())
+  {
+    return true;
+  }
+  qint64 Elapsed = LastCheck.secsTo(Now);
+  return (Elapsed < 0) || (Elapsed >= CheckIntervalSecs);
+}
+
 void Start(QWidget * Window)
 {
   Configuration & Config = Configuration::Instance();
@@ -129,7 +139,7 @@ void Start(QWidget * Window)
   {
     return;
   }
-  if (Config.UpdateLastCheck.isValid() && (Config.UpdateLastCheck.secsTo(QDateTime::currentDateTimeUtc()) < CheckIntervalSecs))
+  if (!CheckDue(Config.UpdateLastCheck, QDateTime::currentDateTimeUtc()))
   {
     return;
   }

@@ -288,10 +288,14 @@ int main(int argc, char ** argv)
     CHECK(Dialog.OnceDoneOperation() == SystemActions::odoIdle);
     if (OnceDone != nullptr)
     {
-      OnceDone->click();
-      CHECK(Dialog.OnceDoneOperation() == SystemActions::odoSuspend);
-      OnceDone->click();
-      CHECK(Dialog.OnceDoneOperation() == SystemActions::odoShutDown);
+      // Sleep and Shut Down: not offered without a backend (Windows, macOS)
+      if (SystemActions::OperationSupported(SystemActions::odoSuspend))
+      {
+        OnceDone->click();
+        CHECK(Dialog.OnceDoneOperation() == SystemActions::odoSuspend);
+        OnceDone->click();
+        CHECK(Dialog.OnceDoneOperation() == SystemActions::odoShutDown);
+      }
       OnceDone->click();
       CHECK(Dialog.OnceDoneOperation() == SystemActions::odoIdle);
       QList<QAction *> Items = OnceDone->menu()->actions();

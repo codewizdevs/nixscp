@@ -26,8 +26,10 @@ All files live next to the configuration file: `~/.config/nixscp/` on Linux, `~/
 |---|---|---|
 | `nixscp.ini` | Sites, stored passwords, preferences, workspaces, bookmarks (WinSCP.ini format) | Yes |
 | `nixscp-cloud-session.ini` | Cached open tabs of cloud sync | Yes |
-| `nixscp-teams.ini` | Team names and team sync state | Yes |
+| `nixscp-teams.ini` | Team names, team sync state, verified member list pins and older team keys | Yes |
 | `backups/nixscp-*.ini` | Copies made before cloud settings replace the local ones (last 10) | Yes |
 | `agent-sessions/*.log` | Agent session recordings | Yes |
-| `nixscp-cloud.ini` | Cloud account, sign-in token, sync state, the wrapped (password-protected) data key | No (owner-only permissions) |
+| `nixscp-cloud.ini` | Cloud account, sign-in token, sync state, the wrapped (password-protected) data key | Yes, once a NixSCP password is set |
+| `nixscp-cloud-keys.ini` | Key changes under way: a new data key, old keys, team keys on their way to the server, a recovery key not confirmed yet | Yes |
+| `nixscp-cloud-bridge.ini` | The old data key, only while a new key reaches the local files | Yes |
 | `nixscp-agent.log` | Agent access audit log | No (owner-only permissions) |

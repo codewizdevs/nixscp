@@ -697,6 +697,15 @@ int main(int argc, char ** argv)
     CHECK(!Q.ProcessUserAction(Id));
     CHECK_MSG(M.Emptied == 1, QString::number(M.Emptied));
 
+    // S17: a selected entry that names no file of its own stays out of the target's parent
+    {
+      M.Done.clear();
+      int Evil = Q.AddDownload({Remote + QStringLiteral("/x/..")}, Back, Param, false);
+      CHECK(WaitFor([&]() { return M.Done.size() == 1; }, 30000));
+      CHECK(M.Find(Evil) && !M.Find(Evil)->Result.Ok && M.Find(Evil)->Result.MoreMessages.isEmpty());
+      M.Done.clear();
+    }
+
     // overwrite query of a transfer without QueueNoConfirmation, cancelled by Delete
     std::printf("[overwrite query, delete while waiting]\n");
     CopyParam Confirm = Param;

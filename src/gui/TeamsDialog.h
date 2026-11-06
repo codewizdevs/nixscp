@@ -53,6 +53,10 @@ private:
   QTabWidget * FTabs;
   QWidget * FDetails;
   QLabel * FEmpty;
+  QLabel * FBanner;
+  QPushButton * FKeepMine;
+  QPushButton * FUseTeam;
+  QPushButton * FForget;
   // Shared sites
   QTreeWidget * FSites;
   QPushButton * FShareSites;
@@ -61,6 +65,7 @@ private:
   QLabel * FSitesHint;
   // Members
   QTableWidget * FMembers;
+  QLabel * FFingerprint;
   QPushButton * FInvite;
   QPushButton * FMakeAdmin;
   QPushButton * FMakeMember;
@@ -89,6 +94,8 @@ private:
   void SetRole(const QString & Role);
   void RemoveMember();
   void Rename();
+  void RestoreFromHistory();
+  void Forget();
   void Leave();
   void Delete();
 };

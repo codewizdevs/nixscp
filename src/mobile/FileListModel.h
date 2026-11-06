@@ -5,6 +5,7 @@
 
 #include <QAbstractListModel>
 #include <QDateTime>
+#include <QHash>
 #include <QSet>
 #include <QVariantMap>
 
@@ -81,6 +82,8 @@ signals:
 private:
   QList<Entry> FAll;
   QList<int> FVisible;   // indexes of FAll, in the shown order
+  QHash<QString, int> FIndexOf;   // name -> index of FAll
+  QHash<int, int> FRowOf;         // index of FAll -> row shown
   QSet<QString> FSelected;
   int FSortBy = SortName;
   bool FDescending = false;

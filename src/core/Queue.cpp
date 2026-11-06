@@ -378,7 +378,8 @@ private:
     auto Action = std::make_shared<UserAction>();
     Action->Kind = UserAction::atQuery;
     // TTerminalItem::TerminalQueryUser: an error query is presented as "Error"
-    bool Error = (Params.Type == qtError) || ((Answers & (qaRetry | qaSkip)) != 0);
+    // (qaRetry with qaYes is the "Append" of an overwrite query)
+    bool Error = (Params.Type == qtError) || (((Answers & (qaRetry | qaSkip)) != 0) && ((Answers & qaYes) == 0));
     Action->Status = Error ? QueueItemInfo::qsError : QueueItemInfo::qsQuery;
     Action->Query = Query;
     Action->MoreMessages = MoreMessages;
@@ -459,7 +460,7 @@ struct Unit
   QString Source;         // file / directory / remote file of the segment
   QString Target;         // ukFile: target directory; ukDir: directory to create; ukPart: part file
   qint64 Size = 0;
-  unsigned int Mode = 0;  // ukDir
+  int Mode = ServerDefaultMode;  // ukDir
   int Parent = -1;        // unit (ukDir) that must be done first
   enum State { usPending, usRunning, usDone };
   State Status = usPending;
@@ -1504,6 +1505,11 @@ void TransferQueue::Private::StartScan(Item & I, Worker & W)
     RemoteFile OnlyFile;
     for (const QString & Path : Sources)
     {
+      // see Terminal::CopyToLocal
+      if (!UnixPath::HasValidFileName(Path))
+      {
+        throw ExtException(QStringLiteral("Invalid file name '%1'.").arg(Path));
+      }
       RemoteFile File = Fs.ReadFile(Path);
       if (Sources.size() == 1)
       {
@@ -1533,7 +1539,7 @@ void TransferQueue::Private::StartScan(Item & I, Worker & W)
       {
         if (Param.NewerOnly)
         {
-          if (OnlyFile.Modification.toSecsSinceEpoch() <= Existing.lastModified().toSecsSinceEpoch())
+          if (!IsNewerModification(OnlyFile.Modification, OnlyFile.ModificationFmt, Existing.lastModified(), mfFull))
           {
             Scan->Skip = true;
             return;
@@ -1668,7 +1674,7 @@ void TransferQueue::Private::HandleScanned(int WorkerId, const OperationResult &
         }
         U.Kind = Unit::ukDir;
         U.Target = Entry.Target;
-        U.Mode = I.Param.PreserveRights ? I.Param.RemoteFileRights(true) : 0755;
+        U.Mode = I.Param.PreserveRights ? static_cast<int>(I.Param.RemoteFileRights(true)) : ServerDefaultMode;
         DirUnit[Index] = static_cast<int>(PS.Units.size());
       }
       else
@@ -2682,6 +2688,7 @@ int TransferQueue::AddUpload(const QStringList & LocalPaths, const QString & Rem
   I.Info.Sources = LocalPaths;
   I.Info.TargetDirectory = RemoteDirectory;
   I.Param = QueueCopyParam(Param);
+  I.Param.TrimVMSVersions = d->Data.TrimVMSVersions;
   I.Parallel = CanParallel(Param, Move) && (d->Data.FSProtocol != fsSCPonly);
   return d->Add(std::move(I));
 }
@@ -2694,6 +2701,7 @@ int TransferQueue::AddDownload(const QStringList & RemotePaths, const QString & 
   I.Info.Sources = RemotePaths;
   I.Info.TargetDirectory = LocalDirectory;
   I.Param = QueueCopyParam(Param);
+  I.Param.TrimVMSVersions = d->Data.TrimVMSVersions;
   I.Parallel = CanParallel(Param, Move) && (d->Data.FSProtocol != fsSCPonly);
   return d->Add(std::move(I));
 }

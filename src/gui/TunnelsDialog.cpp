@@ -74,6 +74,11 @@ void TunnelManager::Start(const SessionData & Data, const PortForwardSpec & Spec
     {
       FErrors.insert(K, Error);
     }
+    else
+    {
+      // stopped as asked: a connection that failed earlier is history
+      FErrors.remove(K);
+    }
     if (FTunnels.value(K) == Tunnel)
     {
       FTunnels.remove(K);
@@ -131,7 +136,7 @@ namespace TunnelsUi
 QString Describe(const PortForward * Tunnel, const QString & Site)
 {
   const PortForwardSpec & Spec = Tunnel->Spec();
-  QString Text = QStringLiteral("%1: %2  127.0.0.1:%3 \u2192 %4:%5").arg(Site, Spec.Name).arg(Spec.LocalPort).arg(Spec.Host).arg(Spec.Port);
+  QString Text = QStringLiteral("%1: %2  127.0.0.1:%3 \u2192 %4:%5").arg(Site, Spec.Name, QString::number(Spec.LocalPort), Spec.Host, QString::number(Spec.Port));
   if (!Tunnel->Running())
   {
     return Text + QStringLiteral(" (connecting...)");
@@ -270,7 +275,14 @@ TunnelsDialog::TunnelsDialog(QWidget * Parent) : QDialog(Parent)
   connect(FStart, &QPushButton::clicked, this, [this]() { StartSelected(); });
   connect(FStop, &QPushButton::clicked, this, [this]() { StopSelected(); });
   connect(FTable, &QTableWidget::itemSelectionChanged, this, [this]() { UpdateButtons(); });
-  connect(FTable, &QTableWidget::cellDoubleClicked, this, [this]() { Edit(false); });
+  connect(FTable, &QTableWidget::cellDoubleClicked, this, [this]()
+  {
+    // as the button: a running tunnel cannot be edited
+    if (FEdit->isEnabled())
+    {
+      Edit(false);
+    }
+  });
   connect(&TunnelManager::Instance(), &TunnelManager::Changed, this, [this]() { Reload(); });
   Reload();
   resize(860, 400);
@@ -385,9 +397,16 @@ void TunnelsDialog::Edit(bool New)
   PortForwardSpec Old;
   if (!New)
   {
+    // sync or another window may have removed the site since the list was filled
+    auto Current = Sites.FindByName(SiteName);
+    if (Current == nullptr)
+    {
+      Reload();
+      return;
+    }
     SiteCombo->setCurrentText(SiteName);
     SiteCombo->setEnabled(false);
-    for (const PortForwardSpec & Spec : PortForwardSpec::LoadAll(Sites.FindByName(SiteName)->PortForwards))
+    for (const PortForwardSpec & Spec : PortForwardSpec::LoadAll(Current->PortForwards))
     {
       if (Spec.Name == Name)
       {
@@ -417,17 +436,22 @@ void TunnelsDialog::Edit(bool New)
     return;
   }
   PortForwardSpec Spec;
-  Spec.Name = NameEdit->text().trimmed().remove(QLatin1Char('|'));
+  Spec.Name = NameEdit->text().trimmed();
   Spec.LocalPort = LocalPort->value();
   Spec.Host = Host->text().trimmed();
   Spec.Port = Port->value();
   if (Spec.Name.isEmpty())
   {
-    Spec.Name = QStringLiteral("%1-%2").arg(Spec.Host).arg(Spec.Port);
+    Spec.Name = QStringLiteral("%1-%2").arg(Spec.Host, QString::number(Spec.Port));
   }
   auto Site = Sites.FindByName(SiteCombo->currentText());
-  if ((Site == nullptr) || !Spec.IsValid())
+  if (Site == nullptr)
   {
+    return;
+  }
+  if (!Spec.IsValid())
+  {
+    QMessageBox::warning(this, windowTitle(), QStringLiteral("\"%1\" is not a valid host.").arg(Spec.Host));
     return;
   }
   QList<PortForwardSpec> List = PortForwardSpec::LoadAll(Site->PortForwards);

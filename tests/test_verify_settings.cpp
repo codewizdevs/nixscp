@@ -48,6 +48,7 @@ int main()
 #include <QDir>
 #include <QFile>
 #include <QGroupBox>
+#include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMessageBox>
@@ -1464,11 +1465,112 @@ static void TestAddedOptions(const QString & Dir)
   C.Load();
 }
 
+// F-12, B21, M7, S-xx: Site Advanced shows what works, and keeps what is stored
+static void TestSiteAdvancedControls()
+{
+  std::printf("[Site Advanced: controls]\n");
+  auto Texts = [](QWidget * Dialog)
+  {
+    QStringList Result;
+    for (QLabel * L : Dialog->findChildren<QLabel *>())
+    {
+      Result.append(L->text());
+    }
+    for (QAbstractButton * B : Dialog->findChildren<QAbstractButton *>())
+    {
+      Result.append(B->text());
+    }
+    for (QGroupBox * G : Dialog->findChildren<QGroupBox *>())
+    {
+      Result.append(G->title());
+    }
+    return Result.join(QLatin1Char('\n'));
+  };
+  SessionData Stored;
+  Stored.HostName = QStringLiteral("example.com");
+  Stored.SFTPMaxVersion = 4;
+  Stored.RekeyTime = 33;
+  Stored.AuthGSSAPIKEX = true;
+  Stored.Ssh2DES = true;
+  Stored.DSTMode = dstmWin;
+  Stored.TunnelLocalPortNumber = 50010;
+  Stored.Bug[sbHMAC2] = asOn;
+  Stored.Bug[sbRekey2] = asOn;
+  {
+    SessionData D = Stored;
+    SiteAdvancedDialog Dialog(D);
+    QString All = Texts(&Dialog);
+    for (const char * Gone : {"Preferred SFTP protocol version", "single-&DES", "GSSAPI key exchange", "Max &minutes before rekey",
+           "Daylight saving time", "Local tunnel port", "Miscomputes", "winadj", "Ignores SSH ma"})
+    {
+      CHECK(!All.contains(QString::fromLatin1(Gone)));
+    }
+    CHECK(All.contains(QStringLiteral("3 (the only version NixSCP uses)")));
+    CHECK(All.contains(QStringLiteral("Handles SSH &key re-exchange badly")));
+    Dialog.accept();
+    CHECK_EQ(D.SFTPMaxVersion, 4);
+    CHECK_EQ(D.RekeyTime, 33);
+    CHECK(D.AuthGSSAPIKEX);
+    CHECK(D.Ssh2DES);
+    CHECK(D.DSTMode == dstmWin);
+    CHECK_EQ(D.TunnelLocalPortNumber, 50010);
+    CHECK(D.Bug[sbHMAC2] == asOn);
+    CHECK(D.Bug[sbRekey2] == asOn);
+  }
+  // F-12: the logon types of an FTP proxy
+  auto ProxyCombo = [](QWidget * Dialog) -> QComboBox *
+  {
+    for (QComboBox * Combo : Dialog->findChildren<QComboBox *>())
+    {
+      if ((Combo->count() >= 4) && (Combo->itemText(1) == QStringLiteral("SOCKS4")))
+      {
+        return Combo;
+      }
+    }
+    return nullptr;
+  };
+  SessionData Ftp;
+  Ftp.HostName = QStringLiteral("example.com");
+  Ftp.FSProtocol = fsFTP;
+  Ftp.PortNumber = 21;
+  {
+    SessionData D = Ftp;
+    D.FtpProxyLogonType = 3;
+    SiteAdvancedDialog Dialog(D);
+    QComboBox * Combo = ProxyCombo(&Dialog);
+    CHECK(Combo != nullptr);
+    CHECK_EQ(Combo->count(), 12);
+    CHECK_EQ(Combo->currentText(), QStringLiteral("OPEN %host"));
+    Combo->setCurrentIndex(Combo->findText(QStringLiteral("USER %user@%host %proxyuser")));
+    Dialog.accept();
+    CHECK_EQ(D.FtpProxyLogonType, 7);
+    CHECK(D.ProxyMethod == pmNone);
+  }
+  {
+    SessionData D = Ftp;
+    D.FtpProxyLogonType = 3;
+    SiteAdvancedDialog Dialog(D);
+    QComboBox * Combo = ProxyCombo(&Dialog);
+    Combo->setCurrentIndex(pmSocks5);
+    Dialog.accept();
+    CHECK_EQ(D.FtpProxyLogonType, 0);
+    CHECK(D.ProxyMethod == pmSocks5);
+  }
+  {
+    // nothing of the kind for other protocols, which have no logon
+    SessionData D = Stored;
+    SiteAdvancedDialog Dialog(D);
+    CHECK(ProxyCombo(&Dialog) != nullptr);
+    CHECK_EQ(ProxyCombo(&Dialog)->findText(QStringLiteral("OPEN %host")), -1);
+  }
+}
+
 int main(int argc, char ** argv)
 {
   QTemporaryDir ConfigDir;
   qputenv("XDG_CONFIG_HOME", ConfigDir.path().toLocal8Bit());
   QApplication App(argc, argv);
+  TestSiteAdvancedControls();
   ScreenshotDir = qEnvironmentVariable("NIXSCP_TEST_SCREENSHOT_DIR");
   Verbose = !qEnvironmentVariableIsEmpty("NIXSCP_VERIFY_VERBOSE");
   InstallModalKiller();

@@ -4,15 +4,33 @@
 #include "core/SecureShell.h"
 
 #include <QClipboard>
+#include <QElapsedTimer>
 #include <QGuiApplication>
 #include <QHash>
 #include <QMetaObject>
+
+#include <chrono>
 
 #include <libssh/libssh.h>
 
 namespace
 {
 const int ScrollbackLines = 2000;
+std::atomic<int> EndingShells{0};
+
+// Declared after the connection: a channel must go before its session,
+// which frees what still belongs to it
+struct ChannelHolder
+{
+  ssh_channel Channel = nullptr;
+  ~ChannelHolder()
+  {
+    if (Channel != nullptr)
+    {
+      ssh_channel_free(Channel);
+    }
+  }
+};
 }
 
 // libvterm's callbacks as members (the user pointer is the session)
@@ -131,6 +149,11 @@ void TerminalSession::Start(int Cols, int Rows)
   }
   Join();
   FStop = false;
+  // what was typed into the ended shell is not for this one
+  {
+    QMutexLocker Lock(&FMutex);
+    FOutput.clear();
+  }
   Resize(Cols, Rows);
   FConnecting = true;
   emit runningChanged();
@@ -140,6 +163,26 @@ void TerminalSession::Start(int Cols, int Rows)
 void TerminalSession::stop()
 {
   FStop = true;
+}
+
+void TerminalSession::Dispose()
+{
+  FStop = true;
+  if (FRunning || FConnecting)
+  {
+    // the worker's last call deletes it
+    FDisposed = true;
+    EndingShells++;
+  }
+  else
+  {
+    deleteLater();
+  }
+}
+
+int TerminalSession::Ending()
+{
+  return EndingShells;
 }
 
 void TerminalSession::Resize(int Cols, int Rows)
@@ -164,6 +207,11 @@ void TerminalSession::Resize(int Cols, int Rows)
 
 void TerminalSession::Write(const char * Data, size_t Size)
 {
+  // no shell, or none coming: keys typed now must not run in the next one
+  if (!FRunning && !FConnecting)
+  {
+    return;
+  }
   QMutexLocker Lock(&FMutex);
   FOutput.append(Data, static_cast<qsizetype>(Size));
 }
@@ -224,6 +272,7 @@ void TerminalSession::Received(const QByteArray & Data)
 {
   vterm_input_write(FVTerm, Data.constData(), static_cast<size_t>(Data.size()));
   vterm_screen_flush_damage(FScreen);
+  FUnprocessed -= Data.size();
   emit updated();
 }
 
@@ -231,13 +280,17 @@ void TerminalSession::Received(const QByteArray & Data)
 void TerminalSession::Run(int Cols, int Rows)
 {
   QString Error;
-  ssh_channel Channel = nullptr;
   try
   {
     SecureShell Shell(FData, FUI);
     Shell.Open();
+    if (FStop)
+    {
+      throw AbortException();
+    }
     ssh_session Session = Shell.Session();
-    Channel = ssh_channel_new(Session);
+    ChannelHolder Holder;
+    ssh_channel Channel = Holder.Channel = ssh_channel_new(Session);
     if ((Channel == nullptr) || (ssh_channel_open_session(Channel) != SSH_OK))
     {
       throw ExtException(QStringLiteral("The server refused to open a session channel."));
@@ -255,9 +308,18 @@ void TerminalSession::Run(int Cols, int Rows)
       emit runningChanged();
     }, Qt::QueuedConnection);
 
+    // the keepalive of the connection: its timer needs an event loop, which this thread has not
+    int PingInterval = (FData.PingType != ptOff) ? FData.PingInterval : 0;
+    QElapsedTimer SincePing;
+    SincePing.start();
     char Buffer[16384];
     while (!FStop)
     {
+      if ((PingInterval > 0) && SincePing.hasExpired(qint64(PingInterval) * 1000))
+      {
+        Shell.KeepAlive();
+        SincePing.restart();
+      }
       QByteArray Output;
       int ResizeCols = 0;
       int ResizeRows = 0;
@@ -276,6 +338,12 @@ void TerminalSession::Run(int Cols, int Rows)
       {
         break;
       }
+      // the screen is behind ("yes", a large file): no more than it can draw
+      if (FUnprocessed >= MaxUnprocessed)
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        continue;
+      }
       QByteArray Data;
       for (int StdErr = 0; StdErr <= 1; StdErr++)
       {
@@ -291,6 +359,7 @@ void TerminalSession::Run(int Cols, int Rows)
       }
       if (!Data.isEmpty())
       {
+        FUnprocessed += Data.size();
         QMetaObject::invokeMethod(this, [this, Data]() { Received(Data); }, Qt::QueuedConnection);
       }
       if (ssh_channel_is_eof(Channel) || !ssh_channel_is_open(Channel))
@@ -299,29 +368,30 @@ void TerminalSession::Run(int Cols, int Rows)
       }
     }
     ssh_channel_close(Channel);
-    ssh_channel_free(Channel);
-    Channel = nullptr;
+  }
+  catch (const AbortException &)
+  {
+    // stopped, or the question was not answered: nothing to report
   }
   catch (const ExtException & E)
   {
     Error = E.MoreMessages().isEmpty() ? E.Message() : (E.Message() + QLatin1Char('\n') + E.MoreMessages());
-    if (Channel != nullptr)
-    {
-      ssh_channel_free(Channel);
-    }
   }
   catch (const std::exception & E)
   {
     Error = QString::fromUtf8(E.what());
-    if (Channel != nullptr)
-    {
-      ssh_channel_free(Channel);
-    }
   }
   QMetaObject::invokeMethod(this, [this, Error]()
   {
     FConnecting = false;
     FRunning = false;
+    if (FDisposed)
+    {
+      // nobody is listening any more; ~TerminalSession joins the worker, which is at its end
+      EndingShells--;
+      deleteLater();
+      return;
+    }
     emit runningChanged();
     emit finished(Error);
   }, Qt::QueuedConnection);

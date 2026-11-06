@@ -56,11 +56,27 @@ iconutil -c icns -o "$App/Contents/Resources/NixSCP.icns" "$IconSet"
 echo "build-macos: icon done; deploying Qt and libraries"
 # Qt frameworks and plugins, OpenSSL and libssh into the bundle
 "$QT_DIR/bin/macdeployqt" "$App" -executable="$App/Contents/MacOS/nixscp-cli" -always-overwrite
+# Qt's OpenSSL backend finds libssl in Frameworks when the first TLS socket opens,
+# which macdeployqt cannot see. Without it Qt falls back to Secure Transport: no
+# TLS 1.3, and no session reuse, which FTPS servers ask of data connections
+Frameworks="$App/Contents/Frameworks"
+cp -L "$DEPS/lib/libssl.3.dylib" "$Frameworks/libssl.3.dylib"
+chmod u+w "$Frameworks/libssl.3.dylib"
+install_name_tool -id @executable_path/../Frameworks/libssl.3.dylib "$Frameworks/libssl.3.dylib"
+install_name_tool -change "$DEPS/lib/libcrypto.3.dylib" @executable_path/../Frameworks/libcrypto.3.dylib "$Frameworks/libssl.3.dylib"
 
 # Checks: every binary universal, no library outside the bundle and the system
 Failed=0
 while IFS= read -r -d '' F; do
   if file "$F" | grep -q 'Mach-O'; then
+    # The search paths of the build machine are searched on every Mac too, first
+    # (/Users/runner/...): only paths relative to the bundle stay
+    while read -r Path; do
+      case "$Path" in
+        @*) ;;
+        *) install_name_tool -delete_rpath "$Path" "$F" || echo "build-macos: $F keeps the search path $Path" ;;
+      esac
+    done < <(otool -l "$F" | awk '$1 == "cmd" { Rpath = ($2 == "LC_RPATH") } Rpath && $1 == "path" { print $2 }' | sort -u)
     Archs="$(lipo -archs "$F" 2>/dev/null || true)"
     for A in ${ARCHS//;/ }; do
       if [[ " $Archs " != *" $A "* ]]; then
@@ -85,6 +101,10 @@ echo "build-macos: all binaries contain ${ARCHS//;/ + } and link only bundled or
 # Ad-hoc signature (required on Apple Silicon; no Developer ID yet)
 codesign --force --deep --sign - "$App"
 codesign --verify --deep --strict "$App"
+
+# What the backend above is for: the app must not end up on the other one
+"$App/Contents/MacOS/nixscp-cli" /ini=nul /info | grep -q 'TLS/SSL implementation: OpenSSL' ||
+  { echo "build-macos: the app does not load the bundled OpenSSL for TLS"; exit 1; }
 
 # Disk image: the app, a link to /Applications and first-start notes
 Stage="$BUILD_DIR/dmg"

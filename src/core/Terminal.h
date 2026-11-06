@@ -98,7 +98,8 @@ public:
   // can be interrupted with Progress().Cancel().
   using CommandOutputCallback = std::function<void(const QString & Line, bool StdError)>;
   using CommandCallback = std::function<void(const OperationResult & Result, int ExitCode, const QString & Directory)>;
-  void AnyCommand(const QString & Command, CommandOutputCallback Output, CommandCallback Done);
+  // RecordAction: off when the caller records the command itself
+  void AnyCommand(const QString & Command, CommandOutputCallback Output, CommandCallback Done, bool RecordAction = true);
   // Whether the protocol supports AnyCommand (fcAnyCommand); valid after Open
   bool CanAnyCommand() const { return FCanAnyCommand; }
 
@@ -166,6 +167,8 @@ public:
   QStringList SupportedChecksumAlgs() const;
   // TTerminal::GetShellChecksumAlgDefs: "sha-256" -> "sha256sum" ... (empty when unknown)
   static QString ShellChecksumCommand(const QString & Alg);
+  // What a server has instead of that command if not GNU coreutils, as macOS and the BSDs (empty: nothing)
+  static QString ShellChecksumFallback(const QString & Command);
   static QStringList ShellChecksumAlgs();
   // TTerminal::CalculateFilesChecksum: OnChecksum (GUI thread) gets each
   // file's name (directories are processed recursively, names relative to
@@ -208,6 +211,7 @@ private:
     qint64 Size = 0;
     QDateTime Modification;
     unsigned int Mode = 0;
+    TModificationFmt ModificationFmt = mfFull;
   };
 
   // TBatchOverwrite
@@ -251,6 +255,10 @@ private:
     void DisplayBanner(const QString & SessionName, const QString & Banner) override
     {
       if (!FDestroying) FUI->DisplayBanner(SessionName, Banner);
+    }
+    void Information(const QString & Message) override
+    {
+      if (!FDestroying) FUI->Information(Message);
     }
     unsigned int QueryUser(const QString & Query, const QString & MoreMessages, unsigned int Answers) override
     {
@@ -335,9 +343,16 @@ private:
   // TTerminal::ConfirmFileOverwrite + the protocol specific parts of
   // TSFTPFileSystem::SFTPConfirmOverwrite / TFTPFileSystem::ConfirmOverwrite.
   // Returns false to skip the file; NewName is set for "New name".
+  // Precision: of the less precise timestamp, for "newer only"
   bool ConfirmOverwrite(const QString & SourceFullFileName, const QString & TargetFileName, bool ToRemote,
-    qint64 SourceSize, const QDateTime & SourceTime, qint64 DestSize, const QDateTime & DestTime,
+    qint64 SourceSize, const QDateTime & SourceTime, qint64 DestSize, const QDateTime & DestTime, TModificationFmt Precision,
     bool AsciiTransfer, CopyParam & Param, OperationState & State, OverwriteMode & Mode, QString & NewName);
+  // TTerminal::DoStartup: the directory to start in (on the worker thread).
+  // An initial directory that cannot be opened is an error with
+  // RequireDirectories, or without UpdateDirectories; otherwise the home
+  // directory is used.
+  // Reopening: the directory of a reconnect, the home directory when it is gone
+  QString InitialDirectory(const QString & Directory, bool Reopening = false);
   bool ConfirmResume(const QString & FileName, bool PartialBiggerThanSource, CopyParam & Param, OperationState & State,
     const FileAttempt & Attempt);
   void ScanRemote(const QString & Path, const RemoteFile & File, const QString & Target, QList<TransferItem> & Items,

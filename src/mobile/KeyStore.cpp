@@ -3,13 +3,17 @@
 #include "core/ConfigVault.h"
 #include "core/PuttyKey.h"
 
-#include <QDateTime>
+#include <QCoreApplication>
 #include <QDir>
+#include <QMessageAuthenticationCode>
+#include <QPointer>
 #include <QRandomGenerator>
 #include <QFile>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QStandardPaths>
+#include <QThread>
 #include <QUrl>
 
 #include <libssh/libssh.h>
@@ -48,19 +52,23 @@ QString KeyStore::Folder()
 
 namespace
 {
-QString TemporaryFolder()
+// all of it or nothing: the file is replaced only by a complete new one, so
+// a kill or full storage cannot take the only copy of a key
+bool WritePrivate(const QString & Path, const QByteArray & Data)
 {
-  return QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + QStringLiteral("/keys");
+  QSaveFile File(Path);
+  if (!File.open(QIODevice::WriteOnly))
+  {
+    return false;
+  }
+  File.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+  return (File.write(Data) == Data.size()) && File.commit();
 }
 
-void WritePrivate(const QString & Path, const QByteArray & Data)
+// what is stored for a private key: encrypted when the key is known
+QByteArray ForStorage(const QByteArray & Plain)
 {
-  QFile File(Path);
-  if (File.open(QIODevice::WriteOnly | QIODevice::Truncate))
-  {
-    File.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-    File.write(Data);
-  }
+  return ConfigVault::Enabled() ? ConfigVault::Seal(Plain) : Plain;
 }
 }
 
@@ -87,40 +95,43 @@ void KeyStore::SealAll()
   }
 }
 
-QString KeyStore::PlainKeyFile(const QString & Path)
+void KeyStore::HashKnownHosts(const QString & FileName)
 {
-  if (!ConfigVault::IsSealedFile(Path))
+  QFile File(FileName);
+  if (!File.open(QIODevice::ReadOnly))
   {
-    return Path;
+    return;
   }
-  bool Locked = false;
-  QByteArray Plain = ConfigVault::ReadFile(Path, &Locked);
-  if (Locked || Plain.isEmpty())
+  const QList<QByteArray> Lines = File.readAll().split('\n');
+  File.close();
+  QByteArray Result;
+  bool Changed = false;
+  for (const QByteArray & Line : Lines)
   {
-    return QString();
+    qsizetype Space = Line.indexOf(' ');
+    // comments, markers and what is hashed already stay
+    if (Line.isEmpty() || (Space <= 0) || Line.startsWith('#') || Line.startsWith('@') || Line.startsWith('|'))
+    {
+      if (!Line.isEmpty())
+      {
+        Result += Line + '\n';
+      }
+      continue;
+    }
+    Changed = true;
+    const QList<QByteArray> Hosts = Line.left(Space).split(',');
+    for (const QByteArray & Host : Hosts)
+    {
+      QByteArray Salt(20, Qt::Uninitialized);
+      QRandomGenerator::system()->generate(reinterpret_cast<quint32 *>(Salt.data()), reinterpret_cast<quint32 *>(Salt.data() + Salt.size()));
+      QByteArray Hash = QMessageAuthenticationCode::hash(Host, Salt, QCryptographicHash::Sha1);
+      Result += "|1|" + Salt.toBase64() + '|' + Hash.toBase64() + Line.mid(Space) + '\n';
+    }
   }
-  QDir().mkpath(TemporaryFolder());
-  QFile::setPermissions(TemporaryFolder(), QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
-  // the name stays (PuTTY keys are recognized by it), in a folder of its own
-  QString Folder = TemporaryFolder() + QLatin1Char('/') +
-    QString::number(QDateTime::currentMSecsSinceEpoch()) + QString::number(QRandomGenerator::global()->generate());
-  QDir().mkpath(Folder);
-  QString Temp = Folder + QLatin1Char('/') + QFileInfo(Path).fileName();
-  WritePrivate(Temp, Plain);
-  return Temp;
-}
-
-void KeyStore::RemoveTemporary(const QString & Path)
-{
-  if (Path.startsWith(TemporaryFolder() + QLatin1Char('/')))
+  if (Changed)
   {
-    QDir(QFileInfo(Path).absolutePath()).removeRecursively();
+    WritePrivate(FileName, Result);
   }
-}
-
-void KeyStore::CleanTemporary()
-{
-  QDir(TemporaryFolder()).removeRecursively();
 }
 
 QString KeyStore::path(const QString & Name) const
@@ -191,50 +202,91 @@ QString KeyStore::importKey(const QString & Source)
     Wanted = Putty ? QStringLiteral("key.ppk") : QStringLiteral("id_key");
   }
   QString Name = UniqueName(Wanted);
-  QFile Target(path(Name));
-  if (!Target.open(QIODevice::WriteOnly) || (Target.write(Data) != Data.size()))
+  // encrypted before it is written: no plain copy on the phone
+  if (!WritePrivate(path(Name), ForStorage(Data)))
   {
     FLastError = QStringLiteral("Cannot store the key.");
     return QString();
   }
-  Target.close();
-  Target.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-  SealAll();
   emit changed();
   return Name;
 }
 
-QString KeyStore::generate(const QString & Wanted, const QString & Type, const QString & Passphrase)
+void KeyStore::generate(const QString & Wanted, const QString & Type, const QString & Passphrase)
 {
-  ssh_key Key = nullptr;
+  if (FGenerating)
+  {
+    return;
+  }
   bool Rsa = (Type == QStringLiteral("rsa"));
-  if (ssh_pki_generate(Rsa ? SSH_KEYTYPE_RSA : SSH_KEYTYPE_ED25519, Rsa ? 4096 : 0, &Key) != SSH_OK)
-  {
-    FLastError = QStringLiteral("The key could not be generated.");
-    return QString();
-  }
   QString Name = UniqueName(Wanted.trimmed().isEmpty() ? (Rsa ? QStringLiteral("id_rsa") : QStringLiteral("id_ed25519")) : Wanted.trimmed());
-  QByteArray File = QFile::encodeName(path(Name));
-  QByteArray Pass = Passphrase.toUtf8();
-  int Rc = ssh_pki_export_privkey_file(Key, Passphrase.isEmpty() ? nullptr : Pass.constData(), nullptr, nullptr,
-    File.constData());
-  QString Public = PublicLine(Key, Name + QStringLiteral("@nixscp-android"));
-  ssh_key_free(Key);
-  if (Rc != SSH_OK)
+  FGenerating = true;
+  emit generatingChanged();
+  QPointer<KeyStore> Self(this);
+  // RSA 4096 takes many seconds on a phone: not on the GUI thread
+  QThread * Worker = QThread::create([Self, Rsa, Name, Passphrase]()
   {
-    FLastError = QStringLiteral("The key could not be saved.");
-    QFile::remove(path(Name));
-    return QString();
+    QByteArray Private;
+    QString Public;
+    QString Error;
+    ssh_key Key = nullptr;
+    if (ssh_pki_generate(Rsa ? SSH_KEYTYPE_RSA : SSH_KEYTYPE_ED25519, Rsa ? 4096 : 0, &Key) != SSH_OK)
+    {
+      Error = QStringLiteral("The key could not be generated.");
+    }
+    else
+    {
+      QByteArray Pass = Passphrase.toUtf8();
+      char * Base64 = nullptr;
+      if (ssh_pki_export_privkey_base64(Key, Passphrase.isEmpty() ? nullptr : Pass.constData(), nullptr, nullptr, &Base64) == SSH_OK)
+      {
+        Private = QByteArray(Base64);
+        ssh_string_free_char(Base64);
+        Public = PublicLine(Key, Name + QStringLiteral("@nixscp-android"));
+      }
+      else
+      {
+        Error = QStringLiteral("The key could not be saved.");
+      }
+      ssh_key_free(Key);
+    }
+    QMetaObject::invokeMethod(QCoreApplication::instance(), [Self, Name, Private, Public, Error]()
+    {
+      if (Self != nullptr)
+      {
+        Self->Generated(Name, Private, Public, Error);
+      }
+    }, Qt::QueuedConnection);
+  });
+  connect(Worker, &QThread::finished, Worker, &QObject::deleteLater);
+  Worker->start();
+}
+
+void KeyStore::Generated(const QString & Wanted, const QByteArray & Private, const QString & Public, const QString & Error)
+{
+  FGenerating = false;
+  emit generatingChanged();
+  if (!Error.isEmpty())
+  {
+    emit generated(QString(), Error);
+    return;
   }
-  QFile::setPermissions(path(Name), QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+  // another key may have taken the name meanwhile
+  QString Name = UniqueName(Wanted);
+  if (!WritePrivate(path(Name), ForStorage(Private)))
+  {
+    emit generated(QString(), QStringLiteral("The key could not be saved."));
+    return;
+  }
   QFile Pub(path(Name) + QStringLiteral(".pub"));
   if (Pub.open(QIODevice::WriteOnly))
   {
     Pub.write(Public.toUtf8() + '\n');
+    // complete before anyone reads it: the page shows it right away
+    Pub.close();
   }
-  SealAll();
   emit changed();
-  return Name;
+  emit generated(Name, QString());
 }
 
 QString KeyStore::publicKey(const QString & Name) const
@@ -242,29 +294,29 @@ QString KeyStore::publicKey(const QString & Name) const
   QFile Pub(path(Name) + QStringLiteral(".pub"));
   if (Pub.open(QIODevice::ReadOnly))
   {
-    return QString::fromUtf8(Pub.readAll()).trimmed();
+    QString Line = QString::fromUtf8(Pub.readAll()).trimmed();
+    if (!Line.isEmpty())
+    {
+      return Line;
+    }
   }
-  ssh_key Key = nullptr;
-  // an encrypted key: from a decrypted temporary copy
-  QString File = PlainKeyFile(path(Name));
-  if (File.isEmpty())
+  // an encrypted key is opened in memory
+  bool Locked = false;
+  QByteArray Data = ConfigVault::ReadFile(path(Name), &Locked);
+  if (Locked || Data.isEmpty())
   {
     return QString();
   }
-  struct Cleanup
-  {
-    QString Path;
-    ~Cleanup() { RemoveTemporary(Path); }
-  } Temp{File};
-  if (PuttyKey::IsPuttyKeyFile(File))
+  ssh_key Key = nullptr;
+  if (Data.startsWith("PuTTY-User-Key-File-"))
   {
     // without asking: an encrypted key's public part needs the passphrase here
-    if (PuttyKey::Load(File, [](QString &, bool) { return false; }, &Key, nullptr) != PuttyKey::lrOk)
+    if (PuttyKey::LoadData(Data, [](QString &, bool) { return false; }, &Key, nullptr) != PuttyKey::lrOk)
     {
       return QString();
     }
   }
-  else if (ssh_pki_import_privkey_file(QFile::encodeName(File).constData(), nullptr, nullptr, nullptr, &Key) != SSH_OK)
+  else if (ssh_pki_import_privkey_base64(Data.constData(), nullptr, nullptr, nullptr, &Key) != SSH_OK)
   {
     return QString();
   }

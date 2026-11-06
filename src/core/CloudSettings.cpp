@@ -40,8 +40,9 @@ bool IsDeviceLocalSection(const QString & Section, const QString & AutoWorkspace
   {
     return true;
   }
-  // Team sites ("Team: <name>/..."): synced with the team (core/TeamSync), not personally
-  if (Section.startsWith(QStringLiteral("Sessions\\") + MungeStr(TeamFolderPrefix, false), Qt::CaseInsensitive))
+  // Team sites ("Team: <name>/..."): synced with the team (core/TeamSync), not
+  // personally. The prefix is exact: a folder "team: x" is just a folder.
+  if (Section.startsWith(QStringLiteral("Sessions\\") + MungeStr(TeamFolderPrefix, false)))
   {
     return true;
   }

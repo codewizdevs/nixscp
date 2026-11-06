@@ -83,6 +83,7 @@ public:
   }
 
   LocalOperationResult Run();
+  LocalOperationResult RunDelete();
 
 private:
   enum OverwriteBatch { obNone, obYesToAll, obNoToAll };
@@ -199,6 +200,97 @@ private:
         throw AbortException();
       }
     }
+  }
+
+  // Deletes a file, or a directory with its contents (links are not followed);
+  // false when something was skipped
+  bool DeleteItem(const QString & Path)
+  {
+    CheckCancel();
+    Stat St;
+    if (!LStat(Path, St))
+    {
+      int Error = LocalFs::LastError();
+      throw ExtException(QStringLiteral("File or folder '%1' does not exist.").arg(Path), ErrnoText(Error));
+    }
+    if (St.IsDirectory())
+    {
+      bool Complete = true;
+      const QStringList Names = ListDirectory(Path);
+      for (const QString & Name : Names)
+      {
+        QString Child = Combine(Path, Name);
+        if (!ItemLoop([&]() { return DeleteItem(Child); }))
+        {
+          Complete = false;
+        }
+      }
+      if (Complete && !LocalFs::RemoveDirectory(Path))
+      {
+        int Error = LocalFs::LastError();
+        throw ExtException(QStringLiteral("Cannot delete folder '%1'.").arg(Path), ErrnoText(Error));
+      }
+      return Complete;
+    }
+    if (FProgress != nullptr)
+    {
+      FProgress->SetFile(Path, 0);
+    }
+    if (!LocalFs::RemoveFile(Path))
+    {
+      int Error = LocalFs::LastError();
+      throw ExtException(QStringLiteral("Cannot delete file '%1'.").arg(Path), ErrnoText(Error));
+    }
+    if (FProgress != nullptr)
+    {
+      FProgress->FileFinished();
+    }
+    return true;
+  }
+
+  // false when the file stays (No answer)
+  bool TrashItem(const QString & Path)
+  {
+    CheckCancel();
+    if (FProgress != nullptr)
+    {
+      FProgress->SetFile(Path, 0);
+    }
+    QString TrashError;
+    if (LocalFileOperations::MoveToTrash(Path, &TrashError))
+    {
+      if (FProgress != nullptr)
+      {
+        FProgress->FileFinished();
+      }
+      return true;
+    }
+    if (FBatch != obYesToAll)
+    {
+      if (FUI == nullptr)
+      {
+        throw ExtException(QStringLiteral("Cannot move '%1' to Trash.").arg(Path), TrashError);
+      }
+      QueryUserParams QueryParams;
+      QueryParams.Type = qtConfirmation;
+      QueryParams.Aliases.append(QueryButtonAlias::YesToAllGroupedWithYes());
+      unsigned int Answer = FUI->QueryUserEx(
+        MainInstructions(QStringLiteral("Cannot move '%1' to Trash. Do you want to delete it permanently?").arg(Path)),
+        TrashError, qaYes | qaYesToAll | qaNo, QueryParams);
+      if (Answer == qaYesToAll)
+      {
+        FBatch = obYesToAll;
+      }
+      else if (Answer != qaYes)
+      {
+        if (FProgress != nullptr)
+        {
+          FProgress->Cancel();
+        }
+        throw AbortException();
+      }
+    }
+    return DeleteItem(Path);
   }
 
   // Item processed in a loop; false when it (or part of it) was skipped
@@ -698,12 +790,71 @@ LocalOperationResult Engine::Run()
   return FResult;
 }
 
+LocalOperationResult Engine::RunDelete()
+{
+  qint64 TotalSize = 0;
+  int Count = 0;
+  try
+  {
+    for (const QString & Source : FParams.Sources)
+    {
+      if (FParams.ToTrash)
+      {
+        Count++;
+      }
+      else
+      {
+        Scan(CleanPath(Source), TotalSize, Count);
+      }
+    }
+  }
+  catch (const AbortException &)
+  {
+    FResult.Ok = false;
+    FResult.Aborted = true;
+    return FResult;
+  }
+  if (FProgress != nullptr)
+  {
+    FProgress->Start(FileOperationProgress::Delete, FileOperationProgress::ToLocal, Count);
+  }
+  try
+  {
+    for (const QString & ASource : FParams.Sources)
+    {
+      QString Source = CleanPath(ASource);
+      bool Complete = ItemLoop([&]() { return FParams.ToTrash ? TrashItem(Source) : DeleteItem(Source); });
+      if (Complete)
+      {
+        FResult.Processed++;
+        FResult.Targets.append(ASource);
+      }
+    }
+  }
+  catch (const AbortException &)
+  {
+    FResult.Ok = false;
+    FResult.Aborted = true;
+  }
+  catch (const ExtException & E)
+  {
+    FResult.Ok = false;
+    FResult.Message = E.Message();
+    FResult.MoreMessages = E.MoreMessages();
+  }
+  if (FProgress != nullptr)
+  {
+    FProgress->Stop();
+  }
+  return FResult;
+}
+
 } // namespace
 
 LocalOperationResult LocalFileOperations::Execute(const Params & AParams, FileOperationProgress * Progress, UserInterface * UI)
 {
   Engine E(AParams, Progress, UI);
-  return E.Run();
+  return (AParams.Op == opDelete) ? E.RunDelete() : E.Run();
 }
 
 bool LocalFileOperations::MoveToTrash(const QString & Path, QString * Error)

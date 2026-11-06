@@ -32,8 +32,9 @@
 // (NeonCertificateFailuresErrorStr).
 //
 // Redirects (TWebDAVFileSystem::GetRedirectUrl): only to the same host and
-// port and never from https to http (WinSCP's defaults of
-// WebDavCrossDomainRedirects / WebDavUnencryptedRedirects); followed by Open
+// port and never from https to http, always: WinSCP's settings to allow more
+// (WebDavCrossDomainRedirects / WebDavUnencryptedRedirects) are not ported, as
+// they would hand the credentials to whatever the server names; followed by Open
 // (OPTIONS, up to 5 with loop detection), by PROPFIND, MOVE (one step) and by
 // GET; other requests fail with "WebDAV resource moved to ...".
 //
@@ -98,6 +99,8 @@ public:
   // Percent-encoding of paths as neon's ne_path_escape (everything but
   // unreserved characters, sub-delims, ':', '@' and '/'), and the reverse
   // (ne_path_unescape; malformed input is returned as is, as WinSCP does)
+  // The path of an href in a multistatus response. LiberalEscaping: WebDavLiberalEscaping
+  static QString HrefPath(const QString & Href, const QString & RequestPath, bool LiberalEscaping);
   static QByteArray PathEscape(const QString & Path);
   static QString PathUnescape(const QByteArray & Path);
 
@@ -240,7 +243,8 @@ private:
   // failed response (callers add the operation message)
   void CheckStatus(const Response & Resp, bool Multistatus);
   Response Propfind(QString & Path, int Depth);
-  static QList<Resource> ParseMultistatus(const QByteArray & Xml, const QString & RequestPath, QStringList * Errors);
+  static QList<Resource> ParseMultistatus(const QByteArray & Xml, const QString & RequestPath, QStringList * Errors,
+    bool LiberalEscaping = false);
   RemoteFile FileFromResource(const Resource & Res, const QString & Name) const;
   bool ReadFileInternal(const QString & Path, RemoteFile & File, Response * Failure);
   void ParseCapabilities(const Response & Resp);

@@ -45,6 +45,8 @@ int main()
 #include <QAbstractButton>
 #include <QAction>
 #include <QApplication>
+#include <QClipboard>
+#include <QUrl>
 #include <QDialogButtonBox>
 #include <QDateTime>
 #include <QDir>
@@ -276,7 +278,7 @@ static void TestDirectorySizes(CommanderWindow & Window, const QString & Root)
   CHECK(CellText(R, QStringLiteral("dir1"), FileListModel::ColSize) == Expected);
   WriteFile(RemoteDir + QStringLiteral("/dir1/new.bin"), 10);
   // a different modification time of the directory entry
-  QProcess::execute(QStringLiteral("touch"), {QStringLiteral("-m"), QStringLiteral("-d"), QStringLiteral("2020-01-01 12:00"),
+  QProcess::execute(QStringLiteral("touch"), {QStringLiteral("-m"), QStringLiteral("-t"), QStringLiteral("202001011200"),
     RemoteDir + QStringLiteral("/dir1")});
   R->Refresh();
   CHECK(WaitFor([&]() { return !R->IsLoading() && CellText(R, QStringLiteral("dir1"), FileListModel::ColSize).isEmpty(); }));
@@ -494,6 +496,31 @@ static void TestUserActionPending(CommanderWindow & Window, const QString & Root
   Config.DefaultCopyParam().QueueNoConfirmation = true;
 }
 
+// UNSAFE_SESSION: a URL on the clipboard can be from anywhere, as in the Login dialog
+static void TestPasteUnsafeUrl(CommanderWindow & Window, const QString & Root)
+{
+  std::printf("[session URL with unsafe settings on the clipboard]\n");
+  QString RemoteDir = QDir(Root).filePath(QStringLiteral("paste-remote"));
+  QString LocalDir = QDir(Root).filePath(QStringLiteral("paste-local"));
+  QDir().mkpath(RemoteDir);
+  QDir().mkpath(LocalDir);
+  CHECK(Connect(Window, RemoteDir, LocalDir));
+  QString Marker = QDir(Root).filePath(QStringLiteral("paste-marker"));
+  QString Url = QStringLiteral("sftp://u;x-ProxyMethod=cmd;x-ProxyLocalhost=1;x-ProxyTelnetCommand=touch%20") +
+    QString::fromLatin1(QUrl::toPercentEncoding(Marker)) + QStringLiteral("@127.0.0.1:1/");
+  QApplication::clipboard()->setText(Url);
+  OtherModals.clear();
+  QAction * Paste = Window.Actions()->Get(QStringLiteral("PasteAction3"));
+  CHECK(WaitFor([&]() { return Paste->isEnabled(); }, 3000));
+  Paste->trigger();
+  // the question, answered by rejecting it
+  CHECK(WaitFor([&]() { return !OtherModals.isEmpty(); }, 3000));
+  // and nothing ran
+  WaitFor([&]() { return QFile::exists(Marker); }, 700);
+  CHECK(!QFile::exists(Marker));
+  OtherModals.clear();
+}
+
 static void TestApplyConfiguration(CommanderWindow & Window)
 {
   std::printf("[preferences apply to queue]\n");
@@ -542,13 +569,13 @@ static void TestUrlRegistration(QWidget * Parent, const QString & DataHome, cons
 {
   std::printf("[register to handle URL addresses]\n");
 #ifdef Q_OS_MACOS
-  // not available on macOS yet: the button is disabled
+  // not available on macOS yet: the group of the button is hidden
   QTimer::singleShot(200, []()
   {
     auto * Dialog = qobject_cast<PreferencesDialog *>(QApplication::activeModalWidget());
     if (Dialog == nullptr) return;
     auto * Button = Dialog->findChild<QPushButton *>(QStringLiteral("RegisterAsUrlHandlersButton"));
-    CHECK((Button != nullptr) && !Button->isEnabled());
+    CHECK((Button != nullptr) && !Button->isVisibleTo(Dialog));
     Dialog->reject();
   });
   PreferencesDialog::Execute(Parent, QStringLiteral("Integration"));
@@ -677,6 +704,7 @@ int main(int argc, char ** argv)
     TestOnceDoneDisconnect(Window, Root);
     TestOnceEmptyDisconnect(Window, Root);
     TestUserActionPending(Window, Root);
+    TestPasteUnsafeUrl(Window, Root);
     QString Shot = qEnvironmentVariable("NIXSCP_TEST_SCREENSHOT");
     if (!Shot.isEmpty())
     {

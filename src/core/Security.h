@@ -14,8 +14,57 @@
 
 #include <functional>
 
+// Key material kept outside ordinary memory: a page of its own, locked against
+// swapping where the system allows it, left out of core dumps, and overwritten
+// when released. For the data key, team keys and private keys. A deep copy is
+// always made: an implicitly shared QByteArray cannot be wiped, because data()
+// detaches and clears a fresh copy while the original stays in memory.
+class SecureBytes
+{
+public:
+  SecureBytes() = default;
+  explicit SecureBytes(const QByteArray & Data) { Assign(Data); }
+  SecureBytes(const SecureBytes & Other) { Assign(Other.View()); }
+  SecureBytes(SecureBytes && Other) noexcept;
+  SecureBytes & operator=(const SecureBytes & Other);
+  SecureBytes & operator=(SecureBytes && Other) noexcept;
+  ~SecureBytes() { Clear(); }
+
+  void Assign(const QByteArray & Data);
+  // Overwrites the bytes and releases the memory
+  void Clear();
+  bool IsEmpty() const { return FSize == 0; }
+  int Size() const { return FSize; }
+  // The bytes without a copy, for passing to a call: not to be kept past this
+  // object or the next change to it
+  QByteArray View() const;
+  // A copy in ordinary memory: the holder wipes it (Security::WipeBytes)
+  QByteArray Copy() const;
+  // In constant time
+  bool Equals(const QByteArray & Data) const;
+
+private:
+  char * FData = nullptr;
+  int FSize = 0;
+  size_t FCapacity = 0;
+};
+
 namespace Security
 {
+  // Overwrites a buffer holding a secret and clears it. A shared buffer cannot
+  // be overwritten without destroying the other holder's copy: it is only released.
+  void WipeBytes(QByteArray & Data);
+  // Keeps secrets out of core dumps and, where the system can, away from other
+  // processes of this user: no core file, on Linux not dumpable (no ptrace, no
+  // /proc/<pid>/mem), on macOS no debugger attaching (PT_DENY_ATTACH); on Windows
+  // no dump through Windows Error Reporting, while other programs of this user
+  // can still read the memory of this process.
+  // Called when a key enters memory. Left off in debug builds, under a
+  // debugger, and with $NIXSCP_ALLOW_COREDUMP.
+  void ProtectProcessMemory();
+  // The session's file dialogs go through xdg-desktop-portal
+  bool DesktopPortalInUse();
+
   constexpr unsigned char PWALG_SIMPLE_MAGIC = 0xA3;
   constexpr int PWALG_SIMPLE_MAXLEN = 50;
   constexpr unsigned char PWALG_SIMPLE_FLAG = 0xFF;

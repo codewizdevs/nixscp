@@ -5,7 +5,6 @@
 #include "mobile/KeyStore.h"
 #include "mobile/MobileSettings.h"
 
-#include <QStandardPaths>
 #include <QFileInfo>
 #include <QUrl>
 
@@ -20,44 +19,60 @@ const int RecentCount = 5;
 
 SitesModel::SitesModel(MobileSettings * Settings, QObject * Parent) :
   QAbstractListModel(Parent),
-  FSettings(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/mobile.ini"),
-    QSettings::IniFormat),
   FMobile(Settings)
 {
-  FFavourites = FSettings.value(QStringLiteral("Sites/Favourites")).toStringList();
-  FRecent = FSettings.value(QStringLiteral("Sites/Recent")).toStringList();
-  const QStringList Collapsed = FSettings.value(QStringLiteral("Sites/Collapsed")).toStringList();
-  FCollapsed = QSet<QString>(Collapsed.begin(), Collapsed.end());
   reload();
+}
+
+void SitesModel::LoadState()
+{
+  PrivateState & State = FMobile->Private();
+  FFavourites = State.Strings(QStringLiteral("favourites"));
+  FRecent = State.Strings(QStringLiteral("recent"));
+  const QStringList Collapsed = State.Strings(QStringLiteral("collapsed"));
+  FCollapsed = QSet<QString>(Collapsed.begin(), Collapsed.end());
+  Rebuild();
 }
 
 void SitesModel::SaveState()
 {
-  FSettings.setValue(QStringLiteral("Sites/Favourites"), FFavourites);
-  FSettings.setValue(QStringLiteral("Sites/Recent"), FRecent);
-  FSettings.setValue(QStringLiteral("Sites/Collapsed"), QStringList(FCollapsed.begin(), FCollapsed.end()));
-  FSettings.sync();
+  PrivateState & State = FMobile->Private();
+  bool Ok = State.SetStrings(QStringLiteral("favourites"), FFavourites);
+  Ok = State.SetStrings(QStringLiteral("recent"), FRecent) && Ok;
+  Ok = State.SetStrings(QStringLiteral("collapsed"), QStringList(FCollapsed.begin(), FCollapsed.end())) && Ok;
+  if (!Ok)
+  {
+    emit failed(QStringLiteral("The list of sites could not be saved."));
+  }
 }
 
 void SitesModel::reload()
 {
   int Before = count();
-  FSites.clear();
+  QList<Site> Sites;
   for (const auto & Data : Configuration::Instance().StoredSessions().Sessions())
   {
     if (Data->IsWorkspace)
     {
       continue;
     }
-    FSites.append(Site{Data->Name, Data->LocalName(), Data->FolderName(), Data->HostNameExpanded(),
+    Sites.append(Site{Data->Name, Data->LocalName(), Data->FolderName(), Data->HostNameExpanded(),
       Data->UserNameExpanded(), Data->ProtocolStr()});
   }
   // folders in natural order (the sites without a folder first), then the site names
-  std::sort(FSites.begin(), FSites.end(), [](const Site & A, const Site & B)
+  std::sort(Sites.begin(), Sites.end(), [](const Site & A, const Site & B)
   {
     int Folder = StoredSessionList::CompareLogicalText(A.Folder, B.Folder);
     return (Folder != 0) ? (Folder < 0) : (StoredSessionList::CompareLogicalText(A.Title, B.Title) < 0);
   });
+  // a sync that brought nothing new (every minute with teams) leaves the
+  // list as it is: a reset would scroll it to the top
+  if (FReloaded && (Sites == FSites))
+  {
+    return;
+  }
+  FReloaded = true;
+  FSites = Sites;
   Rebuild();
   if (count() != Before)
   {
@@ -193,7 +208,10 @@ void SitesModel::MigrateKeys()
   }
   if (Changed)
   {
-    Config.Save();
+    if (!Config.Save())
+    {
+      emit failed(QStringLiteral("The sites could not be saved."));
+    }
     reload();
   }
 }
@@ -209,9 +227,9 @@ int SitesModel::importWinScpIni(const QString & FileName)
   {
     return -1;
   }
-  Config.Save();
+  bool Saved = Config.Save();
   reload();
-  return Count;
+  return Saved ? Count : -1;
 }
 
 QVariantMap SitesModel::siteData(const QString & Name) const
@@ -231,8 +249,10 @@ QVariantMap SitesModel::siteData(const QString & Name) const
   Result[QStringLiteral("directory")] = Data->RemoteDirectory;
   // this phone's key for the site (another device's key file does not apply here)
   QString Key = FMobile->siteKey(Name);
-  Result[QStringLiteral("keyFile")] = !Key.isEmpty() ? (KeyStore::Folder() + QLatin1Char('/') + Key)
+  QString KeyFile = !Key.isEmpty() ? (KeyStore::Folder() + QLatin1Char('/') + Key)
     : (Data->PublicKeyFile.startsWith(KeyStore::Folder() + QLatin1Char('/')) ? Data->PublicKeyFile : QString());
+  // a key that was deleted is no longer the site's
+  Result[QStringLiteral("keyFile")] = QFileInfo::exists(KeyFile) ? KeyFile : QString();
   return Result;
 }
 
@@ -326,7 +346,10 @@ QString SitesModel::duplicateSite(const QString & Name)
   }
   while (Sessions.FindByName(Copy));
   Sessions.NewSession(Copy, *Data);
-  Config.Save();
+  if (!Config.Save())
+  {
+    emit failed(QStringLiteral("The copy of the site could not be saved."));
+  }
   FMobile->setSiteKey(Copy, FMobile->siteKey(Name));
   reload();
   return Copy;
@@ -336,7 +359,10 @@ void SitesModel::removeSite(const QString & Name)
 {
   Configuration & Config = Configuration::Instance();
   Config.StoredSessions().Remove(Name);
-  Config.Save();
+  if (!Config.Save())
+  {
+    emit failed(QStringLiteral("The site could not be deleted."));
+  }
   FMobile->setSiteKey(Name, QString());
   FFavourites.removeAll(Name);
   FRecent.removeAll(Name);
@@ -357,6 +383,17 @@ void SitesModel::RenameState(const QString & From, const QString & To)
     }
   }
   SaveState();
+}
+
+void SitesModel::SiteMoved(const QString & From, const QString & To)
+{
+  RenameState(From, To);
+  QString Key = FMobile->siteKey(From);
+  if (!Key.isEmpty())
+  {
+    FMobile->setSiteKey(To, Key);
+    FMobile->setSiteKey(From, QString());
+  }
 }
 
 void SitesModel::toggleFavourite(const QString & Name)

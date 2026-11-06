@@ -390,6 +390,65 @@ int main(int argc, char ** argv)
     CHECK(LocalFileOperations::GroupNames().contains(LocalFileOperations::GroupName(getegid())));
   }
 
+  // ---- Delete (off the GUI thread: progress, cancel, links not followed)
+  {
+    QString D = Root.filePath(QStringLiteral("delete"));
+    QDir().mkpath(D + QStringLiteral("/tree/sub/deep"));
+    QDir().mkpath(D + QStringLiteral("/outside"));
+    WriteFile(D + QStringLiteral("/tree/a"), "a");
+    WriteFile(D + QStringLiteral("/tree/sub/b"), "b");
+    WriteFile(D + QStringLiteral("/tree/sub/deep/c"), "c");
+    WriteFile(D + QStringLiteral("/single"), "s");
+    WriteFile(D + QStringLiteral("/outside/keep"), "keep");
+    CHECK(symlink(QFile::encodeName(D + QStringLiteral("/outside")).constData(),
+      QFile::encodeName(D + QStringLiteral("/tree/link-to-outside")).constData()) == 0);
+    LocalFileOperations::Params P;
+    P.Op = LocalFileOperations::opDelete;
+    P.Sources = {D + QStringLiteral("/tree"), D + QStringLiteral("/single")};
+    FileOperationProgress Progress;
+    LocalOperationResult R = LocalFileOperations::Execute(P, &Progress, nullptr);
+    CHECK(R.Ok);
+    CHECK(R.Processed == 2);
+    CHECK(R.Targets == P.Sources);
+    CHECK(!Exists(D + QStringLiteral("/tree")));
+    CHECK(!Exists(D + QStringLiteral("/single")));
+    CHECK(ReadFile(D + QStringLiteral("/outside/keep")) == "keep");
+    CHECK(Progress.Get().Op == FileOperationProgress::Delete);
+
+    // cancel: stops before the next file, the rest stays
+    QDir().mkpath(D + QStringLiteral("/tree2"));
+    WriteFile(D + QStringLiteral("/tree2/a"), "a");
+    WriteFile(D + QStringLiteral("/tree2/b"), "b");
+    FileOperationProgress Cancelled;
+    Cancelled.Cancel();
+    P.Sources = {D + QStringLiteral("/tree2")};
+    R = LocalFileOperations::Execute(P, &Cancelled, nullptr);
+    CHECK(!R.Ok && R.Aborted);
+    CHECK(R.Targets.isEmpty());
+    CHECK(Exists(D + QStringLiteral("/tree2/a")) && Exists(D + QStringLiteral("/tree2/b")));
+
+    // a missing file is an error, what was deleted before is reported
+    WriteFile(D + QStringLiteral("/first"), "1");
+    P.Sources = {D + QStringLiteral("/first"), D + QStringLiteral("/missing")};
+    R = LocalFileOperations::Execute(P, nullptr, nullptr);
+    CHECK(!R.Ok && !R.Aborted && R.Message.contains(QStringLiteral("does not exist")));
+    CHECK(R.Targets == QStringList{D + QStringLiteral("/first")});
+    CHECK(!Exists(D + QStringLiteral("/first")));
+
+    // what cannot go to the trash: deleted permanently only when asked for
+    LocalFileOperations::Params T;
+    T.Op = LocalFileOperations::opDelete;
+    T.ToTrash = true;
+    T.Sources = {D + QStringLiteral("/no-such-file")};
+    R = LocalFileOperations::Execute(T, nullptr, nullptr);
+    CHECK(!R.Ok && !R.Aborted && R.Message.contains(QStringLiteral("to Trash")));
+    FakeUI UI;
+    UI.Answers = {qaNo};
+    R = LocalFileOperations::Execute(T, nullptr, &UI);
+    CHECK(!R.Ok && R.Aborted);
+    CHECK((UI.Queries.size() == 1) && UI.Queries.first().contains(QStringLiteral("delete it permanently")));
+  }
+
   std::printf("%s: %d checks, %d failures\n", Failures ? "FAILED" : "OK", Checks, Failures);
   return Failures ? 1 : 0;
 }

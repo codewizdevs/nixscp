@@ -36,6 +36,11 @@ public:
   // connects with a Cols x Rows terminal
   void Start(int Cols, int Rows);
   Q_INVOKABLE void stop();
+  // Ends the shell and deletes this object, without waiting: a connection
+  // being opened may take until its timeout, and waiting here would freeze the app
+  void Dispose();
+  // Shells that are ending (Dispose)
+  static int Ending();
   // typed text; Ctrl / Alt: the modifiers of the extra keys
   Q_INVOKABLE void sendText(const QString & Text, bool Ctrl = false, bool Alt = false);
   // "Enter", "Backspace", "Tab", "Escape", "Up", "Down", "Left", "Right",
@@ -55,6 +60,12 @@ public:
   int ScrollbackCount() const { return static_cast<int>(FScrollback.size()); }
   // 0 = the oldest line
   const QVector<VTermScreenCell> & ScrollbackLine(int Index) const { return FScrollback.at(Index); }
+  // Lines scrolled back, within what the scrollback holds
+  static int ValidOffset(int Offset, int Scrollback) { return qBound(0, Offset, Scrollback); }
+  // What was received and not yet drawn; the most that may wait (the worker
+  // stops reading there and the server waits, as for any slow terminal)
+  qint64 Unprocessed() const { return FUnprocessed; }
+  static const qint64 MaxUnprocessed = 1024 * 1024;
 
 signals:
   void runningChanged();
@@ -80,6 +91,8 @@ private:
   // the worker thread and what it shares
   std::thread FThread;
   std::atomic<bool> FStop{false};
+  std::atomic<qint64> FUnprocessed{0};
+  bool FDisposed = false;
   QMutex FMutex;
   QByteArray FOutput;         // to the server
   int FResizeCols = 0;        // pending size change

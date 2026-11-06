@@ -3,11 +3,24 @@
 #include <QJsonDocument>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
+#include <QHostAddress>
 #include <QNetworkRequest>
 
+#include <memory>
 #include <utility>
 
 static constexpr int TransferTimeoutMs = 30000;
+// Nothing the cloud sends is larger; a hostile server cannot fill the memory
+static constexpr qint64 MaxReplyLength = 32 * 1024 * 1024;
+
+static QString WithoutTrailingSlash(QString Url)
+{
+  while (Url.endsWith(QLatin1Char('/')))
+  {
+    Url.chop(1);
+  }
+  return Url;
+}
 
 CloudClient::CloudClient(QObject * Parent) :
   QObject(Parent),
@@ -16,27 +29,46 @@ CloudClient::CloudClient(QObject * Parent) :
 {
 }
 
+bool CloudClient::AcceptableUrl(const QString & Url, bool FromEnvironment)
+{
+  QUrl Parsed(Url, QUrl::StrictMode);
+  if (!Parsed.isValid() || Parsed.host().isEmpty())
+  {
+    return false;
+  }
+  if (Parsed.scheme() == QStringLiteral("https"))
+  {
+    return true;
+  }
+  if (!FromEnvironment || (Parsed.scheme() != QStringLiteral("http")))
+  {
+    return false;
+  }
+#ifdef QT_NO_DEBUG
+  return (Parsed.host() == QStringLiteral("localhost")) || QHostAddress(Parsed.host()).isLoopback();
+#else
+  return true;
+#endif
+}
+
 QString CloudClient::DefaultBaseUrl()
 {
-  QString Url = qEnvironmentVariable("NIXSCP_CLOUD_URL");
-  if (Url.isEmpty())
+  QString Url = WithoutTrailingSlash(qEnvironmentVariable("NIXSCP_CLOUD_URL"));
+  if (!Url.isEmpty() && AcceptableUrl(Url, true))
   {
-    Url = QStringLiteral("https://nixscp.com");
+    return Url;
   }
-  while (Url.endsWith(QLatin1Char('/')))
+  if (!Url.isEmpty())
   {
-    Url.chop(1);
+    qWarning("NixSCP cloud: ignoring $NIXSCP_CLOUD_URL, it is not https");
   }
-  return Url;
+  return QStringLiteral("https://nixscp.com");
 }
 
 void CloudClient::SetBaseUrl(const QString & Url)
 {
-  FBaseUrl = Url;
-  while (FBaseUrl.endsWith(QLatin1Char('/')))
-  {
-    FBaseUrl.chop(1);
-  }
+  QString Clean = WithoutTrailingSlash(Url);
+  FBaseUrl = AcceptableUrl(Clean, false) ? Clean : DefaultBaseUrl();
 }
 
 void CloudClient::SetRefreshToken(const QString & Token)
@@ -46,8 +78,12 @@ void CloudClient::SetRefreshToken(const QString & Token)
 }
 
 void CloudClient::Send(const QByteArray & Method, const QUrl & Url, const QByteArray & Body, const Headers & RequestHeaders,
-  const Callback & Done)
+  const Callback & Done, qint64 MaxBytes)
 {
+  if (MaxBytes <= 0)
+  {
+    MaxBytes = MaxReplyLength;
+  }
   QNetworkRequest Request(Url);
   Request.setTransferTimeout(TransferTimeoutMs);
   Request.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("NixSCP"));
@@ -58,10 +94,25 @@ void CloudClient::Send(const QByteArray & Method, const QUrl & Url, const QByteA
     Request.setRawHeader(Header.first, Header.second);
   }
   QNetworkReply * NetReply = FManager->sendCustomRequest(Request, Method, Body);
-  connect(NetReply, &QNetworkReply::finished, this, [NetReply, Done]()
+  auto TooLarge = std::make_shared<bool>(false);
+  connect(NetReply, &QNetworkReply::downloadProgress, NetReply, [NetReply, TooLarge, MaxBytes](qint64 Received, qint64 Total)
+  {
+    if (!*TooLarge && ((Received > MaxBytes) || (Total > MaxBytes)))
+    {
+      *TooLarge = true;
+      NetReply->abort();
+    }
+  });
+  connect(NetReply, &QNetworkReply::finished, this, [NetReply, Done, TooLarge]()
   {
     NetReply->deleteLater();
     Reply Result;
+    if (*TooLarge)
+    {
+      Result.Error = QStringLiteral("The NixSCP cloud sent more data than expected.");
+      Done(Result);
+      return;
+    }
     Result.Status = NetReply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
     Result.Data = NetReply->readAll();
     QJsonParseError ParseError;
@@ -128,6 +179,14 @@ void CloudClient::Refresh(const std::function<void(bool)> & Done)
     return;
   }
   FRefreshing = true;
+  if (FTokenSource)
+  {
+    QString Newer = FTokenSource();
+    if (!Newer.isEmpty())
+    {
+      FRefreshToken = Newer;
+    }
+  }
   QJsonObject Body
   {
     {QStringLiteral("grant_type"), QStringLiteral("refresh_token")},
@@ -142,9 +201,10 @@ void CloudClient::Refresh(const std::function<void(bool)> & Done)
     {
       SetTokens(Result.Json);
     }
-    else if ((Result.Status == 400) || (Result.Status == 401))
+    else if (Result.ErrorCode() == QStringLiteral("invalid_grant"))
     {
-      // The token is invalid (revoked from the website, or replayed): signed out
+      // The token is invalid (revoked from the website, or replayed): signed
+      // out. Any other failure, like a proxy's error page, is retried later.
       FAccessToken.clear();
       FRefreshToken.clear();
       emit TokensChanged();
@@ -203,9 +263,19 @@ void CloudClient::SendApi(const QByteArray & Method, const QString & Path, const
 }
 
 void CloudClient::Transfer(const QByteArray & Method, const QUrl & Url, const QByteArray & Data, const Headers & RequestHeaders,
-  const Callback & Done)
+  const Callback & Done, qint64 MaxBytes)
 {
-  Send(Method, Url, Data, RequestHeaders, Done);
+  // The URL comes from the server: https, or the plain test server itself
+  QUrl Base(FBaseUrl);
+  bool SameServer = (Url.scheme() == Base.scheme()) && (Url.host() == Base.host()) && (Url.port() == Base.port());
+  if ((Url.scheme() != QStringLiteral("https")) && !SameServer)
+  {
+    Reply Result;
+    Result.Error = QStringLiteral("The NixSCP cloud returned an address that is not secure.");
+    Done(Result);
+    return;
+  }
+  Send(Method, Url, Data, RequestHeaders, Done, MaxBytes);
 }
 
 void CloudClient::SignOut(const std::function<void()> & Done)

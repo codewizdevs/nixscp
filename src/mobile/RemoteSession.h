@@ -9,6 +9,7 @@
 #include "core/SessionData.h"
 #include "core/Terminal.h"
 #include "mobile/FileListModel.h"
+#include "mobile/MobileUserInterface.h"
 #include "mobile/TerminalSession.h"
 
 #include <QDateTime>
@@ -19,7 +20,6 @@
 class FileFind;
 struct FoundFile;
 class MobileSettings;
-class MobileUserInterface;
 class MobileQueue;
 
 class RemoteSession : public QObject
@@ -34,7 +34,8 @@ class RemoteSession : public QObject
   Q_PROPERTY(QString status READ status NOTIFY statusChanged)
   Q_PROPERTY(QString downloadFolder READ downloadFolder CONSTANT)
   Q_PROPERTY(FileListModel * files READ files CONSTANT)
-  // the server runs commands (console, archives, extract, key install): SFTP and SCP
+  // the server runs shell commands (console, archives, extract, key install):
+  // SFTP and SCP; FTP's "commands" are FTP commands
   Q_PROPERTY(bool canRunCommands READ canRunCommands NOTIFY stateChanged)
   // the interactive shell of this session (null until openTerminal)
   Q_PROPERTY(TerminalSession * terminal READ terminal NOTIFY terminalChanged)
@@ -57,7 +58,7 @@ public:
   QString status() const { return FStatus; }
   QString downloadFolder() const;
   FileListModel * files() { return &FFiles; }
-  bool canRunCommands() const { return connected() && FTerminal->CanAnyCommand(); }
+  bool canRunCommands() const { return connected() && FData.IsSsh() && FTerminal->CanAnyCommand(); }
   TerminalSession * terminal() const { return FShell; }
   bool transferring() const { return FTransferring; }
   double progress() const { return FProgress; }
@@ -91,13 +92,24 @@ public:
 
   // ---- editing: the file is downloaded and handed over with editReady();
   // changes of the local copy are uploaded back by checkEdits() (when the
-  // app is active again, after another app edited it) or saveText()
+  // app is active again, after another app edited it, or to try a failed
+  // upload again). The built-in editor keeps the file in memory: a copy
+  // exists only while it is transferred, so nothing stays on the phone.
   Q_INVOKABLE void editFile(const QString & Name);
   Q_INVOKABLE void checkEdits();
-  // the built-in editor: {text} or {error}
+  // the built-in editor takes over the file: {text, encoding, lineEnding,
+  // sample}, {needsEncoding, encodings, text, sample} for a file that is not
+  // UTF-8 (asked again with one of the encodings), or {error}
+  Q_INVOKABLE QVariantMap readEdit(const QString & LocalPath, const QString & Encoding = QString());
+  // only what changed is replaced in the file, in its own encoding and line
+  // endings; uploaded, then editSaved()
+  Q_INVOKABLE void saveText(const QString & LocalPath, const QString & Text, const QString & Encoding);
+  // the built-in editor closed: the file is forgotten
+  Q_INVOKABLE void closeEdit(const QString & LocalPath);
+  // the file again for an editor whose session ended: editAdopted()
+  Q_INVOKABLE void adoptEdit(const QString & RemotePath);
+  // to look at a file: {text} or {error}
   Q_INVOKABLE QVariantMap readText(const QString & LocalPath) const;
-  // writes the text and uploads the file
-  Q_INVOKABLE void saveText(const QString & LocalPath, const QString & Text);
 
   // ---- archives: the selection as one .tar.gz / .zip made on the server
   // (tar / zip; a local .zip for servers without commands), downloaded into
@@ -111,12 +123,15 @@ public:
   // started in the current folder; an existing one is kept
   Q_INVOKABLE TerminalSession * openTerminal(int Cols, int Rows);
 
-  // ---- properties: Mode < 0 keeps the rights; empty Owner / Group keep them
-  Q_INVOKABLE void setProperties(const QStringList & Names, int Mode, const QString & Owner, const QString & Group,
+  // ---- properties: the bits of Set are set and those of Unset cleared on
+  // each file, the others stay as they are there; empty Owner / Group keep them
+  Q_INVOKABLE void setProperties(const QStringList & Names, int Set, int Unset, const QString & Owner, const QString & Group,
     bool Recursive);
 
-  // ---- preview: the file downloaded into the cache, then previewReady()
+  // ---- preview: the file downloaded into the cache, then previewReady();
+  // closePreview when it is no longer looked at
   Q_INVOKABLE void previewFile(const QString & Name);
+  Q_INVOKABLE void closePreview(const QString & LocalPath);
 
   // ---- search below the current folder (WinSCP's Find files; Mask:
   // "*.log", or a part of the name): found() in batches, searchFinished()
@@ -138,6 +153,17 @@ public:
 
   // appends an OpenSSH public key to the server's ~/.ssh/authorized_keys
   Q_INVOKABLE void installPublicKey(const QString & Key);
+  // the shell command for that; it fails when the key did not get there
+  static QString InstallKeyCommand(const QString & Line);
+
+  // a transfer of this session runs or waits (closing it stops them)
+  Q_INVOKABLE bool hasTransfers() const;
+
+  // Deletes the session once its connections are gone: their callbacks
+  // still run after close()
+  void DeleteWhenClosed();
+  // Connections and shells of closed sessions that are still ending
+  static int Closing();
 
 signals:
   void stateChanged();
@@ -160,6 +186,12 @@ signals:
   // an upload finished (count of files)
   void uploaded(int count);
   void editReady(const QString & localPath, const QString & remotePath);
+  // a save of the built-in editor reached the server, or did not
+  void editSaved(const QString & localPath, bool ok);
+  void editAdopted(const QString & localPath, const QString & remotePath);
+  // the session ended with changes another app made and that were not
+  // uploaded: kept in localPath until the next start
+  void editUnsent(const QString & localPath);
   void archived(const QString & path);
   void terminalChanged();
   void previewReady(const QString & localPath, const QString & name);
@@ -174,8 +206,20 @@ private:
   {
     QString Local;
     QString RemoteDir;
+    // the file as uploaded last (another app's editor)
     QDateTime Modified;
     qint64 Size = 0;
+    // the built-in editor: the file's bytes and those of a save on its way
+    bool BuiltIn = false;
+    QByteArray Original;
+    // the last save, and what the upload on its way has of it: a save during
+    // an upload changes Unsent, which then goes up when that one is done
+    QByteArray Unsent;
+    QByteArray Sending;
+    bool HasUnsent = false;
+    // the last upload failed: tried again by checkEdits or the next save
+    bool Failed = false;
+    bool Closed = false;
   };
 
   struct Thumb
@@ -186,6 +230,8 @@ private:
   };
 
   MobileUserInterface * FUI;
+  // the questions of this session's connections
+  std::shared_ptr<MobileUserInterface::Asker> FAsker;
   MobileSettings * FSettings;
   MobileQueue * FQueue;
   // the background connection: the queue's transfers, then thumbnails
@@ -202,10 +248,17 @@ private:
   // as opened (the phone's settings, known_hosts): for the terminal's connection
   SessionData FOpenData;
   QPointer<TerminalSession> FShell;
-  // the decrypted copy of the session's key (removed on close)
-  QString FTemporaryKey;
+  // its own folders in the cache (MobileCache)
+  int FCacheId;
   QList<Edit> FEdits;
   int FEditCounter = 0;
+  // the edit being uploaded
+  QString FUploadingEdit;
+  // connections that are ending, and what comes after them
+  int FClosing = 0;
+  bool FDeleteClosed = false;
+  // an upload ended while the folder was being read: listed again afterwards
+  bool FStale = false;
   QPointer<Terminal> FTerminal;
   FileListModel FFiles;
   QTimer FProgressTimer;
@@ -233,6 +286,17 @@ private:
   void Command(const QString & Command, const QString & Status,
     std::function<void(int, const QStringList &)> Done);
   void ZipLocally(const QStringList & Names, const QString & ArchiveName, const QString & TargetDir);
+  void CopiesReady(const QStringList & LocalPaths, const QString & Bad, const QString & CacheDir, const QString & Target);
+  // the end of a connection (it may still be working)
+  void Dispose(Terminal * Term);
+  // the session's questions stay valid as long as the connection lives
+  void KeepAsker(QObject * Connection);
+  Edit * FindEdit(const QString & Local);
+  void FetchEdit(const QString & Name, bool Adopt);
+  // uploads the next edit that has something to send
+  void SendEdits();
+  bool WriteEdit(const Edit & E);
+  void EditUploaded(const QString & Local, bool Ok, const QDateTime & Modified, qint64 Size);
   // the queue and thumbnails on the background connection
   void RunNext();
   void WithBack(std::function<void(bool)> Ready);
@@ -241,7 +305,8 @@ private:
   void QueueThumbnails(const RemoteFileList & Files);
   void DropBack();
   void UpdateProgress();
-  // downloads Names into Target (emptied first with Clean), then Done with the local files
+  // downloads Names into Target (emptied first with Clean), then Done with
+  // the local files; Exact: as binary, whatever the transfer settings are
   void Fetch(const QStringList & Names, const QString & Target, bool Clean, const QString & Status,
-    std::function<void(const QStringList &)> Done);
+    std::function<void(const QStringList &)> Done, bool Exact = false);
 };

@@ -2,6 +2,7 @@
 // 2.0, one message per line on standard input/output). The tools use the
 // running NixSCP application exactly like "nixscp --connect/--get/--put/--list"
 // (core/AgentAccess.h): same rules, approvals, recordings and audit log.
+// Takes JSON-RPC batches; ping and notifications/cancelled work during a tool call.
 #pragma once
 
 namespace AgentMcp

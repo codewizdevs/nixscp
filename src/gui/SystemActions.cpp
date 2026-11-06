@@ -192,6 +192,23 @@ bool Execute(OnceDoneOperation Operation, QString * Error)
   }
 }
 
+static bool SystemOperationsUnsupported = false;
+
+bool OperationSupported(OnceDoneOperation Operation)
+{
+#ifdef Q_OS_LINUX
+  bool Backend = !SystemOperationsUnsupported;
+#else
+  bool Backend = false;
+#endif
+  return Backend || ((Operation != odoSuspend) && (Operation != odoShutDown));
+}
+
+void SetSystemOperationsUnsupported(bool Unsupported)
+{
+  SystemOperationsUnsupported = Unsupported;
+}
+
 void SetErrorHandler(const std::function<void(const QString &)> & Handler)
 {
   ErrorHandler() = Handler;

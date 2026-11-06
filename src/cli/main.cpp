@@ -2,16 +2,18 @@
 // Console(), Usage(), ExpandCommand, LoadScriptFromFile) and the scripting
 // part of source/windows/WinMain.cpp: the winscp.com equivalent.
 //
-// Also the command-line only modes of WinSCP: FingerprintScan, Info and
-// BatchSettings (windows/ConsoleRunner.cpp) and the master password prompt.
+// Also the command-line only modes of WinSCP: FingerprintScan, Info, KeyGen,
+// CopyId and BatchSettings (windows/ConsoleRunner.cpp) and the master password prompt.
 //
 // nixscp-cli [session|url] [/script=file] [/command "cmd1" "cmd2"...]
 //            [/parameter // param1...] [/stdout[=binary|chunked]] [/stdin]
 //            [/log=file [/loglevel=n]] [/logsize=[n*]size] [/xmllog=file [/xmlgroups]]
 //            [/nointeractiveinput] [/ini=file|nul] [/rawconfig ...]
 //            [/rawtransfersettings setting1=value1 ...] [/batchsettings ...]
-//            [/fingerprintscan url] [/info] [/help]
+//            [/fingerprintscan url] [/keygen keyfile ...] [/copyid /identity=file session]
+//            [/info] [/help]
 #include "cli/ConsoleUserInterface.h"
+#include "core/Platform.h"
 #include "cli/Options.h"
 #include "cli/Script.h"
 #include "cli/SessionUrl.h"
@@ -20,9 +22,12 @@
 #include "core/Configuration.h"
 #include "core/FileMasks.h"
 #include "core/IniStorage.h"
+#include "core/PuttyKey.h"
+#include "core/SecureShell.h"
 #include "core/Security.h"
 #include "core/ActionsLog.h"
 #include "core/SessionLog.h"
+#include "core/Synchronize.h"
 #include "core/Terminal.h"
 
 #include <QCryptographicHash>
@@ -59,12 +64,7 @@ static const QString TimestampVarName = QStringLiteral("TIMESTAMP");
 // %VARIABLES% in /ini and /log)
 static QString LocalExpandFileName(const QString & FileName)
 {
-  QString Result = FileName;
-  if (Result.startsWith(QStringLiteral("~/")))
-  {
-    Result = QDir::homePath() + Result.mid(1);
-  }
-  return Result;
+  return SessionData::ExpandEnvironmentVariables(FileName);
 }
 
 static void PrintUsageSyntax(Console & C, const QString & Str)
@@ -100,6 +100,9 @@ static void Usage(Console & C)
   PrintUsageSyntax(C, QStringLiteral("[/rawconfig config1=value1 config2=value2 ...]"));
   PrintUsageSyntax(C, QStringLiteral("[/rawtransfersettings setting1=value1 setting2=value2 ...]"));
   PrintUsageSyntax(C, QStringLiteral("/batchsettings <site_mask> setting1=value1 setting2=value2 ..."));
+  PrintUsageSyntax(C, QStringLiteral("/keygen keyfile [/output=<file>] [/changepassphrase]"));
+  PrintUsageSyntax(C, QStringLiteral("/keygen keyfile [/comment=<text>]"));
+  PrintUsageSyntax(C, QStringLiteral("/copyid /identity=<file> mysession"));
   PrintUsageSyntax(C, QStringLiteral("/fingerprintscan <session>"));
   PrintUsageSyntax(C, QStringLiteral("/info"));
   PrintUsageSyntax(C, QStringLiteral("/help"));
@@ -137,6 +140,9 @@ static void Usage(Console & C)
     { QStringLiteral("/rawconfig"), QStringLiteral("Configures any settings using a raw format as in an INI file.") },
     { QStringLiteral("/rawtransfersettings"), QStringLiteral("Configures any transfer settings using a raw format as in an INI file.") },
     { QStringLiteral("/batchsettings"), QStringLiteral("Updates settings of sites matching a mask using a raw format as in an INI file.") },
+    { QStringLiteral("/keygen"), QStringLiteral("Converts private key to .ppk format or edits key. Use /output= to specify output file. "
+      "Use /changepassphrase to change or set passphrase. Use /comment= to change or set comment.") },
+    { QStringLiteral("/copyid"), QStringLiteral("Installs your public key in a server's authorized_keys.") },
     { QStringLiteral("/fingerprintscan"), QStringLiteral("Prints fingerprints of server SSH host key or TLS/SSL certificate.") },
     { QStringLiteral("/info"), QStringLiteral("Prints list of supported ciphers and algorithms.") },
     { QStringLiteral("/help"), QStringLiteral("Prints this usage.") },
@@ -548,7 +554,12 @@ static int Run(Script & AScript, const QString & Session, Options & Params, cons
 
   C.FinishProgress();
   int ExitCode = (AnyError || AScript.Aborted()) ? RESULT_ANY_ERROR : RESULT_SUCCESS;
-  AScript.Log(QLatin1Char('.'), QStringLiteral("Script: Exit code: %1").arg(ExitCode));
+  QString ExitCodeMessage = QStringLiteral("Exit code: %1").arg(ExitCode);
+  AScript.Log(QLatin1Char('.'), QStringLiteral("Script: ") + ExitCodeMessage);
+  if (AScript.LogLevel() >= 1)
+  {
+    C.PrintLine(ExitCodeMessage);
+  }
   return ExitCode;
 }
 
@@ -791,6 +802,265 @@ static int Info(Console & C)
   return RESULT_SUCCESS;
 }
 
+// FindNixCompatibleSwitch (windows/ConsoleRunner.cpp): /name=value or the puttygen form "-n value"
+static bool FindNixCompatibleSwitch(Options & Params, const QString & Name, const QString & NixName, QString & Value, bool & Set)
+{
+  bool Result = !Name.isEmpty() && Params.FindSwitch(Name, Value, Set);
+  if (!Result)
+  {
+    QStringList Args;
+    Result = Params.FindSwitchCaseSensitive(NixName, Args, 1);
+    if (Result && !Args.isEmpty())
+    {
+      Value = Args.first();
+      Set = true;
+    }
+  }
+  return Result;
+}
+
+// KeyType (core/PuttyIntf.cpp): what a key file holds, by its first bytes
+enum KeyFileType { kftUnopenable, kftUnknown, kftPutty, kftOpenSsh, kftSsh1, kftPublic, kftSshCom };
+static KeyFileType GetKeyFileType(const QString & FileName)
+{
+  QFile File(FileName);
+  if (!File.open(QIODevice::ReadOnly))
+  {
+    return kftUnopenable;
+  }
+  QByteArray Head = File.read(64);
+  if (Head.startsWith("PuTTY-User-Key-File-"))
+  {
+    return kftPutty;
+  }
+  if (Head.startsWith("SSH PRIVATE KEY FILE FORMAT 1.1"))
+  {
+    return kftSsh1;
+  }
+  if (Head.startsWith("---- BEGIN SSH2 ENCRYPTED PRIVATE KEY"))
+  {
+    return kftSshCom;
+  }
+  if (Head.startsWith("-----BEGIN OPENSSH PRIVATE KEY") || (Head.startsWith("-----BEGIN ") && Head.contains("PRIVATE KEY")))
+  {
+    return kftOpenSsh;
+  }
+  if (Head.startsWith("---- BEGIN SSH2 PUBLIC KEY") || Head.startsWith("ssh-") || Head.startsWith("ecdsa-") || Head.startsWith("sk-"))
+  {
+    return kftPublic;
+  }
+  return kftUnknown;
+}
+
+// KeyGen (windows/ConsoleRunner.cpp). The output is a .ppk file; adding a
+// certificate is not done: "<key>-cert.pub" next to the key is picked up anyway.
+static int KeyGen(Console & C, Options & Params)
+{
+  int Result = RESULT_SUCCESS;
+  ssh_key Key = nullptr;
+  QString Passphrase;
+  QString NewPassphrase;
+  try
+  {
+    QStringList Args;
+    if (!Params.FindSwitch(QStringLiteral("keygen"), Args, 1) || Args.isEmpty() || Args.first().isEmpty())
+    {
+      // KEYGEN_NO_INPUT
+      throw ExtException(QStringLiteral("You have to specify input key file."));
+    }
+    QString InputFileName = LocalExpandFileName(Args.first());
+    bool ValueSet = false;
+    QString OutputFileName;
+    FindNixCompatibleSwitch(Params, QStringLiteral("output"), QStringLiteral("o"), OutputFileName, ValueSet);
+    QString NewComment;
+    FindNixCompatibleSwitch(Params, QStringLiteral("comment"), QStringLiteral("C"), NewComment, ValueSet);
+    bool ChangePassphrase = false;
+    bool NewPassphraseSet = false;
+    if (Params.FindSwitchCaseSensitive(QStringLiteral("P")))
+    {
+      ChangePassphrase = true;
+      FindNixCompatibleSwitch(Params, QString(), QStringLiteral("-new-passphrase"), NewPassphrase, NewPassphraseSet);
+    }
+    else
+    {
+      ChangePassphrase = Params.FindSwitch(QStringLiteral("changepassphrase"), NewPassphrase, NewPassphraseSet);
+    }
+    QString Certificate;
+    FindNixCompatibleSwitch(Params, QStringLiteral("certificate"), QStringLiteral("-certificate"), Certificate, ValueSet);
+    FindNixCompatibleSwitch(Params, QStringLiteral("passphrase"), QStringLiteral("-old-passphrase"), Passphrase, ValueSet);
+    if (Params.ParamCount() > 0)
+    {
+      // TOO_MANY_PARAMS_ERROR
+      throw ExtException(QStringLiteral("Too many parameters."));
+    }
+    if (!Certificate.isEmpty())
+    {
+      throw ExtException(QStringLiteral("Adding a certificate to a key file is not supported. "
+        "Keep it next to the key as \"<key>-cert.pub\", or use the Certificate setting of the site."));
+    }
+
+    KeyFileType Type = GetKeyFileType(InputFileName);
+    switch (Type)
+    {
+      case kftSsh1:
+        // KEYGEN_SSH1
+        throw ExtException(QStringLiteral("Editing SSH-1 keys is not supported."));
+      case kftPutty:
+        if (NewComment.isEmpty() && !ChangePassphrase && OutputFileName.isEmpty())
+        {
+          // KEYGEN_NO_ACTION
+          throw ExtException(QStringLiteral("No action specified."));
+        }
+        break;
+      case kftOpenSsh:
+        if (OutputFileName.isEmpty())
+        {
+          // KEYGEN_NO_OUTPUT
+          throw ExtException(QStringLiteral("You have to specify output key file."));
+        }
+        break;
+      case kftSshCom:
+        throw ExtException(QStringLiteral("Keys in ssh.com format are not supported."));
+      case kftPublic:
+        // KEYGEN_PUBLIC
+        throw ExtException(QStringLiteral("Converting public keys is not supported."));
+      case kftUnopenable:
+        // KEY_TYPE_UNOPENABLE
+        throw ExtException(QStringLiteral("Private key file '%1' does not exist or cannot be opened.").arg(InputFileName));
+      case kftUnknown:
+      default:
+        // KEY_TYPE_UNKNOWN2
+        throw ExtException(QStringLiteral("File '%1' does not contain private key in known format.").arg(InputFileName));
+    }
+
+    QString Comment;
+    bool PassphrasePrompted = false;
+    auto PromptPassphrase = [&](QString & Value) -> bool
+    {
+      if (!Passphrase.isEmpty() && !PassphrasePrompted)
+      {
+        PassphrasePrompted = true;
+        Value = Passphrase;
+        return true;
+      }
+      PassphrasePrompted = true;
+      // PROMPT_KEY_PASSPHRASE
+      C.Print(QStringLiteral("Passphrase for key '%1': ").arg(QFileInfo(InputFileName).fileName()));
+      Passphrase.clear();
+      if (!C.Input(Passphrase, false, 0) || Passphrase.isEmpty())
+      {
+        return false;
+      }
+      Value = Passphrase;
+      return true;
+    };
+    if (Type == kftPutty)
+    {
+      QString Error;
+      Comment = PuttyKey::ReadComment(InputFileName);
+      PuttyKey::LoadResult Loaded = PuttyKey::Load(InputFileName,
+        [&](QString & Value, bool) { return PromptPassphrase(Value); }, &Key, &Error);
+      if (Loaded == PuttyKey::lrCancelled)
+      {
+        throw AbortException();
+      }
+      if (Loaded != PuttyKey::lrOk)
+      {
+        throw ExtException(QStringLiteral("Unable to load private key from '%1'.").arg(InputFileName), Error);
+      }
+    }
+    else
+    {
+      QByteArray Path = QFile::encodeName(InputFileName);
+      int Rc = ssh_pki_import_privkey_file(Path.constData(), Passphrase.toUtf8().constData(), nullptr, nullptr, &Key);
+      for (int Attempt = 0; (Rc != SSH_OK) && (Attempt < 3); Attempt++)
+      {
+        QString Value;
+        if (!PromptPassphrase(Value))
+        {
+          throw AbortException();
+        }
+        Rc = ssh_pki_import_privkey_file(Path.constData(), Value.toUtf8().constData(), nullptr, nullptr, &Key);
+      }
+      if (Rc != SSH_OK)
+      {
+        throw ExtException(QStringLiteral("Unable to load private key from '%1'.").arg(InputFileName));
+      }
+      // The comment of an OpenSSH key is kept in the .pub file
+      try
+      {
+        SecureShell::PublicKeyLine(InputFileName, &Comment);
+      }
+      catch (const ExtException &)
+      {
+      }
+      if (Comment.isEmpty())
+      {
+        Comment = QStringLiteral("imported-openssh-key");
+      }
+    }
+
+    if (!NewComment.isEmpty())
+    {
+      Comment = NewComment;
+    }
+    if (ChangePassphrase)
+    {
+      if (!NewPassphraseSet)
+      {
+        // KEYGEN_PASSPHRASE
+        C.Print(QStringLiteral("Enter passphrase to save key: "));
+        if (!C.Input(NewPassphrase, false, 0))
+        {
+          throw AbortException();
+        }
+        // KEYGEN_PASSPHRASE2
+        C.Print(QStringLiteral("Re-enter passphrase to verify: "));
+        QString NewPassphrase2;
+        if (!C.Input(NewPassphrase2, false, 0))
+        {
+          throw AbortException();
+        }
+        bool Same = (NewPassphrase == NewPassphrase2);
+        NewPassphrase2.fill(QChar(0));
+        if (!Same)
+        {
+          // KEYGEN_PASSPHRASES_MISMATCH
+          throw ExtException(QStringLiteral("Passphrases do not match."));
+        }
+      }
+    }
+    else
+    {
+      NewPassphrase = Passphrase;
+    }
+    if (OutputFileName.isEmpty())
+    {
+      OutputFileName = InputFileName;
+    }
+    OutputFileName = LocalExpandFileName(OutputFileName);
+    QString Error;
+    if (!PuttyKey::Save(OutputFileName, Key, Comment, NewPassphrase, &Error))
+    {
+      throw ExtException(Error);
+    }
+    // KEYGEN_SAVED
+    C.PrintLine(QStringLiteral("Key saved to \"%1\".").arg(OutputFileName));
+  }
+  catch (const AbortException &)
+  {
+    Result = RESULT_ANY_ERROR;
+  }
+  catch (const ExtException & E)
+  {
+    Result = HandleException(C, E);
+  }
+  ssh_key_free(Key);
+  Passphrase.fill(QChar(0));
+  NewPassphrase.fill(QChar(0));
+  return Result;
+}
+
 // BatchSettings (windows/ConsoleRunner.cpp)
 static int BatchSettings(Console & C, Options & Params, Configuration * Config)
 {
@@ -870,6 +1140,7 @@ static void ApplyRawConfig(Configuration & Config, const QStringList & RawConfig
   {
     return;
   }
+  Platform::MakeDirectoryPrivate(Temp.path());
   QString FileName = Temp.filePath(QStringLiteral("nixscp.ini"));
   if (!Config.Export(FileName))
   {
@@ -899,6 +1170,7 @@ static void ApplyRawConfig(Configuration & Config, const QStringList & RawConfig
 
 int main(int argc, char * argv[])
 {
+  Platform::HardenProcess();
 #ifdef Q_OS_MACOS
   // a closed connection is an error result, not a signal (no MSG_NOSIGNAL there)
   signal(SIGPIPE, SIG_IGN);
@@ -993,6 +1265,12 @@ int main(int argc, char * argv[])
     Config.SetIniFileName((IniFileName.compare(QStringLiteral("nul"), Qt::CaseInsensitive) == 0) ?
       QStringLiteral("nul") : LocalExpandFileName(IniFileName));
   }
+  QString ConfigProblem = Config.IsNulStorage() ? QString() : ConfigVault::ConfigProblemText(Config.IniFileName());
+  if (!ConfigProblem.isEmpty())
+  {
+    C.PrintLine(ConfigProblem);
+    return 1;
+  }
   if (!Config.IsNulStorage() && ConfigVault::IsSealedFile(Config.IniFileName()))
   {
     // NixSCP Pro: the configuration is encrypted with the NixSCP password
@@ -1005,11 +1283,12 @@ int main(int argc, char * argv[])
       {
         break;
       }
-      Unlocked = ConfigVault::Unlock(Config.IniFileName(), Secret, false) ||
-        (!CloudCrypto::ParseRecoveryKey(Secret).isEmpty() && ConfigVault::Unlock(Config.IniFileName(), Secret, true));
+      QString Problem;
+      Unlocked = ConfigVault::Unlock(Config.IniFileName(), Secret, false, &Problem) ||
+        (!CloudCrypto::ParseRecoveryKey(Secret).isEmpty() && ConfigVault::Unlock(Config.IniFileName(), Secret, true, &Problem));
       if (!Unlocked)
       {
-        C.PrintLine(QStringLiteral("The password is not correct."));
+        C.PrintLine(Problem);
       }
     }
     if (!Unlocked)
@@ -1032,6 +1311,10 @@ int main(int argc, char * argv[])
   if (Params.FindSwitch(QStringLiteral("batchsettings")))
   {
     return BatchSettings(C, Params, &Config);
+  }
+  if (Params.FindSwitch(QStringLiteral("keygen")))
+  {
+    return KeyGen(C, Params);
   }
   if (Params.FindSwitch(QStringLiteral("fingerprintscan")))
   {
@@ -1066,7 +1349,21 @@ int main(int argc, char * argv[])
     QStringList ScriptCommands;
     QStringList ScriptParameters;
     QString Value;
-    if (Params.FindSwitch(QStringLiteral("script"), Value) && !Value.isEmpty())
+    if (Params.FindSwitch(QStringLiteral("copyid")))
+    {
+      // TConsoleRunner: the "copyid" command on the session of the command line
+      bool ValueSet = false;
+      QString IdentityFileName;
+      FindNixCompatibleSwitch(Params, QStringLiteral("identity"), QStringLiteral("i"), IdentityFileName, ValueSet);
+      if (IdentityFileName.isEmpty())
+      {
+        // COPYID_IDETITY_MISSING
+        throw ExtException(QStringLiteral("Identity/key file was not specified."));
+      }
+      ScriptCommands.append(QStringLiteral("copyid %1").arg(QuoteParam(IdentityFileName)));
+      ScriptCommands.append(QStringLiteral("exit"));
+    }
+    else if (Params.FindSwitch(QStringLiteral("script"), Value) && !Value.isEmpty())
     {
       QString Error;
       if (!LoadScriptFromFile(Value, ScriptCommands, Error))
@@ -1081,16 +1378,22 @@ int main(int argc, char * argv[])
     QString LogLevelStr;
     if (Params.FindSwitch(QStringLiteral("loglevel"), LogLevelStr))
     {
-      bool LogPasswords = LogLevelStr.contains(QLatin1Char('*'));
-      QString Number = LogLevelStr;
-      Number.remove(QLatin1Char('*'));
-      bool Ok = false;
-      int Level = Number.isEmpty() ? 0 : Number.toInt(&Ok);
-      if (!Number.isEmpty() && (!Ok || (Level < -1) || (Level > 2)))
+      // windows/WinMain.cpp: "*" logs passwords, "*-" does not; an invalid level is ignored
+      bool LogPasswords = false;
+      qsizetype StarPos = LogLevelStr.indexOf(QLatin1Char('*'));
+      if (StarPos >= 0)
       {
-        throw ExtException(QStringLiteral("Unknown value '%1' of option '%2'.").arg(LogLevelStr, QStringLiteral("loglevel")));
+        LogPasswords = true;
+        LogLevelStr.remove(StarPos, 1);
+        if ((StarPos < LogLevelStr.size()) && (LogLevelStr[StarPos] == QLatin1Char('-')))
+        {
+          LogPasswords = false;
+          LogLevelStr.remove(StarPos, 1);
+        }
       }
-      AScript.SetLogLevel(Level, LogPasswords);
+      bool Ok = false;
+      int Level = LogLevelStr.trimmed().toInt(&Ok);
+      AScript.SetLogLevel((Ok && (Level >= -1)) ? Level : AScript.LogLevel(), LogPasswords);
     }
     // /logsize=[<count>*]<size>[K|M|G]
     qint64 LogMaxSize = 0;
@@ -1151,7 +1454,7 @@ int main(int argc, char * argv[])
     {
       bool Required = Params.FindSwitch(QStringLiteral("xmllogrequired"));
       QString Error;
-      if (!AScript.OpenXmlLog(LocalExpandFileName(XmlLogFileName), Params.FindSwitch(QStringLiteral("xmlgroups")), Error))
+      if (!AScript.OpenXmlLog(LocalExpandFileName(XmlLogFileName), Params.FindSwitch(QStringLiteral("xmlgroups")), Required, Error))
       {
         if (Required)
         {
@@ -1194,6 +1497,14 @@ int main(int argc, char * argv[])
     }
 
     AScript.SetCopyParam(DefaultCopyParam);
+    {
+      // Interface\\SynchronizeParams, the setting of the GUI too (/rawconfig sets it for a script)
+      IniStorage Storage(&Config.Ini());
+      if (Storage.OpenSubKeyPath(QStringLiteral("Configuration\\Interface"), false) && Storage.ValueExists(QStringLiteral("SynchronizeParams")))
+      {
+        AScript.SetSynchronizeParams(Storage.ReadInteger(QStringLiteral("SynchronizeParams"), spDefault));
+      }
+    }
     AScript.SetWantsProgress(C.OutputIsTty());
     bool UsageWarnings = !ScriptCommands.isEmpty() || !C.InputIsTty();
     AScript.SetUsageWarnings(UsageWarnings);

@@ -1,5 +1,6 @@
 // Port of WinSCP source/core/HierarchicalStorage.cpp (INI part)
 #include "core/IniStorage.h"
+#include "core/Platform.h"
 #include "core/ConfigVault.h"
 
 #include <QFile>
@@ -128,7 +129,7 @@ bool IniFile::Load(const QString & FileName)
   }
   // an encrypted configuration (NixSCP Pro) is readable once unlocked
   QByteArray Plaintext;
-  if (!ConfigVault::Open(F.readAll(), Plaintext))
+  if (!ConfigVault::OpenFile(FileName, F.readAll(), Plaintext))
   {
     return false;
   }
@@ -370,25 +371,15 @@ QByteArray IniFile::SaveToData() const
 
 bool IniFile::Save(const QString & FileName) const
 {
-  bool Existed = QFileInfo::exists(FileName);
   QSaveFile F(FileName);
   if (!F.open(QIODevice::WriteOnly | QIODevice::Truncate))
   {
     return false;
   }
-  if (!Existed)
-  {
-    // QSaveFile keeps permissions of an existing file only
-    F.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-  }
-  else
-  {
-    // the file holds (encrypted) passwords: an imported 0644 WinSCP.ini
-    // is tightened to owner-only on the first save
-    QFileDevice::Permissions Perms = QFileInfo(FileName).permissions() &
-      (QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ReadUser | QFileDevice::WriteUser);
-    F.setPermissions(Perms | QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-  }
+  // the file holds (encrypted) passwords: an imported 0644 WinSCP.ini is
+  // tightened to owner-only on the first save, as it is in a shared folder
+  // on Windows. QSaveFile does not keep the ACL of the file it replaces
+  Platform::MakePrivate(F);
   F.write(ConfigVault::ForFile(FileName, SaveToData()));
   return F.commit();
 }

@@ -76,7 +76,19 @@ static void TestRemotePatterns()
   CHECK_EQ(Remote(QStringLiteral("touch \"!\""), QStringLiteral("file.txt")), QStringLiteral("touch \"file.txt\""));
   CHECK_EQ(Remote(QStringLiteral("rm \"!\""), QStringLiteral("a \"b\" $c `d` \\e")),
     QStringLiteral("rm \"a \\\"b\\\" \\$c \\`d\\` \\\\e\""));
-  CHECK_EQ(Remote(QStringLiteral("rm !"), QStringLiteral("a \"b\" $c")), QStringLiteral("rm a \"b\" \\$c"));
+  // outside of quotes: one word, nothing in the name is shell syntax
+  CHECK_EQ(Remote(QStringLiteral("rm !"), QStringLiteral("a \"b\" $c")), QStringLiteral("rm 'a \"b\" $c'"));
+  CHECK_EQ(Remote(QStringLiteral("rm !"), QStringLiteral("x;touch y")), QStringLiteral("rm 'x;touch y'"));
+  CHECK_EQ(Remote(QStringLiteral("rm !"), QStringLiteral("x'; touch y; 'z")), QStringLiteral("rm 'x'\\''; touch y; '\\''z'"));
+  CHECK_EQ(Remote(QStringLiteral("rm !"), QStringLiteral("-rf")), QStringLiteral("rm './-rf'"));
+  CHECK_EQ(Remote(QStringLiteral("mv ! !.bak"), QStringLiteral("a b")), QStringLiteral("mv 'a b' 'a b'.bak"));
+  // inside of a longer quoted word, the quotes are what the shell sees
+  CHECK_EQ(Remote(QStringLiteral("echo \"file: !\""), QStringLiteral("x\"; touch y; \"")), QStringLiteral("echo \"file: x\\\"; touch y; \\\"\""));
+  CHECK_EQ(Remote(QStringLiteral("echo 'file: !'"), QStringLiteral("x'; touch y; '")), QStringLiteral("echo 'file: x'\\''; touch y; '\\'''"));
+  CHECK_EQ(Remote(QStringLiteral("echo \"x\"!\"y\""), QStringLiteral("; touch z")), QStringLiteral("echo \"x\"'; touch z'\"y\""));
+  CHECK_EQ(Remote(QStringLiteral("echo \\\"!"), QStringLiteral("; touch z")), QStringLiteral("echo \\\"'; touch z'"));
+  // the current path as well
+  CHECK_EQ(RemoteCustomCommand(CustomCommandData(), QStringLiteral("/a;b")).Complete(QStringLiteral("ls !/"), true), QStringLiteral("ls '/a;b/'"));
   CHECK_EQ(Remote(QStringLiteral("rm '!'"), QStringLiteral("a $c\\")), QStringLiteral("rm 'a $c\\'"));
   CHECK_EQ(Remote(QStringLiteral("rm \"!\""), QStringLiteral("-rf")), QStringLiteral("rm \"./-rf\""));
   // the "Execute" default command
@@ -84,25 +96,29 @@ static void TestRemotePatterns()
   // !! and a file name with ! (escaped in the first pass)
   CHECK_EQ(Remote(QStringLiteral("echo !! \"!\""), QStringLiteral("wow!.txt")), QStringLiteral("echo ! \"wow!.txt\""));
   // trailing ! is the file name
-  CHECK_EQ(Remote(QStringLiteral("ls -l !"), QStringLiteral("x")), QStringLiteral("ls -l x"));
+  CHECK_EQ(Remote(QStringLiteral("ls -l !"), QStringLiteral("x")), QStringLiteral("ls -l 'x'"));
   // current path
   CHECK_EQ(Remote(QStringLiteral("cd \"!/\" && ls"), QString()), QStringLiteral("cd \"/home/martin/\" && ls"));
-  CHECK_EQ(RemoteCustomCommand(CustomCommandData(), QStringLiteral("/")).Complete(QStringLiteral("!/"), true), QStringLiteral("/"));
+  CHECK_EQ(RemoteCustomCommand(CustomCommandData(), QStringLiteral("/")).Complete(QStringLiteral("!/"), true), QStringLiteral("'/'"));
   // session patterns
   CHECK_EQ(Remote(QStringLiteral("!@ !U !# !N !K"), QString()),
-    QStringLiteral("example.com martin 2222 My server /home/martin/.ssh/id_ed25519.ppk"));
-  CHECK_EQ(Remote(QStringLiteral("echo !P"), QString()), QStringLiteral("echo pa\\$\\$!word"));
+    QStringLiteral("'example.com' 'martin' '2222' 'My server' '/home/martin/.ssh/id_ed25519.ppk'"));
+  CHECK_EQ(Remote(QStringLiteral("echo !P"), QString()), QStringLiteral("echo 'pa$$!word'"));
   CHECK_EQ(Remote(QStringLiteral("echo '!P'"), QString()), QStringLiteral("echo 'pa$$!word'"));
   CHECK_EQ(Remote(QStringLiteral("!u !n !k"), QString()),
-    QStringLiteral("martin My server /home/martin/.ssh/id_ed25519.ppk"));
+    QStringLiteral("'martin' 'My server' '/home/martin/.ssh/id_ed25519.ppk'"));
   CHECK_EQ(Remote(QStringLiteral("putty '!S'"), QString()),
     QStringLiteral("putty 'sftp://martin:pa%24%24%21word@example.com:2222/'"));
   // file list (already quoted)
   QString List = MakeShellFileList({QStringLiteral("a b"), QStringLiteral("c\"d"), QStringLiteral("-x")});
   CHECK_EQ(List, QStringLiteral("\"a b\" \"c\\\"d\" \"./-x\""));
   CHECK_EQ(Remote(QStringLiteral("grep foo !&"), QString(), List), QStringLiteral("grep foo \"a b\" \"c\\\"d\" \"./-x\""));
+  // a list put inside of quotes must not end them
+  QString Hostile = MakeShellFileList({QStringLiteral("a;touch z")});
+  CHECK_EQ(Remote(QStringLiteral("grep foo \"!&\""), QString(), Hostile), QStringLiteral("grep foo \"\\\"a;touch z\\\"\""));
+  CHECK_EQ(Remote(QStringLiteral("grep foo '!&'"), QString(), Hostile), QStringLiteral("grep foo '\"a;touch z\"'"));
   // unknown pattern letters are a file name followed by text
-  CHECK_EQ(Remote(QStringLiteral("cat !x"), QStringLiteral("f")), QStringLiteral("cat fx"));
+  CHECK_EQ(Remote(QStringLiteral("cat !x"), QStringLiteral("f")), QStringLiteral("cat 'f'x"));
   // no session: session patterns are empty
   CHECK_EQ(RemoteCustomCommand().Complete(QStringLiteral("[!@][!#][!S]"), true), QStringLiteral("[][][]"));
 }
@@ -177,7 +193,7 @@ static void TestPrompts()
   InteractiveCustomCommand Interactive(&RemoteCommand, InteractiveCustomCommand::PromptsCallback(),
     [](const QString & Command) { return QStringLiteral("<%1>").arg(Command); });
   // file patterns inside are expanded first (last pass, no escaping)
-  CHECK_EQ(Interactive.Complete(QStringLiteral("x !`date -d !@` y"), false), QStringLiteral("x <date -d example.com> y"));
+  CHECK_EQ(Interactive.Complete(QStringLiteral("x !`date -d !@` y"), false), QStringLiteral("x <date -d 'example.com'> y"));
 }
 
 static void TestErrors()
@@ -207,6 +223,11 @@ static void TestLocalPatterns()
   // server chosen names with cmd.exe syntax are quoted when the command does not
   CHECK_EQ(Local(QStringLiteral("type !"), QStringLiteral("C:/t/a&calc")), QStringLiteral("type \"C:/t/a&calc\""));
   CHECK_EQ(Local(QStringLiteral("type !"), QStringLiteral("C:/t/plain.txt")), QStringLiteral("type C:/t/plain.txt"));
+  // a quote, a variable or a line end in the name does not get out of the quotes
+  CHECK_EQ(Local(QStringLiteral("type !"), QStringLiteral("a\"&calc&\"b")), QStringLiteral("type \"a&calc&b\""));
+  CHECK_EQ(Local(QStringLiteral("type \"!\""), QStringLiteral("a\"&calc&\"b")), QStringLiteral("type \"a&calc&b\""));
+  CHECK_EQ(Local(QStringLiteral("type \"!\""), QStringLiteral("%PATH%")), QStringLiteral("type \"%%cd:~,%PATH%%cd:~,%\""));
+  CHECK_EQ(Local(QStringLiteral("type !"), QStringLiteral("a\r\nb")), QStringLiteral("type \"ab\""));
 #else
   // shell-escaped (run by /bin/sh); !^! and !\ only for local commands
   CHECK_EQ(Local(QStringLiteral("meld \"!\" \"!^!\""), QStringLiteral("/tmp/a $b.txt"), QStringLiteral("/home/me/a b.txt")),
@@ -221,6 +242,9 @@ static void TestLocalPatterns()
     QStringLiteral("putty -ssh 'martin'@'example.com' -P '2222' -pw 'pa$$!word'"));
   CHECK_EQ(Local(QStringLiteral("cat '!'"), QStringLiteral("x'; rm -rf y; 'z")), QStringLiteral("cat 'x'\\''; rm -rf y; '\\''z'"));
   CHECK_EQ(Local(QStringLiteral("cat !"), QStringLiteral("x$(id)`id`")), QStringLiteral("cat 'x$(id)`id`'"));
+  // the quotes the shell sees, not only those right next to the pattern
+  CHECK_EQ(Local(QStringLiteral("echo \"file: !\""), QStringLiteral("x\"; id; \"")), QStringLiteral("echo \"file: x\\\"; id; \\\"\""));
+  CHECK_EQ(Local(QStringLiteral("echo \"x\"!\"y\""), QStringLiteral("; id")), QStringLiteral("echo \"x\"'; id'\"y\""));
 #endif
 }
 
@@ -393,8 +417,24 @@ static void TestList(const QString & Dir)
   CHECK(CustomCommandList::Configured() == Changed);
 }
 
+// L10: !E is the session URL with the settings, !S without
+static void TestCompleteUrl()
+{
+  SessionData Data;
+  Data.HostName = QStringLiteral("example.com");
+  Data.UserName = QStringLiteral("martin");
+  Data.Compression = true;
+  CustomCommandData Custom = CustomCommandData::FromSession(Data, QStringLiteral("pw"));
+  CHECK_EQ(Custom.SessionUrl, QStringLiteral("sftp://martin:pw@example.com/"));
+  CHECK_EQ(Custom.CompleteSessionUrl, QStringLiteral("sftp://martin:pw;x-compression=1@example.com/"));
+  FileCustomCommand Command(Custom, QStringLiteral("/home"), QString(), QString());
+  CHECK_EQ(Command.Complete(QStringLiteral("!S"), true), QStringLiteral("'%1'").arg(Custom.SessionUrl));
+  CHECK_EQ(Command.Complete(QStringLiteral("!E"), true), QStringLiteral("'%1'").arg(Custom.CompleteSessionUrl));
+}
+
 int main()
 {
+  TestCompleteUrl();
   QStandardPaths::setTestModeEnabled(true);
   QTemporaryDir Dir;
   CHECK(Dir.isValid());

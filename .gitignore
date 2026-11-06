@@ -19,3 +19,16 @@ CMakeLists.txt.user
 __pycache__/
 *.pyc
 android-sdk/
+
+# private notes, credentials and signing material: never publish
+/report.md
+SECRETS*
+.claude/
+*.jks
+*.keystore
+*.p12
+*.pfx
+play-api*.json
+id_rsa
+id_ecdsa
+id_ed25519

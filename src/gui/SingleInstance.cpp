@@ -1,6 +1,7 @@
 // Port of the inter-instance part of WinSCP source/windows/WinMain.cpp and
 // forms/CustomScpExplorer.cpp (WMCopyData); see SingleInstance.h
 #include "gui/SingleInstance.h"
+#include "core/AgentAccess.h"
 #include "core/Platform.h"
 
 #include <QCryptographicHash>
@@ -16,6 +17,9 @@
 #include <QTimer>
 
 #include <unistd.h>
+#ifndef Q_OS_WIN
+#include <sys/un.h>
+#endif
 
 static const QString Magic = QStringLiteral("NixSCP-Instance");
 static const qint32 ProtocolVersion = 1;
@@ -48,17 +52,21 @@ QString SingleInstance::DefaultServerName(const QString & IniFileName)
   // Qt creates the runtime directory (0700) when $XDG_RUNTIME_DIR is not set
   QString Dir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
   QString Result = Dir.isEmpty() ? Name : QDir(Dir).filePath(Name);
-  // sockaddr_un holds at most 107 bytes: with a long runtime directory
-  // QLocalServer/QLocalSocket fail silently (every instance would run on
-  // its own); the name alone goes to the temporary directory (0600 socket)
-  if (QFile::encodeName(Result).size() > 100)
+#ifndef Q_OS_WIN
+  // sockaddr_un holds at most 107 bytes (103 on macOS), and Qt first binds in a
+  // private folder next to the name, "<name>XXXXXX/s": with a long runtime
+  // directory QLocalServer/QLocalSocket fail silently (every instance would run
+  // on its own); the name alone goes to the temporary directory (0600 socket)
+  constexpr qsizetype MaxSize = sizeof(sockaddr_un::sun_path) - sizeof("XXXXXX/s");
+  if (QFile::encodeName(Result).size() > MaxSize)
   {
     Result = QDir(QDir::tempPath()).filePath(Name);
-    if (QFile::encodeName(Result).size() > 100)
+    if (QFile::encodeName(Result).size() > MaxSize)
     {
       Result = QStringLiteral("/tmp/") + Name;
     }
   }
+#endif
   return Result;
 }
 
@@ -109,6 +117,12 @@ void SingleInstance::NewConnection()
   while (QLocalSocket * Socket = FServer->nextPendingConnection())
   {
     connect(Socket, &QLocalSocket::disconnected, Socket, &QObject::deleteLater);
+    // a command line opens sites of this user: only from this user
+    if (!AgentAccess::PeerIsSameUser(Socket->socketDescriptor()))
+    {
+      Socket->abort();
+      continue;
+    }
     connect(Socket, &QLocalSocket::readyRead, this, [this, Socket]() { ReadRequest(Socket); });
     // A client that never completes its request is dropped
     QPointer<QLocalSocket> Guard(Socket);
@@ -204,7 +218,7 @@ bool SingleInstance::Send(const QString & ServerName, int Command, const QString
 {
   QLocalSocket Socket;
   Socket.connectToServer(ServerName);
-  if (!Socket.waitForConnected(TimeoutMs))
+  if (!Socket.waitForConnected(TimeoutMs) || !AgentAccess::PeerIsSameUser(Socket.socketDescriptor()))
   {
     return false;
   }

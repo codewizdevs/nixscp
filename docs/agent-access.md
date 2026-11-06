@@ -5,13 +5,15 @@ SSH sites **without ever getting their passwords or private keys**. The running 
 credentials and makes the SSH connection itself. The agent only talks to NixSCP through the `nixscp` command
 (or the [MCP server](mcp.md)) and only gets the output.
 
-Agent Access is **free**. It does not need a NixSCP Pro account.
+Agent Access is **free**. It does not need a NixSCP Pro account, except for
+[session recordings](#session-recordings), which need the NixSCP password.
 
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Setting up a site](#setting-up-a-site)
 - [Permissions](#permissions)
 - [Approval: Ask me each time](#approval-ask-me-each-time)
+- [Settings prompt (master password only)](#settings-prompt-master-password-only)
 - [Name for agents](#name-for-agents)
 - [Command rules](#command-rules)
 - [Session recordings](#session-recordings)
@@ -26,9 +28,10 @@ Agent Access is **free**. It does not need a NixSCP Pro account.
 
 1. You enable Agent Access for a site in NixSCP and choose what agents may do there.
 2. An agent runs, for example, `nixscp --connect web1 --cmd "df -h"`.
-3. That command connects to the running NixSCP over a local socket that only your user account can open
-   (`$XDG_RUNTIME_DIR/nixscp-agent.sock` on Linux, `nixscp-agent.sock` in the private `$TMPDIR` on macOS,
-   a per-user named pipe on Windows).
+3. That command connects to the running NixSCP over a local socket that only your user account can open. It lives
+   only in a private folder: `$XDG_RUNTIME_DIR/nixscp-agent.sock` on Linux and `nixscp-agent.sock` in `$TMPDIR` on
+   macOS, when that folder is private to you, else `~/.nixscp-agent.sock`, never `/tmp`. On Windows it is a per-user
+   named pipe, and a pipe of that name created by someone else is refused.
 4. NixSCP checks the site's settings, asks you if the site is set to ask, logs the request, opens the SSH
    connection with the stored credentials, runs the command and streams the output and exit code back.
 
@@ -92,14 +95,33 @@ interactive shell. The agent's command waits until you answer:
 
 | Button | Effect |
 |---|---|
-| **Allow once** (default) | Runs this request only. |
+| **Allow once** | Runs this request only. |
 | **1 hour** | Runs it, and allows all requests for this site for one hour without asking. |
 | **24 hours** | The same for 24 hours. |
 | **Always** | Runs it and changes the site to **Allowed without asking** (saved; logged as a settings change). Change it back in Agent Access... |
-| **Deny** | Refuses the request: the agent gets exit code 255 and "The user denied the request in NixSCP." |
+| **Deny** (default) | Refuses the request: the agent gets exit code 255 and "The user denied the request in NixSCP." |
 
 The 1 hour and 24 hours allowances are kept in memory only; they end when NixSCP exits. `nixscp --list` shows
 such sites with `APPROVAL` = `asks user` (`"approval": "ask"` in JSON).
+
+## Settings prompt (master password only)
+
+With the NixSCP password the whole configuration is encrypted, and this section does not apply. With a **master
+password alone**, only the passwords are encrypted: `nixscp.ini` is text that any program you run can edit, an agent
+included, to raise its own permissions or to point a site with a stored password at another server.
+
+So the settings a site runs with carry a seal that only the master password can make, in the file
+`nixscp-agent-seals` next to the configuration. The seal covers every saved setting of the site, except the passwords
+and what only the panels use (color, note, start folders).
+
+A site without a matching seal (new settings, settings edited outside the Agent Access dialog, a new master password)
+is not used as it is: the next agent request opens a window that shows the server, the permissions, the approval, the
+rules and every other setting that is not at its default. **Accept these settings** trusts them until they change;
+**Deny** refuses the request and keeps asking. `nixscp --list` shows such a site as `asks user`.
+
+Settings you make in the Agent Access dialog are sealed when you click **OK**. The seal covers more than it used to, so
+after this update each site asks once. The seal cannot detect an old settings file put back together with its old seal:
+those are settings you accepted at some time.
 
 ## Name for agents
 
@@ -114,16 +136,20 @@ names (`Clients/Acme/web1 [agent name: web1]`), and the approval window shows bo
 ## Command rules
 
 Command rules are optional patterns that limit the commands agents may run on a site. Both lists empty (the
-default) means every command is allowed.
+default) means every command is allowed, except one with a NUL character or text that is not valid Unicode. Rules are
+[a safety net, not a security boundary](#rules-are-a-safety-net-not-a-security-boundary).
 
 - **Allowed commands**: one pattern per line. When the list is not empty, every part of a command must match one of
   these patterns.
 - **Denied commands**: one pattern per line. No part of a command may match any of these.
 - Empty lines and lines starting with `#` are ignored; leading and trailing spaces are trimmed.
+- A pattern with a `[` and no closing `]` is not valid, and the dialog does not accept it. If one gets into the
+  settings another way, a denied pattern that is not valid blocks every command on the site.
 
 ### Pattern syntax
 
-Patterns are wildcards that must match the **whole** part of the command (not a substring), case-sensitively:
+Patterns are wildcards that must match the **whole** part of the command (not a substring). Allowed patterns are
+case-sensitive; denied patterns are not, as some servers have case-insensitive file systems.
 
 | Wildcard | Matches |
 |---|---|
@@ -132,22 +158,39 @@ Patterns are wildcards that must match the **whole** part of the command (not a 
 | `[abc]`, `[a-z]` | One character from the set or range |
 
 So `uptime` allows only `uptime` exactly, `uptime*` also allows `uptime -p`, and `systemctl status *` allows
-`systemctl status nginx` but not `systemctl restart nginx`. Spaces in the command are normalized (runs of
-whitespace count as one space) before matching.
+`systemctl status nginx` but not `systemctl restart nginx`. Quoting is removed before matching. Denied patterns see
+spaces normalized (runs of whitespace count as one space). Allowed patterns match the words exactly, joined by one
+space: `'a  b'` keeps its two spaces, and a no-break space is not a space.
 
 ### How a command is checked
 
-1. The command line is split into **simple commands** at `;`, `&`, `&&`, `|`, `||` and new lines. Characters inside
-   single or double quotes, and characters escaped with `\`, do not split. For example
-   `cd /var/log && tail -n 50 syslog | grep error` is checked as three parts: `cd /var/log`,
+A request must be valid Unicode text, on every site: no lone surrogates, and no byte order mark at the start. A check
+that takes over 1 second, or a line too complex for the patterns to give an answer, is refused; for a denied pattern, a
+match that fails with an error counts as denied.
+
+1. The whole command (with whitespace normalized) is checked against the **denied** patterns. Any match refuses it.
+2. An **allowed** pattern without wildcards that equals the whole command line lets it through, past the steps below:
+   you have spelled out this very line.
+3. The command line is read the way a POSIX shell reads it and split into **simple commands** at `;`, `&`, `&&`, `|`,
+   `||` and new lines. Characters inside single or double quotes, and characters escaped with `\`, do not split. For
+   example `cd /var/log && tail -n 50 syslog | grep error` is checked as three parts: `cd /var/log`,
    `tail -n 50 syslog` and `grep error`.
-2. If an **allowed** list exists:
-   - command substitution (`$(...)` or backticks, outside single quotes) is refused;
-   - output redirection to a file (`>` or `>>` followed by anything other than `/dev/null`) is refused.
-     Redirection to another descriptor (`2>&1`, `>&2`) and to `/dev/null` is fine.
-3. Each part is checked against the **denied** patterns; the whole command (with whitespace normalized) is also
-   checked against them. Any match refuses the command.
-4. If an **allowed** list exists, each part must match at least one allowed pattern.
+4. **What the checker cannot read with certainty is refused**, on every site with rules, also one with denied patterns
+   only: control characters, comments, `$VAR`, `$(...)` and backticks, `$'...'`, process substitution, here-documents,
+   line continuations, subshells and functions, unquoted braces, shell keywords (`if`, `for`...), `VAR=value` prefixes,
+   unterminated quotes, and wildcards in a program name or an option. Text in single quotes is fine.
+5. A program that runs shell text is refused unless an allowed pattern names it, which also means on a site with
+   denied patterns only: `sh`, `bash` and other shells, `eval`, `source`, `.`, `alias`, `trap`, `su`, `runuser`, `sg`,
+   `script`, `watch`, `compgen`, `complete`, `mapfile`, `readarray`, `bind`, `fc`, `enable`, and the options `sudo -s`,
+   `sudo -i`, `doas -s`, `env -S`, `flock -c` and `strace -o`. A bash builtin (`let`, `printf`, `declare`, `read`...) with
+   an array subscript the shell would evaluate is refused too, whatever the patterns say.
+6. If an **allowed** list exists, redirection that writes to a file (`>`, `>>`, `<>`, `>&file`, `&>`, followed by
+   anything other than `/dev/null`) is refused. Redirection to another descriptor (`2>&1`, `>&2`) and to `/dev/null`
+   is fine.
+7. Each part is checked against the **denied** patterns, also what follows programs that start other programs
+   (`sudo`, `env`, `xargs`, `find -exec` and the like). Any match refuses the command.
+8. If an **allowed** list exists, each part must match at least one allowed pattern. A program name with spaces in it
+   needs a pattern equal to the whole command.
 
 A refused command never reaches the server. The agent gets exit code 255 and a message such as
 `"systemctl restart nginx" is not among the commands allowed on this site.` The refusal is logged.
@@ -157,27 +200,42 @@ because typed input cannot be checked.
 
 ### Read-only preset
 
-**Read-only preset** fills in inspection commands (`ls*`, `cat *`, `tail *`, `grep *`, `find *`, `du *`, `df*`,
-`ps *`, `systemctl status *`, `journalctl *`, `docker ps*`, `docker logs *`, `git status*`, `git log*`,
-`git diff*`, `nginx -t` and others) as allowed, denies `find` actions that change things (`* -delete*`,
-`* -exec *`, `* -execdir *`, `* -ok *`, `* -fprint*`), ticks **Download files** and unticks **Upload files**.
-Review the list and adjust it. **Clear rules** empties both lists.
+**Read-only preset** fills in inspection commands as allowed (`ls`, `cat *`, `tail *`, `grep *`, `find *`, `du`,
+`df`, `ps`, `journalctl`, `docker ps`, `docker logs *`, `git status`, `git log`, `git diff`, `nginx -t` and others).
+Programs with options that write or change something are narrowed to their harmless forms:
 
-### Rules are a safety net, not a sandbox
+- `sort` and `uniq` only in forms that read standard input, without file names or `-o`;
+- `date` and `hostname` only to print;
+- `ip` only to show addresses, routes and links;
+- `systemctl` only `status`, `is-active`, `is-enabled`, `list-units` and `--failed`.
 
-Rules stop an agent from running something you did not intend by mistake. They cannot contain a determined
-program:
+It denies options of the allowed programs that write files or run others (`find` actions such as `-delete` and
+`-exec`, `journalctl --rotate`, `git --output` and more), ticks **Download files** and unticks **Upload files** and
+**Open tunnels**. Review the list and adjust it. **Clear rules** empties both lists. Read-only does not mean private:
+`cat *` and **Download files** reach whatever the server account can read.
 
-- An allowed program can do more than its name suggests (`journalctl *` allows any `journalctl` options,
-  `git diff*` can run configured external tools, editors and pagers can start shells, and so on).
-- Without an allowed list, only the denied patterns are checked, and substitution and redirection are not
-  refused, so a denied command can be reached in other ways (`sh -c '...'`, variables, scripts on the server).
-- Only `$(...)` and backticks count as substitution; other shell expansions (variables, `<(...)`) are not
-  inspected. Input redirection (`<`) is not restricted.
-- The command runs in your login shell on the server with your account's rights.
+### Rules are a safety net, not a security boundary
 
-For real limits, use a dedicated server account with only the rights the agent needs (and, for example, a
-restricted `sudo` configuration), and use rules on top of that.
+Rules check text, and the server runs programs. They stop an agent from running something you did not intend by
+mistake, and they refuse what they cannot parse. They cannot stop:
+
+- **An allowed program doing more than its name suggests**: options nobody listed, programs that run others (`awk`,
+  `vim`, `less`, `tar --to-command`), `git` running the hooks and filters a repository configures.
+- **A denied program under another name**: a copy, a symbolic link, a script, `python3 -c ...`. Denied patterns are a
+  block list of spellings.
+- **A `*` that matches spaces and `/`**: `rm *.tmp` also allows `rm /etc/passwd x.tmp`, and `cat /var/log/*` also
+  allows `cat /var/log/../x`.
+- **What a wildcard in an argument expands to** on the server.
+- **A login shell that is not POSIX-like** (`csh`, `fish`), which reads the same text differently.
+- **A server in a legacy multibyte locale**: Shift JIS, GBK or Big5 can take the second byte of a UTF-8 character for a
+  `\` or a `|`.
+
+Input redirection (`<`) is not restricted. The command runs in your login shell on the server with your account's
+rights.
+
+A site that must not be changed needs a server account without those rights, not command rules: use a dedicated server
+account with only the rights the agent needs (and, for example, a restricted `sudo` configuration), and use rules on
+top of that.
 
 ## Session recordings
 
@@ -185,10 +243,13 @@ With **Record sessions** on (default), NixSCP keeps a transcript of every agent 
 request type, the command or file, the output (standard output and standard error, up to 4 MB per request), the
 exit code or error. Standard input sent to a command is not recorded, only its size.
 
+Recordings hold whatever commands print, so they are **always encrypted** with the NixSCP key
+([encryption.md](encryption.md)) and refused without it. With a master password only, nothing is recorded: the Agent
+Access dialog warns about it, and the audit log marks such requests `allowed; not recorded`.
+
 - View them with **Commands > Agent Sessions...**; **Delete all** removes them.
 - They are stored in `agent-sessions/` next to the configuration file, readable by your user only.
-- When the configuration is encrypted with the NixSCP password ([encryption.md](encryption.md)), the recordings are
-  encrypted too. A recording made under another NixSCP password shows as "(encrypted with another NixSCP password)".
+- A recording made under another NixSCP password shows as "(encrypted with another NixSCP password)".
 - Retention: the newest 1000 recordings from the last 90 days are kept; older ones are deleted automatically.
 
 ## Audit log
@@ -198,8 +259,9 @@ Every agent request is written to the audit log, allowed or not: listings, comma
 **Commands > Agent Access Log...**.
 
 The log is the tab-separated text file `nixscp-agent.log` next to the configuration file (columns: time, site,
-request, result, detail; details are cut at 500 characters). It is readable by your user only and is **not**
-encrypted, so it shows site names and commands but never credentials or output.
+request, result, detail). It is readable by your user only and is **not** encrypted. It stores site names and the first
+500 characters of each command as it was sent, so a secret typed inline into a command lands there. It holds no stored
+passwords or keys and no output. If the log cannot be written, NixSCP refuses the request.
 
 ## Command line reference
 
@@ -217,7 +279,8 @@ written for both people and AI agents. On Windows the program is `nixscp.exe` in
 | `nixscp --mcp` | Runs the [MCP server](mcp.md) on standard input/output. |
 | `nixscp --help` | Shows the help text. (WinSCP-compatible switches: `nixscp /help`.) |
 
-`--get` and `--put` transfer single files; for folders, use `tar` through `--connect` (see the examples). Sites
+`--get` and `--put` transfer single files; for folders, use `tar` through `--connect` (see the examples). The file
+name of an upload cannot hold a path: give the folder as the remote file. Sites
 are addressed by the name shown in `nixscp --list`, exactly. At most 8 agent requests run at the same time; more
 are refused with "Too many agent requests are running".
 
@@ -280,7 +343,7 @@ What Agent Access protects:
 - **Scope.** Only sites you switched on are visible. Each site has its own permissions, rules and approval mode.
 - **Server identity.** Unknown or changed host keys are refused, so an agent request never trusts a new server
   key on its own.
-- **Visibility.** Every request is in the audit log; recordings keep the output.
+- **Visibility.** Every request is in the audit log; with the NixSCP password, recordings keep the output.
 
 What it does not protect against:
 
@@ -288,7 +351,9 @@ What it does not protect against:
   Anything you run can use the sites you enabled, within their settings. Use **Ask me each time** for sites that
   matter.
 - **What the agent does on the server.** An allowed command runs with the server account's full rights. Command
-  rules are a safety net, not a sandbox (see above).
+  rules are a safety net, not a security boundary (see above).
+- **Secrets in commands.** A password typed into a command is sent to the server as part of it, and lands in the audit
+  log.
 - **Unprotected key files.** A private key file without a passphrase can be read directly by any program you run.
 - **A compromised computer.** Malware running as you could, for example, read NixSCP's memory or watch what you
   type. Agent Access keeps credentials away from well-behaved programs; it is not a defense against malware.
@@ -304,6 +369,14 @@ URL or `/rawconfig`.
 | NixSCP is not running. | Start NixSCP (and unlock it with your NixSCP password). |
 | Agent access needs the saved passwords encrypted. | Set a master password (Preferences > Security), or use NixSCP Pro's NixSCP password. |
 | Site "x" is not available to agents. | Use a name exactly as listed by `nixscp --list`; switch the site on in Agent Access... |
+| More than one site is available to agents as "x". | Give the sites different names for agents. |
+| The user did not accept the Agent Access settings of the site in NixSCP. | With a master password only: see [Settings prompt](#settings-prompt-master-password-only). |
+| The agent access log cannot be written, so NixSCP refuses agent requests. | Check `nixscp-agent.log` next to the configuration and the free disk space. |
+| ... are not allowed on this site. | The rules refused what they cannot check: run plain commands, and quote text with such characters in single quotes. |
+| ... runs commands NixSCP cannot check ... | Run the command itself, or add an allowed pattern that names it. |
+| The command is too complex to be checked against the rules of this site. | Split it into shorter commands. |
+| A request must be valid Unicode text ... | Send the text without lone surrogates or a leading byte order mark. |
+| The denied pattern "x" of this site is not valid, so no command can be checked. | Correct the pattern in Agent Access... |
 | Site "x" does not allow commands / file transfers for agents. | Tick the permission in Agent Access... |
 | The host key of ... is not known yet. / has CHANGED | Connect to the site in NixSCP and verify and accept the key. |
 | The site has no stored password, or the stored password was refused. | Save the password with the site. |

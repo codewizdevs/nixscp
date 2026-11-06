@@ -6,6 +6,8 @@
 #
 # Needs the Windows SDK folder win-sdk/ (see cmake/windows-llvm-mingw.cmake):
 # llvm-mingw, Qt for Windows (llvm-mingw build) and deps/ with OpenSSL and libssh.
+# Build that OpenSSL with no-autoload-config: otherwise it reads an openssl.cnf
+# from its built-in path, which on Windows can be a folder other users can write to.
 set -euo pipefail
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,6 +19,19 @@ JOBS="${JOBS:-$(nproc)}"
 QT="$(ls -d "$SDK"/qt/*/llvm-mingw_64 | head -1)"
 LLVM="$SDK/llvm-mingw"
 [ -d "$QT" ] && [ -d "$LLVM" ] && [ -f "$SDK/deps/bin/libssh.dll" ] || { echo "build-windows: incomplete Windows SDK in $SDK" >&2; exit 1; }
+
+# What the release is built from, as in .github/workflows/macos.yml: the sources
+# in the SDK match their published hashes, and the libraries report these versions
+QT_VERSION=6.10.2
+OPENSSL_VERSION=3.5.9
+OPENSSL_SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+LIBSSH_VERSION=0.11.5
+LIBSSH_SHA256=6898ba9dd836d618b71dc7a4bb786a502c173cef5cafbf20fe5e0567ba4ea30c
+[ "$(basename "$(dirname "$QT")")" = "$QT_VERSION" ] || { echo "build-windows: expected Qt $QT_VERSION in $SDK/qt" >&2; exit 1; }
+echo "$OPENSSL_SHA256  $SDK/src/openssl-$OPENSSL_VERSION.tar.gz" | sha256sum --quiet -c -
+echo "$LIBSSH_SHA256  $SDK/src/libssh-$LIBSSH_VERSION.tar.xz" | sha256sum --quiet -c -
+grep -aq "OpenSSL $OPENSSL_VERSION " "$SDK/deps/bin/libcrypto-3-x64.dll" || { echo "build-windows: libcrypto is not OpenSSL $OPENSSL_VERSION" >&2; exit 1; }
+grep -aq "libssh_$LIBSSH_VERSION" "$SDK/deps/bin/libssh.dll" || { echo "build-windows: libssh.dll is not libssh $LIBSSH_VERSION" >&2; exit 1; }
 
 cmake -S "$SOURCE_DIR" -B "$BUILD_DIR" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$SOURCE_DIR/cmake/windows-llvm-mingw.cmake" -DNIXSCP_WIN_SDK="$SDK" \
@@ -96,7 +111,16 @@ rm -f "$ZIP"
 # Installer
 if command -v makensis > /dev/null; then
   SETUP="$OUT_DIR/NixSCP-$VERSION-setup.exe"
-  makensis -V2 -DVERSION="$VERSION" -DSTAGE="$STAGE" -DOUTFILE="$SETUP" "$SOURCE_DIR/packaging/windows/installer.nsi"
+  # The uninstaller removes what was installed, by name, and no more
+  UNINSTALL_LIST="$BUILD_DIR/uninstall-list.nsh"
+  for Entry in "$STAGE"/*; do
+    if [ -d "$Entry" ]; then
+      echo "RMDir /r \"\$INSTDIR\\$(basename "$Entry")\""
+    else
+      echo "Delete \"\$INSTDIR\\$(basename "$Entry")\""
+    fi
+  done > "$UNINSTALL_LIST"
+  makensis -V2 -DVERSION="$VERSION" -DSTAGE="$STAGE" -DOUTFILE="$SETUP" -DUNINSTALL_LIST="$UNINSTALL_LIST" "$SOURCE_DIR/packaging/windows/installer.nsi"
 fi
 
 ls -la "$OUT_DIR"

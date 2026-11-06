@@ -458,7 +458,8 @@ static void RunSuite(const SessionData & Data, const QString & Label, Context & 
     CHECK_MSG(R.Ok && (Dir == RSrc) && (Files.size() == 8), Describe(R) + QStringLiteral(" ") + Dir);
     // redirect to another host is refused
     R = DoList(T, QStringLiteral("/cross-redirect") + RSrc);
-    CHECK_MSG(!R.Ok && !R.Fatal && R.MoreMessages.contains(QStringLiteral("Redirect to other host encountered")), Describe(R));
+    CHECK_MSG(!R.Ok && !R.Fatal && R.MoreMessages.contains(QStringLiteral("NixSCP does not follow it")) &&
+      !R.MoreMessages.contains(QStringLiteral("session settings")), Describe(R));
     // permissions and links are not supported (as in WinSCP)
     R = DoJob(T, [=](FileSystem & Fs, FileOperationProgress &, UserInterface &)
     {
@@ -737,8 +738,22 @@ static void RunSuite(const SessionData & Data, const QString & Label, Context & 
   }
 }
 
+// "Tolerate non-encoded special characters in filenames"
+static void TestLiberalEscaping()
+{
+  std::printf("[WebDavLiberalEscaping]\n");
+  const QString Request = QStringLiteral("/dir/");
+  CHECK(WebDavFileSystem::HrefPath(QStringLiteral("/dir/a%20b.txt"), Request, false) == QStringLiteral("/dir/a b.txt"));
+  CHECK(WebDavFileSystem::HrefPath(QStringLiteral("/dir/a%20b.txt"), Request, true) == QStringLiteral("/dir/a b.txt"));
+  // strictly, what follows is a query or a fragment; the setting makes it a part of the name
+  CHECK(WebDavFileSystem::HrefPath(QStringLiteral("/dir/what?.txt"), Request, false) == QStringLiteral("/dir/what"));
+  CHECK(WebDavFileSystem::HrefPath(QStringLiteral("/dir/what?.txt"), Request, true) == QStringLiteral("/dir/what?.txt"));
+  CHECK(WebDavFileSystem::HrefPath(QStringLiteral("http://h/dir/c#1.txt"), Request, true) == QStringLiteral("/dir/c#1.txt"));
+}
+
 int main(int argc, char ** argv)
 {
+  TestLiberalEscaping();
   QCoreApplication App(argc, argv);
 
   QString UrlStr = qEnvironmentVariable("NIXSCP_TEST_DAV_URL");

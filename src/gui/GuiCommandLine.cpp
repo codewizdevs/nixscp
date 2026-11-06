@@ -2,6 +2,7 @@
 // windows/UserInterface.cpp, forms/Custom.cpp TSaveSessionDialog,
 // forms/CustomScpExplorer.cpp, windows/Setup.cpp); see GuiCommandLine.h
 #include "gui/GuiCommandLine.h"
+#include "core/Platform.h"
 #include "gui/HelpSystem.h"
 
 // The command line tokenizer and session URL parser of nixscp-cli
@@ -108,57 +109,17 @@ namespace
     return nullptr;
   }
 
-  // Removes the ";x-name=value" raw settings of the user info part of an ad-hoc URL
-  QString StripUrlRawSettings(const QString & Url)
+  // Switches that change a session, and so must not come with a command line
+  // handed to a running instance (it ignores them there, see ParseUrl)
+  const QStringList & SessionSwitches()
   {
-    QString Scheme;
-    TFSProtocol Protocol;
-    int ProtocolLen = 0;
-    qsizetype Start = 0;
-    if (CommandLineUrlProtocol(Url, Scheme, Protocol, ProtocolLen))
-    {
-      Start = ProtocolLen;
-      if (Url.mid(Start, 2) == QStringLiteral("//"))
-      {
-        Start += 2;
-      }
-    }
-    qsizetype PSlash = Url.indexOf(QLatin1Char('/'), Start);
-    if (PSlash < 0)
-    {
-      PSlash = Url.size();
-    }
-    QString ConnectInfo = Url.mid(Start, PSlash - Start);
-    qsizetype At = ConnectInfo.lastIndexOf(QLatin1Char('@'));
-    if (At < 0)
-    {
-      return Url;
-    }
-    QStringList UserInfo = ConnectInfo.left(At).split(QLatin1Char(';'));
-    QStringList Kept;
-    for (int Index = 0; Index < UserInfo.size(); Index++)
-    {
-      if ((Index == 0) || !UserInfo[Index].startsWith(QStringLiteral("x-"), Qt::CaseInsensitive))
-      {
-        Kept.append(UserInfo[Index]);
-      }
-    }
-    return Url.left(Start) + Kept.join(QLatin1Char(';')) + ConnectInfo.mid(At) + Url.mid(PSlash);
-  }
-
-  // Settings TSessionData::DoLoad reads only when !Unsafe
-  void RestoreUnsafeSettings(SessionData & Data, const SessionData & Base)
-  {
-    Data.Shell = Base.Shell;
-    Data.ListingCommand = Base.ListingCommand;
-    Data.DeleteToRecycleBin = Base.DeleteToRecycleBin;
-    Data.OverwrittenToRecycleBin = Base.OverwrittenToRecycleBin;
-    Data.RecycleBinPath = Base.RecycleBinPath;
-    Data.PostLoginCommands = Base.PostLoginCommands;
-    Data.ReturnVar = Base.ReturnVar;
-    Data.ProxyLocalCommand = Base.ProxyLocalCommand;
-    Data.ProxyTelnetCommand = Base.ProxyTelnetCommand;
-    Data.SftpServer = Base.SftpServer;
+    static const QStringList Result{
+      QStringLiteral("username"), QStringLiteral("password"), QStringLiteral("sessionname"), QStringLiteral("newpassword"),
+      QStringLiteral("privatekey"), QStringLiteral("clientcert"), QStringLiteral("passphrase"), QStringLiteral("timeout"),
+      QStringLiteral("hostkey"), QStringLiteral("certificate"), QStringLiteral("passive"), QStringLiteral("implicit"),
+      QStringLiteral("explicitssl"), QStringLiteral("explicit"), QStringLiteral("explicittls"), QStringLiteral("rawsettings"),
+      QStringLiteral("passwordsfromfiles") };
+    return Result;
   }
 
   QString DefaultKeyFileValue;
@@ -169,7 +130,11 @@ namespace
     QString Self = QFileInfo(QCoreApplication::applicationFilePath()).canonicalFilePath();
     if (!Self.isEmpty())
     {
+#ifdef Q_OS_WIN
+      QString Candidate = QFileInfo(Self).absolutePath() + QStringLiteral("/nixscp-cli.exe");
+#else
       QString Candidate = QFileInfo(Self).absolutePath() + QStringLiteral("/nixscp-cli");
+#endif
       if (QFileInfo(Candidate).isExecutable())
       {
         return Candidate;
@@ -219,10 +184,44 @@ namespace
   }
 }
 
+QStringList GuiCommandLine::LinkArguments(const QStringList & Arguments)
+{
+  Options Params;
+  for (const QString & Argument : Arguments)
+  {
+    Params.Add(Argument);
+  }
+  if (CheckSafe(Params))
+  {
+    return QStringList();
+  }
+  QStringList Result{QStringLiteral("/unsafe")};
+  QString Link = Params.Param(1);
+  // what follows "--" is a parameter here, but not to Qt
+  if (!Link.isEmpty() && !Link.startsWith(QLatin1Char('-')) && !Link.startsWith(QLatin1Char('/')))
+  {
+    Result.append(Link);
+  }
+  return Result;
+}
+
 bool GuiCommandLine::CheckSafe(Options & Params)
 {
   // windows/UserInterface.cpp CheckSafe: silent, as warning would help the attacker
   return !Params.FindSwitch(QStringLiteral("Unsafe"));
+}
+
+bool GuiCommandLine::CanForwardCommandLine(const Options & Params)
+{
+  Options Probe(Params);
+  for (const QString & Switch : SessionSwitches())
+  {
+    if (Probe.FindSwitch(Switch))
+    {
+      return false;
+    }
+  }
+  return true;
 }
 
 GuiCommandLine::ParsedUrl GuiCommandLine::ParseUrl(const QString & Url, Options * Params, StoredSessionList & Stored, bool Unsafe)
@@ -242,12 +241,46 @@ GuiCommandLine::ParsedUrl GuiCommandLine::ParseUrl(const QString & Url, Options 
   std::shared_ptr<SessionData> Site = !Rest.isEmpty() ? MatchStoredSite(Stored, DecodeUrlChars(Rest)) : nullptr;
   QString UrlToParse = (Site && ProtocolDefined) ? Rest : Url;
 
+  // /unsafe (a clicked link, a command line from another process): no switch
+  // gets to change the session, so a stored password cannot be sent elsewhere
+  Options * Switches = Unsafe ? nullptr : Params;
   SessionExtras Extras;
-  ParseSessionUrl(UrlToParse, Params, &Stored, Result.Data, Extras, Result.ParsedInfo);
+  ParseSessionUrl(UrlToParse, Switches, &Stored, Result.Data, Extras, Result.ParsedInfo, nullptr, Unsafe);
   if (Site && ProtocolDefined)
   {
-    Result.Data.FSProtocol = Protocol;
+    // /unsafe: "ftp://mysite/" must not send the password of an SFTP site in the clear
+    if (!Unsafe)
+    {
+      Result.Data.FSProtocol = Protocol;
+    }
     Result.ParsedInfo |= piProtocolDefined;
+  }
+  if (!Site && ((Result.ParsedInfo & piDefaultsOnly) == 0))
+  {
+    // What a URL names is never expanded: "ftp://$SECRET@host/" would send the
+    // value of the variable to the server. The defaults and the switches of
+    // the local command line are not part of it.
+    SessionData Defaults;
+    SessionExtras DefaultsExtras;
+    int DefaultsInfo = 0;
+    ParseSessionUrl(QString(), nullptr, &Stored, Defaults, DefaultsExtras, DefaultsInfo);
+    Result.Data.ProtectFromExpansion(Defaults);
+    QString Value;
+    if (Switches != nullptr)
+    {
+      if (Switches->FindSwitch(QStringLiteral("username"), Value))
+      {
+        Result.Data.UserName = SessionData::ExpandEnvironmentVariables(Value);
+      }
+      if (Switches->FindSwitch(QStringLiteral("privatekey"), Value))
+      {
+        Result.Data.PublicKeyFile = SessionData::ExpandEnvironmentVariables(Value);
+      }
+      if (Switches->FindSwitch(QStringLiteral("clientcert"), Value))
+      {
+        Result.Data.TlsCertificateFile = SessionData::ExpandEnvironmentVariables(Value);
+      }
+    }
   }
   Result.Passphrase = Extras.Passphrase;
   Result.PuttyProtocol = ProtocolDefined && (Scheme == QStringLiteral("ssh"));
@@ -292,17 +325,6 @@ GuiCommandLine::ParsedUrl GuiCommandLine::ParseUrl(const QString & Url, Options 
     qsizetype Slash = RawRemote.lastIndexOf(QLatin1Char('/'));
     Result.DownloadFile = DecodeUrlChars(RawRemote.mid(Slash + 1));
     Result.Data.RemoteDirectory = DecodeUrlChars(RawRemote.left(Slash + 1));
-  }
-
-  if (Unsafe)
-  {
-    // pufUnsafe: what the URL or /rawsettings would set is reverted to the
-    // site's (or default) values
-    SessionData Base;
-    SessionExtras BaseExtras;
-    int BaseInfo = 0;
-    ParseSessionUrl(StripUrlRawSettings(UrlToParse), nullptr, &Stored, Base, BaseExtras, BaseInfo);
-    RestoreUnsafeSettings(Result.Data, Base);
   }
   return Result;
 }
@@ -526,8 +548,7 @@ std::shared_ptr<SessionData> GuiCommandLine::DoSaveSession(const SessionData & D
   ToSave.IsWorkspace = false;
   if (!(CanSavePassword && SavePasswordCheck->isChecked()))
   {
-    ToSave.Password.clear();
-    ToSave.TunnelPassword.clear();
+    Workspaces::ClearSessionPasswords(ToSave);
   }
   std::shared_ptr<SessionData> Saved = Stored.NewSession(ComposedName(), ToSave);
   if (!Config.Save())
@@ -610,6 +631,7 @@ void GuiCommandLine::ApplyRawConfig(Options & Params)
   {
     return;
   }
+  Platform::MakeDirectoryPrivate(Temp.path());
   Configuration & Config = Configuration::Instance();
   QString FileName = Temp.filePath(QStringLiteral("nixscp.ini"));
   if (!Config.Export(FileName))
@@ -738,6 +760,53 @@ void GuiCommandLine::ApplyLogSwitches(Options & Params)
   }
 }
 
+#ifdef Q_OS_WIN
+// There is no exec on Windows. The C library's joins the arguments without any
+// quoting and looks in the current folder first. So nixscp-cli.exe is run as a
+// child that shares the streams of this program (a GUI program has them only
+// when redirected), or has a console of its own.
+static int RunConsoleProgram(const QStringList & Arguments)
+{
+  int Argc = 1;
+  char Name[] = "nixscp";
+  char * Argv[] = {Name, nullptr};
+  QCoreApplication App(Argc, Argv);
+  QStringList Args;
+  for (const QString & Arg : Arguments)
+  {
+    // "/console" only switches the binary into the console mode
+    if ((Arg.compare(QStringLiteral("/console"), Qt::CaseInsensitive) != 0) &&
+        (Arg.compare(QStringLiteral("-console"), Qt::CaseInsensitive) != 0))
+    {
+      Args << Arg;
+    }
+  }
+  QProcess Process;
+  Platform::SetProgram(Process, CliExecutable(), Args);
+  bool HasStreams = (GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_UNKNOWN);
+  if (HasStreams)
+  {
+    Process.setInputChannelMode(QProcess::ForwardedInputChannel);
+    Process.setProcessChannelMode(QProcess::ForwardedChannels);
+  }
+  Process.setCreateProcessArgumentsModifier([HasStreams](QProcess::CreateProcessArguments * ProcessArguments)
+  {
+    if (!HasStreams)
+    {
+      ProcessArguments->flags = (ProcessArguments->flags & ~static_cast<DWORD>(CREATE_NO_WINDOW)) | CREATE_NEW_CONSOLE;
+      ProcessArguments->startupInfo->dwFlags &= ~static_cast<DWORD>(STARTF_USESTDHANDLES);
+    }
+  });
+  Process.start();
+  if (!Process.waitForFinished(-1) && (Process.error() == QProcess::FailedToStart))
+  {
+    fprintf(stderr, "Cannot run nixscp-cli.\n");
+    return 1;
+  }
+  return Process.exitCode();
+}
+#endif
+
 int GuiCommandLine::RunConsoleMode(const QStringList & Arguments)
 {
   Options Params;
@@ -764,6 +833,9 @@ int GuiCommandLine::RunConsoleMode(const QStringList & Arguments)
   {
     return -1;
   }
+#ifdef Q_OS_WIN
+  return RunConsoleProgram(Arguments);
+#else
   QString Cli = CliExecutable();
   QStringList Args;
   // Started from the desktop without a terminal: the console needs one
@@ -803,6 +875,7 @@ int GuiCommandLine::RunConsoleMode(const QStringList & Arguments)
   execvp(Argv[0], Argv.data());
   fprintf(stderr, "Cannot run %s.\n", Argv[0]);
   return 1;
+#endif
 }
 
 //---------------------------------------------------------------------------
@@ -902,7 +975,9 @@ void GuiCommandLine::CommandLineFromAnotherInstance(CommanderWindow * Window, co
   }
   try
   {
-    LoginData Data = GetLoginData(Params.Param(1), Params, lnSession, Window, !CheckSafe(Params));
+    // Any program of this user can reach the socket, and this instance holds
+    // the unlocked passwords: as a clicked link, always /unsafe
+    LoginData Data = GetLoginData(Params.Param(1), Params, lnSession, Window, true);
     QDir::setCurrent(OldDirectory);
     if (!Data.Aborted)
     {

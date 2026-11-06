@@ -66,11 +66,17 @@ QString SftpErrorDetails(int Code, const QString & ServerMessage)
 // SFTP v3 packet types (draft-ietf-secsh-filexfer-02)
 enum : quint8
 {
-  FXP_CLOSE = 4, FXP_LSTAT = 7, FXP_SETSTAT = 9, FXP_OPENDIR = 11, FXP_READDIR = 12,
-  FXP_STAT = 17, FXP_RENAME = 18, FXP_READLINK = 19, FXP_SYMLINK = 20,
+  FXP_OPEN_PACKET = 3, FXP_CLOSE = 4, FXP_LSTAT = 7, FXP_SETSTAT = 9, FXP_OPENDIR = 11, FXP_READDIR = 12,
+  FXP_MKDIR = 14, FXP_STAT = 17, FXP_RENAME = 18, FXP_READLINK = 19, FXP_SYMLINK = 20,
   FXP_STATUS = 101, FXP_HANDLE = 102, FXP_DATA = 103, FXP_NAME = 104, FXP_ATTRS = 105,
   FXP_EXTENDED = 200, FXP_EXTENDED_REPLY = 201
 };
+
+const quint32 FXF_READ = 0x00000001;
+const quint32 FXF_WRITE = 0x00000002;
+const quint32 FXF_CREAT = 0x00000008;
+const quint32 FXF_TRUNC = 0x00000010;
+const quint32 FXF_EXCL = 0x00000020;
 
 const quint32 ATTR_SIZE = 0x00000001;
 const quint32 ATTR_UIDGID = 0x00000002;
@@ -542,6 +548,11 @@ QString SftpFileSystem::CanonicalizePath(const QString & APath)
     return FFallback->CanonicalizePath(APath);
   }
   CheckConnection();
+  if (FData.SFTPRealPath == asOff)
+  {
+    // LocalCanonify: "Canonicalize paths on the server" off, for a broken REALPATH
+    return SessionDirectoryCache::NormalizePath(APath, FHomeDirectory.isEmpty() ? QStringLiteral("/") : FHomeDirectory);
+  }
   SessionLog::LogEvent(1, QStringLiteral("Type: SSH_FXP_REALPATH, Path: %1").arg(APath));
   char * Result = sftp_canonicalize_path(FSftp, Path(APath).constData());
   if (Result == nullptr)
@@ -655,6 +666,7 @@ void SftpFileSystem::RawRead(char * Buffer, qsizetype Len)
     {
       // timeout of the blocking read, or the channel was closed
       CheckConnection();
+      FShell->ConfirmStalled();
       continue;
     }
     Got += Read;
@@ -743,6 +755,14 @@ RemoteFile SftpFileSystem::RawFileFromName(const QByteArray & Payload, int & Pos
     return File;
   }
   File.FileName = DecodeString(NameData, NameLen);
+  // Never pass on a name that is not a single path component: "x/.." selected
+  // in a listing would make a download land outside of the target directory
+  if (!IsValidListingName(File.FileName) || (static_cast<qsizetype>(strnlen(NameData, NameLen)) != NameLen))
+  {
+    SessionLog::LogEvent(QStringLiteral("Discarding entry \"%1\" with invalid name.").arg(File.FileName));
+    Valid = false;
+    return File;
+  }
   File.Size = static_cast<qint64>(A.Size);
   File.Permissions = A.Permissions & 07777;
   File.Modification = ModificationFromUnix(A.MTime, 0);
@@ -1090,10 +1110,38 @@ void SftpFileSystem::CreateDirectory(const QString & APath, int Mode)
   CheckConnection();
   auto Modified = qScopeGuard([&]() { DirectoryModified(APath, false); });
   SessionLog::LogEvent(1, QStringLiteral("Type: SSH_FXP_MKDIR, Path: %1").arg(APath));
-  if (sftp_mkdir(FSftp, Path(APath).constData(), static_cast<mode_t>(Mode)) != SSH_OK)
+  const QString Message = QStringLiteral("Error creating folder '%1'.").arg(APath);
+  if ((Mode < 0) && RawCapable())
   {
-    SftpError(QStringLiteral("Error creating folder '%1'.").arg(APath));
+    // libssh always sends permissions: SSH_FXP_MKDIR with no attributes
+    QByteArray Body = SftpString(Path(APath));
+    AddCardinal(Body, 0);
+    quint32 Id = RawSend(FXP_MKDIR, Body);
+    RawFlush();
+    RawExpectStatus(Id, Message);
+    return;
   }
+  if (sftp_mkdir(FSftp, Path(APath).constData(), static_cast<mode_t>((Mode < 0) ? 0777 : Mode)) != SSH_OK)
+  {
+    SftpError(Message);
+  }
+}
+
+void SftpFileSystem::CheckDirectory(const QString & APath)
+{
+  if (FFallback)
+  {
+    FFallback->CheckDirectory(APath);
+    return;
+  }
+  CheckConnection();
+  SessionLog::LogEvent(1, QStringLiteral("Type: SSH_FXP_OPENDIR, Path: %1").arg(APath));
+  sftp_dir Dir = sftp_opendir(FSftp, Path(APath).constData());
+  if (Dir == nullptr)
+  {
+    SftpError(QStringLiteral("Error listing directory '%1'.").arg(APath));
+  }
+  sftp_closedir(Dir);
 }
 
 void SftpFileSystem::DeleteFile(const QString & APath)
@@ -1454,6 +1502,52 @@ void SftpFileSystem::Download(const QString & RemotePath, const QString & LocalP
   Local.close();
 }
 
+sftp_file SftpFileSystem::OpenForUpload(const QString & RemotePath, bool Truncate, int Mode)
+{
+  const QString Message = QStringLiteral("Cannot create remote file '%1'.").arg(RemotePath);
+  try
+  {
+    if ((Mode >= 0) || !RawCapable())
+    {
+      int Flags = O_WRONLY | O_CREAT | (Truncate ? O_TRUNC : 0);
+      sftp_file File = sftp_open(FSftp, Path(RemotePath).constData(), Flags, static_cast<mode_t>((Mode >= 0) ? Mode : 0666));
+      if (File == nullptr)
+      {
+        SftpError(Message);
+      }
+      return File;
+    }
+    // libssh always sends permissions: SSH_FXP_OPEN with no attributes, and the
+    // file structure of libssh around the handle, as sftp_open would fill it
+    QByteArray Handle = RawOpenHandle(RemotePath, FXF_WRITE | FXF_CREAT | (Truncate ? FXF_TRUNC : 0), Message);
+    sftp_file File = static_cast<sftp_file>(calloc(1, sizeof(*File)));
+    ssh_string HandleString = ssh_string_new(static_cast<size_t>(Handle.size()));
+    if ((File == nullptr) || (HandleString == nullptr) ||
+        (ssh_string_fill(HandleString, Handle.constData(), static_cast<size_t>(Handle.size())) != 0))
+    {
+      free(File);
+      ssh_string_free(HandleString);
+      RawCloseHandle(Handle);
+      throw ExtException(Message);
+    }
+    File->sftp = FSftp;
+    File->handle = HandleString;
+    return File;
+  }
+  catch (const FatalException &)
+  {
+    throw;
+  }
+  catch (const AbortException &)
+  {
+    throw;
+  }
+  catch (const ExtException & E)
+  {
+    throw CannotCreateFileException(E.Message(), E.MoreMessages());
+  }
+}
+
 void SftpFileSystem::Upload(const QString & LocalPath, const QString & RemotePath, int Mode, FileOperationProgress & Progress)
 {
   TransferParams Params;
@@ -1497,14 +1591,20 @@ void SftpFileSystem::Upload(const QString & LocalPath, const QString & RemotePat
   // The removed BOM / ^Z still count to the progress of the local file
   const qint64 Removed = (LocalPos - RemoteOffset) + (Local.size() - LocalEnd);
   auto Modified = qScopeGuard([&]() { DirectoryModified(RemotePath, false); });
-  int Flags = O_WRONLY | O_CREAT | ((RemoteOffset > 0) ? 0 : O_TRUNC);
-  SessionLog::LogEvent(1, QStringLiteral("Type: SSH_FXP_OPEN, Path: %1").arg(RemotePath));
-  sftp_file File = sftp_open(FSftp, Path(RemotePath).constData(), Flags, static_cast<mode_t>(Mode));
-  if (File == nullptr)
+  // Where the data goes: Params.Append keeps the existing contents, all of the local file follows
+  qint64 WriteOffset = RemoteOffset;
+  if (Params.Append)
   {
-    SftpError(QStringLiteral("Cannot create remote file '%1'.").arg(RemotePath));
+    sftp_attributes Attrs = sftp_stat(FSftp, Path(RemotePath).constData());
+    if (Attrs != nullptr)
+    {
+      WriteOffset = static_cast<qint64>(Attrs->size);
+      sftp_attributes_free(Attrs);
+    }
   }
-  if ((RemoteOffset > 0) && (sftp_seek64(File, static_cast<uint64_t>(RemoteOffset)) != 0))
+  SessionLog::LogEvent(1, QStringLiteral("Type: SSH_FXP_OPEN, Path: %1").arg(RemotePath));
+  sftp_file File = OpenForUpload(RemotePath, (RemoteOffset == 0) && !Params.Append, Mode);
+  if ((WriteOffset > 0) && (sftp_seek64(File, static_cast<uint64_t>(WriteOffset)) != 0))
   {
     sftp_close(File);
     SftpError(QStringLiteral("Cannot write to remote file '%1'.").arg(RemotePath));
@@ -1645,12 +1745,6 @@ void SftpFileSystem::Upload(const QString & LocalPath, const QString & RemotePat
 
 namespace
 {
-
-const quint8 FXP_OPEN_PACKET = 3;
-const quint32 FXF_READ = 0x00000001;
-const quint32 FXF_WRITE = 0x00000002;
-const quint32 FXF_CREAT = 0x00000008;
-const quint32 FXF_EXCL = 0x00000020;
 
 void AddInt64(QByteArray & Data, quint64 Value)
 {

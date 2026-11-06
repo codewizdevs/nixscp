@@ -34,6 +34,9 @@ public:
   // Switch followed by a list of parameters ("/command a b c");
   // the parameters are consumed (removed from the parameter list)
   bool FindSwitch(const QString & Switch, QStringList & Params, int ParamsMax = -1);
+  // puttygen style switches, where -o and -O or -p and -P differ
+  bool FindSwitchCaseSensitive(const QString & Switch);
+  bool FindSwitchCaseSensitive(const QString & Switch, QStringList & Params, int ParamsMax = -1);
   QString SwitchValue(const QString & Switch, const QString & Default);
   // "on"/"off"/number; throws ExtException on an invalid value
   bool SwitchValue(const QString & Switch, bool Default, bool DefaultOnNonExistence);
@@ -62,5 +65,7 @@ private:
   bool FNoMoreSwitches = false;
   int FParamCount = 0;
 
-  bool DoFindSwitch(const QString & Switch, QString & Value, int & ParamsStart, int & ParamsCount, bool & ValueSet);
+  bool FindSwitchParams(const QString & Switch, QStringList & Params, int ParamsMax, Qt::CaseSensitivity Sensitivity);
+  bool DoFindSwitch(const QString & Switch, QString & Value, int & ParamsStart, int & ParamsCount, bool & ValueSet,
+    Qt::CaseSensitivity Sensitivity = Qt::CaseInsensitive);
 };

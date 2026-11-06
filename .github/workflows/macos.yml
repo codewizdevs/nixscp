@@ -25,7 +25,9 @@ jobs:
       LIBSSH_SHA256: 6898ba9dd836d618b71dc7a4bb786a502c173cef5cafbf20fe5e0567ba4ea30c
       MIN_MACOS: '12.0'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Build tools
         run: |
@@ -35,11 +37,11 @@ jobs:
       - name: Qt ${{ env.QT_VERSION }} (universal)
         run: |
           python3 -m venv "$RUNNER_TEMP/aqt"
-          "$RUNNER_TEMP/aqt/bin/pip" install --quiet aqtinstall
+          "$RUNNER_TEMP/aqt/bin/pip" install --quiet aqtinstall==3.3.0
           "$RUNNER_TEMP/aqt/bin/aqt" install-qt mac desktop "$QT_VERSION" clang_64 -O "$RUNNER_TEMP/qt"
           echo "QT_DIR=$RUNNER_TEMP/qt/$QT_VERSION/macos" >> "$GITHUB_ENV"
 
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         id: deps
         with:
           path: ~/nixscp-deps
@@ -81,11 +83,19 @@ jobs:
           otool -L "$DEPS"/lib/libssh.dylib
 
       # saved at once, so that a later failing step does not lose it
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         if: steps.deps.outputs.cache-hit != 'true'
         with:
           path: ~/nixscp-deps
           key: ${{ steps.deps.outputs.cache-primary-key }}
+
+      # also what came from the cache, which is not checked against the hashes above
+      - name: Dependency versions
+        run: |
+          set -euo pipefail
+          export PKG_CONFIG_PATH="$DEPS/lib/pkgconfig"
+          test "$(pkg-config --modversion libcrypto)" = "$OPENSSL_VERSION"
+          test "$(pkg-config --modversion libssh)" = "$LIBSSH_VERSION"
 
       - name: Tests (arm64)
         continue-on-error: true
@@ -113,7 +123,7 @@ jobs:
             arch -x86_64 "$App/Contents/MacOS/nixscp-cli" /help | head -1
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: nixscp-macos
           path: bin/macos/*.dmg

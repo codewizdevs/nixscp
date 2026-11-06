@@ -36,10 +36,15 @@ file, or `C:\Program Files\NixSCP\nixscp.exe`).
 
 ## Protocol
 
-- Transport: JSON-RPC 2.0 over standard input/output, one message per line.
+- Transport: JSON-RPC 2.0 over standard input/output, one message per line. Batches are accepted: the replies of a
+  batch go out together, as one array.
 - Protocol versions: `2025-06-18`, `2025-03-26` and `2024-11-05` (the client's version when it is one of these,
   otherwise the newest).
 - Capabilities: `tools` (the list does not change). Methods: `initialize`, `ping`, `tools/list`, `tools/call`.
+- Tool calls run one at a time, in the order they came. `ping` is answered during a call, and
+  `notifications/cancelled` stops a call while it runs: it gets no reply, and NixSCP stops the work on the server.
+- Text in a request must be valid Unicode: no lone surrogates, and no byte order mark at the start. Anything else comes
+  back as a tool error.
 - Server name `nixscp`, version the NixSCP version. The server's instructions tell the model to call
   `list_sites` first and to use site names exactly as listed.
 
@@ -58,7 +63,7 @@ Runs a shell command on a site (the user's login shell on the server, without a 
 |---|---|---|
 | `site` | yes | Site name exactly as returned by `list_sites` |
 | `command` | yes | The command line, e.g. `systemctl status nginx --no-pager` |
-| `stdin` | no | Text passed to the command's standard input |
+| `stdin` | no | Text passed to the command's standard input; it can be larger than 1 MiB |
 | `max_output_bytes` | no | Output kept per stream; default 102400 (100 KiB), between 1024 and 2097152 (2 MiB) |
 
 Result: text with the exit code, standard output and standard error, and `structuredContent`
@@ -88,6 +93,8 @@ Uploads one file from this computer to a site.
 | `site` | yes | Site name |
 | `local_path` | yes | File on this computer |
 | `remote_path` | no | File or folder on the server; default: the home folder |
+
+The file name of an upload cannot hold a path: give the folder as `remote_path`.
 
 ## What MCP does not offer
 

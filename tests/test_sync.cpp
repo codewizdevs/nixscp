@@ -328,6 +328,49 @@ int main(int argc, char ** argv)
     CHECK_MSG(R == (QStringList{QStringLiteral("older"), QStringLiteral("ronly"), QStringLiteral("size")}), R.join(QLatin1Char(',')));
     CompareDirectories(Local, Remote, false, true, true, L, R);
     CHECK_MSG(L == QStringList{QStringLiteral("size")}, L.join(QLatin1Char(',')));
+
+    // Timestamp precision of the listing (F-22): an FTP LIST gives minutes or days
+    {
+      QDateTime Exact(QDate(2025, 3, 4), QTime(12, 34, 56));
+      QList<CompareEntry> L2, R2;
+      auto Remote2 = [&R2](const char * Name, const QDateTime & Time, TModificationFmt Fmt)
+      {
+        CompareEntry Entry;
+        Entry.FileName = QString::fromLatin1(Name);
+        Entry.Modification = Time;
+        Entry.SecondPrecision = true;
+        Entry.ModificationFmt = Fmt;
+        R2.append(Entry);
+      };
+      for (const char * Name : {"minute", "day", "none", "seconds", "newminute"})
+      {
+        CompareEntry Entry;
+        Entry.FileName = QString::fromLatin1(Name);
+        Entry.Modification = Exact;
+        L2.append(Entry);
+      }
+      Remote2("minute", QDateTime(Exact.date(), QTime(12, 34)), mfMDHM);
+      Remote2("day", QDateTime(Exact.date(), QTime(0, 0)), mfMDY);
+      Remote2("none", QDateTime(), mfNone);
+      Remote2("seconds", QDateTime(Exact.date(), QTime(12, 34)), mfFull);
+      Remote2("newminute", QDateTime(Exact.date(), QTime(12, 35)), mfMDHM);
+      QStringList LocalChanged, RemoteChanged;
+      CompareDirectories(L2, R2, true, false, false, LocalChanged, RemoteChanged);
+      LocalChanged.sort();
+      CHECK_MSG(LocalChanged == QStringList{QStringLiteral("seconds")}, LocalChanged.join(QLatin1Char(',')));
+      CHECK_MSG(RemoteChanged == QStringList{QStringLiteral("newminute")}, RemoteChanged.join(QLatin1Char(',')));
+      // the convenience variant takes the precision from the listing
+      QTemporaryDir Dir;
+      QString File = Dir.filePath(QStringLiteral("f.txt"));
+      WriteFile(File, "x", Exact.toSecsSinceEpoch());
+      RemoteFile Listed;
+      Listed.FileName = QStringLiteral("f.txt");
+      Listed.Size = 1;
+      Listed.Modification = QDateTime(Exact.date(), QTime(12, 34));
+      Listed.ModificationFmt = mfMDHM;
+      CompareDirectories(Dir.path(), RemoteFileList{Listed}, true, false, LocalChanged, RemoteChanged);
+      CHECK_MSG(LocalChanged.isEmpty() && RemoteChanged.isEmpty(), LocalChanged.join(QLatin1Char(',')) + QLatin1Char('|') + RemoteChanged.join(QLatin1Char(',')));
+    }
   }
 
   QString Host = qEnvironmentVariable("NIXSCP_TEST_SSH_HOST", QStringLiteral("127.0.0.1"));

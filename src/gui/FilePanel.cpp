@@ -525,6 +525,11 @@ QString RemoteDirectoryProvider::UserName() const
   return (FTerminal != nullptr) ? FTerminal->Data().UserName : QString();
 }
 
+bool RemoteDirectoryProvider::ResolvingSymlinks() const
+{
+  return (FTerminal == nullptr) || (FTerminal->Data().ResolveSymlinks && FTerminal->IsCapable(fcResolveSymlink));
+}
+
 //---------------------------------------------------------------------------
 // View, delegate, path label
 //---------------------------------------------------------------------------
@@ -537,7 +542,7 @@ struct DropData
   bool Valid = false;
   bool FromRemote = false;
   bool OwnFiles = false;          // dragged from the same panel
-  QStringList Paths;
+  QStringList Paths;              // empty while hovering over remote files of another session
 };
 
 // Implemented by FilePanel::Private: keyboard/mouse selection logic of
@@ -558,6 +563,7 @@ public:
   virtual void ViewDrop(const DropData & Data, int Row, Qt::DropAction Action) = 0;
   virtual bool ViewIsMarked(int Row) = 0;
   virtual bool ViewFullRowSelect() = 0;
+  virtual QString ViewSessionId() = 0;
 };
 
 class PanelView : public QTreeView
@@ -755,7 +761,7 @@ protected:
     setState(QAbstractItemView::NoState);
     SetDropRow(-1);
     viewport()->update();
-    DropData Data = Decode(Event);
+    DropData Data = Decode(Event, true);
     int Row = TargetRow(Event->position().toPoint());
     if (!Data.Valid || (Data.OwnFiles && (Row < 0)))
     {
@@ -808,7 +814,12 @@ private:
     return Index.row();
   }
 
-  DropData Decode(const QDropEvent * Event) const
+  // Dropping: the drop itself, not just hovering. Remote files of another
+  // session or window are no use as paths (they would be looked up on the
+  // session of this tab): they count as files of any other application, which
+  // the source downloads to a temporary folder when asked for the URLs. That
+  // must wait for the drop.
+  DropData Decode(const QDropEvent * Event, bool Dropping = false) const
   {
     DropData Result;
     const QMimeData * Mime = Event->mimeData();
@@ -816,19 +827,32 @@ private:
     {
       return Result;
     }
+    bool OtherSession = false;
     if (Mime->hasFormat(FilesMimeType))
     {
       QJsonObject Obj = QJsonDocument::fromJson(Mime->data(FilesMimeType)).object();
-      Result.FromRemote = Obj.value(QStringLiteral("remote")).toBool();
-      for (const QJsonValue & Value : Obj.value(QStringLiteral("paths")).toArray())
+      bool Remote = Obj.value(QStringLiteral("remote")).toBool();
+      QString Session = Obj.value(QStringLiteral("session")).toString();
+      OtherSession = Remote && (Session.isEmpty() || (Handler == nullptr) || (Session != Handler->ViewSessionId()));
+      if (!OtherSession)
       {
-        Result.Paths.append(Value.toString());
+        Result.FromRemote = Remote;
+        for (const QJsonValue & Value : Obj.value(QStringLiteral("paths")).toArray())
+        {
+          Result.Paths.append(Value.toString());
+        }
+        Result.OwnFiles = (Event->source() == this);
+        Result.Valid = !Result.Paths.isEmpty();
+        return Result;
       }
-      Result.OwnFiles = (Event->source() == this);
-      Result.Valid = !Result.Paths.isEmpty();
     }
-    else if (Mime->hasUrls())
+    if (Mime->hasUrls())
     {
+      if (OtherSession && !Dropping)
+      {
+        Result.Valid = true;
+        return Result;
+      }
       for (const QUrl & Url : Mime->urls())
       {
         if (Url.isLocalFile())
@@ -1342,6 +1366,8 @@ struct FilePanel::Private : public QObject, public PanelViewHandler
   QStackedWidget * Stack = nullptr;
   QWidget * PanelPage = nullptr;
   QWidget * PlaceholderPage = nullptr;
+  QLabel * DisconnectLabel = nullptr;
+  QPushButton * ReconnectButton = nullptr;
   QVBoxLayout * TopDock = nullptr;
   QHBoxLayout * ButtonRow = nullptr;
   QComboBox * PathCombo = nullptr;
@@ -1374,6 +1400,7 @@ struct FilePanel::Private : public QObject, public PanelViewHandler
   QRubberBand * RubberBand = nullptr;
 
   QString Directory;
+  QString SessionId;
   QStringList BackHistory;       // last = most recent
   QStringList ForwardHistory;    // last = next
   quint64 Generation = 0;
@@ -1498,17 +1525,21 @@ struct FilePanel::Private : public QObject, public PanelViewHandler
     return Result;
   }
 
-  // GetMarkedFile/MarkedCount: marked files, or the focused one (Norton-like modes)
-  QList<int> OperationRows() const
+  // GetMarkedFile/MarkedCount: marked files, or the focused one (Norton-like
+  // modes). OnFocused: OperateOnFocusedFile(True), a focused file that is not
+  // marked is the only one, whatever else is marked.
+  QList<int> OperationRows(bool OnFocused = false) const
   {
-    QList<int> Rows = Model->MarkedRows();
-    if (Rows.isEmpty() && (NortonLike != nlOff))
+    int Current = CurrentRow();
+    bool FocusedFile = (Current >= 0) && !Model->IsParentRow(Current);
+    if (OnFocused && FocusedFile && !Model->IsMarked(Current))
     {
-      int Current = CurrentRow();
-      if ((Current >= 0) && !Model->IsParentRow(Current))
-      {
-        Rows.append(Current);
-      }
+      return {Current};
+    }
+    QList<int> Rows = Model->MarkedRows();
+    if (Rows.isEmpty() && (NortonLike != nlOff) && FocusedFile)
+    {
+      Rows.append(Current);
     }
     return Rows;
   }
@@ -1930,6 +1961,15 @@ struct FilePanel::Private : public QObject, public PanelViewHandler
     {
       return;
     }
+    // TWinConfiguration::ResolveDoubleClickAction: when the session does not
+    // resolve links, a link can be a directory. Unlike WinSCP not for plain files,
+    // which a directory change only fails for.
+    if (File.IsSymLink && Q->FRemote && (Live() != nullptr) && !Live()->ResolvingSymlinks() &&
+        !Configuration::Instance().AlwaysRespectDoubleClickAction)
+    {
+      Q->ChangeDirectory(Path);
+      return;
+    }
     // "Operation on double-click" applies to files only
     if ((DoubleClickAction == dcaCopy) && SignalConnected(QMetaMethod::fromSignal(&FilePanel::CopyRequested)))
     {
@@ -2086,7 +2126,10 @@ struct FilePanel::Private : public QObject, public PanelViewHandler
     {
       Pos = QPoint(4, 4);
     }
-    emit Q->ContextMenuRequested(View->viewport()->mapToGlobal(Pos), (Row >= 0) && !Model->IsParentRow(Row));
+    // TCustomDirView.KeyUp (VK_APPS): the file popup when MarkedCount > 0, which
+    // is the focused file too, but in the Explorer-style mode only what is marked
+    bool OnItem = (Row >= 0) && !Model->IsParentRow(Row) && ((NortonLike != nlOff) || (Model->MarkedCount() > 0));
+    emit Q->ContextMenuRequested(View->viewport()->mapToGlobal(Pos), OnItem);
   }
 
   bool NavigationKey(int Key, Qt::KeyboardModifiers Mods)
@@ -2597,6 +2640,7 @@ struct FilePanel::Private : public QObject, public PanelViewHandler
     }
     QJsonObject Obj;
     Obj.insert(QStringLiteral("remote"), Q->FRemote);
+    Obj.insert(QStringLiteral("session"), SessionId);
     Obj.insert(QStringLiteral("paths"), QJsonArray::fromStringList(Paths));
     Data->setData(FilesMimeType, QJsonDocument(Obj).toJson(QJsonDocument::Compact));
     if (!Q->FRemote)
@@ -2651,6 +2695,11 @@ struct FilePanel::Private : public QObject, public PanelViewHandler
   bool ViewFullRowSelect() override
   {
     return Delegate->FullRowSelect;
+  }
+
+  QString ViewSessionId() override
+  {
+    return SessionId;
   }
 
   //-------------------------------------------------------------------------
@@ -3007,25 +3056,33 @@ struct FilePanel::Private : public QObject, public PanelViewHandler
       connect(Hide, &QAction::triggered, this, [this, Column]() { Q->SetColumnVisible(Column, false); });
       Menu.addSeparator();
     }
-    QMenu * Sizes = Menu.addMenu(QStringLiteral("Show File Si&zes In"));
-    const struct { TFormatBytesStyle Style; const char * Caption; } SizeStyles[] =
-      { { fbNone, "&Bytes" }, { fbKilobytes, "&Kilobytes" }, { fbShort, "&Short format" } };
-    for (const auto & Item : SizeStyles)
+    // Local/RemoteFormatSizeBytesPopupItem and CalculateDirectorySizesPopupItem:
+    // of the Size column only (DirViewColumnRightClick)
+    if (Column == FileListModel::ColSize)
     {
-      QAction * Action = Sizes->addAction(QString::fromLatin1(Item.Caption));
-      Action->setCheckable(true);
-      Action->setChecked(Configuration::Instance().FormatSizeBytes == Item.Style);
-      TFormatBytesStyle Style = Item.Style;
-      connect(Action, &QAction::triggered, this, [Style]()
+      QMenu * Sizes = Menu.addMenu(QStringLiteral("Show File Si&zes In"));
+      const struct { TFormatBytesStyle Style; const char * Caption; } SizeStyles[] =
+        { { fbNone, "&Bytes" }, { fbKilobytes, "&Kilobytes" }, { fbShort, "&Short format" } };
+      for (const auto & Item : SizeStyles)
       {
-        Configuration::Instance().FormatSizeBytes = Style;
-        for (FilePanel * Panel : AllPanels())
+        QAction * Action = Sizes->addAction(QString::fromLatin1(Item.Caption));
+        Action->setCheckable(true);
+        Action->setChecked(Configuration::Instance().FormatSizeBytes == Item.Style);
+        TFormatBytesStyle Style = Item.Style;
+        connect(Action, &QAction::triggered, this, [Style]()
         {
-          Panel->ApplyConfiguration();
-        }
-      });
+          Configuration::Instance().FormatSizeBytes = Style;
+          for (FilePanel * Panel : AllPanels())
+          {
+            Panel->ApplyConfiguration();
+          }
+        });
+      }
+      QAction * Calculate = Menu.addAction(QStringLiteral("&Calculate Directory Sizes"));
+      Calculate->setEnabled((Model->MarkedCount() > 0) || Q->HasFocusedFile());
+      connect(Calculate, &QAction::triggered, Q, &FilePanel::CalculateDirectorySizesRequested);
+      Menu.addSeparator();
     }
-    Menu.addSeparator();
     QMenu * Columns = Menu.addMenu(QStringLiteral("&Columns"));
     for (int Index = 0; Index < FileListModel::ColCount; Index++)
     {
@@ -3343,14 +3400,28 @@ FilePanel::FilePanel(bool Remote, QWidget * Parent) :
   QLabel * NotConnected = new QLabel(QStringLiteral("Not connected"), d->PlaceholderPage);
   NotConnected->setAlignment(Qt::AlignCenter);
   PlaceholderLayout->addWidget(NotConnected);
+  // ReconnectPanel: why the session ended, when no message box told it
+  d->DisconnectLabel = new QLabel(d->PlaceholderPage);
+  d->DisconnectLabel->setObjectName(QStringLiteral("ReconnectLabel"));
+  d->DisconnectLabel->setAlignment(Qt::AlignCenter);
+  d->DisconnectLabel->setWordWrap(true);
+  d->DisconnectLabel->setTextFormat(Qt::PlainText);
+  d->DisconnectLabel->hide();
+  PlaceholderLayout->addWidget(d->DisconnectLabel);
+  // ReconnectToolbar
+  d->ReconnectButton = new QPushButton(QStringLiteral("&Reconnect"), d->PlaceholderPage);
+  d->ReconnectButton->setObjectName(QStringLiteral("ReconnectItem"));
+  d->ReconnectButton->hide();
   QPushButton * NewSession = new QPushButton(QStringLiteral("New Session..."), d->PlaceholderPage);
   QHBoxLayout * ButtonLayout = new QHBoxLayout();
   ButtonLayout->addStretch(1);
+  ButtonLayout->addWidget(d->ReconnectButton);
   ButtonLayout->addWidget(NewSession);
   ButtonLayout->addStretch(1);
   PlaceholderLayout->addLayout(ButtonLayout);
   PlaceholderLayout->addStretch(1);
   connect(NewSession, &QPushButton::clicked, this, &FilePanel::NewSessionRequested);
+  connect(d->ReconnectButton, &QPushButton::clicked, this, &FilePanel::ReconnectRequested);
   d->Stack->addWidget(d->PlaceholderPage);
   d->Stack->setCurrentWidget(d->PlaceholderPage);
 
@@ -3415,6 +3486,23 @@ FilePanel::~FilePanel()
   {
     d->Live()->CancelLoad();
   }
+}
+
+void FilePanel::SetDisconnected(bool CanReconnect, const QString & Message)
+{
+  d->ReconnectButton->setVisible(CanReconnect);
+  d->DisconnectLabel->setText(Message);
+  d->DisconnectLabel->setVisible(!Message.isEmpty());
+}
+
+void FilePanel::SetSessionId(const QString & SessionId)
+{
+  d->SessionId = SessionId;
+}
+
+QString FilePanel::SessionId() const
+{
+  return d->SessionId;
 }
 
 void FilePanel::SetProvider(DirectoryProvider * Provider)
@@ -3606,6 +3694,11 @@ int FilePanel::ForwardCount() const
   return d->ForwardHistory.size();
 }
 
+bool FilePanel::IsRoot() const
+{
+  return !d->Directory.isEmpty() && d->IsRootPath(d->Directory);
+}
+
 void FilePanel::ParentDirectory()
 {
   if (d->Directory.isEmpty() || d->IsRootPath(d->Directory))
@@ -3677,22 +3770,49 @@ void FilePanel::CancelLoading()
     QStringLiteral("Reading of directory was cancelled."));
 }
 
-QStringList FilePanel::SelectedPaths() const
+QStringList FilePanel::SelectedPaths(bool OnFocused) const
 {
   QStringList Result;
-  for (int Row : d->OperationRows())
+  for (int Row : d->OperationRows(OnFocused))
   {
     Result.append(d->Combine(d->Directory, d->Model->File(Row).FileName));
   }
   return Result;
 }
 
-QList<RemoteFile> FilePanel::SelectedFiles() const
+QList<RemoteFile> FilePanel::SelectedFiles(bool OnFocused) const
 {
   QList<RemoteFile> Result;
-  for (int Row : d->OperationRows())
+  for (int Row : d->OperationRows(OnFocused))
   {
     Result.append(d->Model->File(Row));
+  }
+  return Result;
+}
+
+QList<RemoteFile> FilePanel::FilesOfPaths(const QStringList & Paths) const
+{
+  QList<RemoteFile> Result;
+  for (const QString & Path : Paths)
+  {
+    int Row = d->Model->RowOfName(FRemote ? UnixPath::ExtractFileName(Path) : QFileInfo(Path).fileName());
+    if (Row >= 0)
+    {
+      Result.append(d->Model->File(Row));
+    }
+  }
+  return Result;
+}
+
+QList<RemoteFile> FilePanel::VisibleFiles() const
+{
+  QList<RemoteFile> Result;
+  for (int Row = 0; Row < d->RowCount(); Row++)
+  {
+    if (!d->Model->IsParentRow(Row))
+    {
+      Result.append(d->Model->File(Row));
+    }
   }
   return Result;
 }
@@ -3974,6 +4094,37 @@ QTreeView * FilePanel::View() const
 void FilePanel::FocusView()
 {
   d->View->setFocus();
+}
+
+void FilePanel::StartIncrementalSearch()
+{
+  FocusView();
+  if (!d->Searching)
+  {
+    d->Searching = true;
+    d->SearchHaveNext = false;
+    d->SearchText.clear();
+    d->UpdateStatus();
+  }
+}
+
+void FilePanel::ResetState(const FilePanel * Other)
+{
+  d->BackHistory.clear();
+  d->ForwardHistory.clear();
+  d->SavedNames.clear();
+  d->ResetIncrementalSearch();
+  ClearSelection();
+  if (Other != nullptr)
+  {
+    SetSort(Other->SortColumn(), Other->SortAscending());
+    SetFilterMask(Other->FilterMask());
+  }
+  if (d->RowCount() > 0)
+  {
+    d->SetCurrentRow(0);
+  }
+  d->UpdateButtons();
 }
 
 //---------------------------------------------------------------------------

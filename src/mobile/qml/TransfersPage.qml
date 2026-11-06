@@ -34,6 +34,7 @@ Page {
             required property string detail
             required property string error
             required property string target
+            required property bool canRetry
             width: ListView.view.width
             contentItem: RowLayout {
                 spacing: 12
@@ -82,7 +83,8 @@ Page {
                     onClicked: transfers.cancel(itemId)
                 }
                 ToolButton {
-                    visible: status === "failed" || status === "cancelled"
+                    // not after the tab closed: its connection is gone
+                    visible: canRetry
                     icon.source: "icons/refresh.svg"
                     Accessible.name: qsTr("Retry")
                     onClicked: transfers.retry(itemId)

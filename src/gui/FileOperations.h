@@ -25,6 +25,16 @@ class QWidget;
 
 namespace FileOperations
 {
+  // In-place rename: the character making Name impossible, empty when it is
+  // fine. WindowsPath: a local name on Windows, where "\" separates directories too.
+  QString InvalidNameCharacter(const QString & Name, bool WindowsPath);
+  // Local rename of OldName to NewName, TargetExists: whether the target path
+  // exists. On a case-insensitive volume the target of "foo" to "Foo" is the
+  // file itself, which only DirectoryEntries (called then) tells apart from
+  // another file: there the entry under the new name is missing.
+  bool LocalRenameTargetTaken(const QString & OldName, const QString & NewName, bool TargetExists,
+    const std::function<QStringList()> & DirectoryEntries);
+
   // Runs a Terminal operation with a progress window and reports its error
   // (CommanderWindow::RunWithProgress has this signature). Empty: a
   // ProgressDialog of the operation's terminal and ShowErrorMessage.

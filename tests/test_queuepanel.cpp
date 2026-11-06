@@ -27,6 +27,7 @@ int main()
 #include "core/IniStorage.h"
 #include "core/Queue.h"
 #include "gui/QueuePanel.h"
+#include "gui/SystemActions.h"
 
 #include <QAction>
 #include <QApplication>
@@ -234,11 +235,30 @@ int main(int argc, char ** argv)
     Panel->Action(QA::CycleOnceEmpty)->trigger();
     CHECK(Panel->OnceEmpty() == QueuePanel::odoDisconnect);
     CHECK(Panel->Action(QA::DisconnectOnceEmpty)->isChecked());
-    Panel->Action(QA::CycleOnceEmpty)->trigger();
-    Panel->Action(QA::CycleOnceEmpty)->trigger();
-    CHECK(Panel->OnceEmpty() == QueuePanel::odoShutDown);
+    if (SystemActions::OperationSupported(SystemActions::odoSuspend))
+    {
+      Panel->Action(QA::CycleOnceEmpty)->trigger();
+      Panel->Action(QA::CycleOnceEmpty)->trigger();
+      CHECK(Panel->OnceEmpty() == QueuePanel::odoShutDown);
+    }
     Panel->Action(QA::CycleOnceEmpty)->trigger();
     CHECK(Panel->OnceEmpty() == QueuePanel::odoIdle);
+
+    // No backend for Sleep and Shut Down (Windows, macOS): not offered
+    {
+      SystemActions::SetSystemOperationsUnsupported(true);
+      QueuePanel Limited;
+      Limited.SetQueue(&Queue);
+      CHECK(!Limited.Action(QA::SuspendOnceEmpty)->isVisible());
+      CHECK(!Limited.Action(QA::ShutDownOnceEmpty)->isVisible());
+      CHECK(Limited.Action(QA::DisconnectOnceEmpty)->isVisible());
+      Limited.Action(QA::CycleOnceEmpty)->trigger();
+      CHECK(Limited.OnceEmpty() == QueuePanel::odoDisconnect);
+      Limited.Action(QA::CycleOnceEmpty)->trigger();
+      CHECK(Limited.OnceEmpty() == QueuePanel::odoIdle);
+      Limited.SetQueue(nullptr);
+      SystemActions::SetSystemOperationsUnsupported(false);
+    }
 
     // the queue empties with "Disconnect Session" selected: signal, reset to Stay Idle
     int Requested = -1;

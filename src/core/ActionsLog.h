@@ -66,11 +66,16 @@ public:
   ActionsLog & operator=(const ActionsLog &) = delete;
 
   // Creates the file and writes the XML declaration and <session>
-  // (TActionLog::ReflectSettings); false with the error when it cannot be created
-  bool Open(QString * Error = nullptr);
+  // (TActionLog::ReflectSettings); false with the error when it cannot be created.
+  // DeferHeader: those are written with the first record, for the session
+  // named by SetSession until then.
+  bool Open(QString * Error = nullptr, bool DeferHeader = false);
+  void SetSession(const SessionData & Data);
   // Ends a group, writes </session> and closes the file
   void Close();
   bool Logging() const;
+  // Writing has failed, and logging was turned off (LOG_GEN_ERROR)
+  bool Failed() const;
   QString CurrentFileName() const;
   QString LastError() const;
 
@@ -99,6 +104,9 @@ public:
   // Whether sessions create their own XML log from the configuration
   // (LogActions). nixscp-cli turns it off: its script writes the XML log.
   static void SetSessionLoggingEnabled(bool Enabled);
+  // One log of the process, used by all its sessions (/xmllog of nixscp-cli)
+  static void SetProcessLog(const std::shared_ptr<ActionsLog> & Log);
+  static std::shared_ptr<ActionsLog> ProcessLog();
   // The XML log a new session uses (nullptr when off)
   static std::shared_ptr<ActionsLog> CreateForSession(const SessionData & Data, const Configuration & Config);
 
@@ -115,10 +123,12 @@ private:
   QString FLastError;
   QString FIndent = QStringLiteral("  ");
   bool FLogging = false;
+  bool FHeaderPending = false;
   bool FFailed = false;
   bool FInGroup = false;
   std::deque<std::shared_ptr<Record>> FPending;
 
+  void AddHeader();
   void DoAdd(const QString & Line);
   void AddMessages(const QString & Indent, const QStringList & Messages);
   void AddPending(const std::shared_ptr<Record> & Action);

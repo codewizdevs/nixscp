@@ -7,6 +7,7 @@
 
 #include <QAbstractButton>
 #include <QApplication>
+#include <QDateTime>
 #include <QElapsedTimer>
 #include <QMessageBox>
 #include <QTcpServer>
@@ -78,6 +79,16 @@ static QMessageBox * Startup(QWidget * Window)
   return Notice();
 }
 
+// L39: the daily limit, and a clock that was set back
+static void TestCheckDue()
+{
+  QDateTime Now = QDateTime::currentDateTimeUtc();
+  CHECK(UpdateCheck::CheckDue(QDateTime(), Now));
+  CHECK(!UpdateCheck::CheckDue(Now.addSecs(-3600), Now));
+  CHECK(UpdateCheck::CheckDue(Now.addSecs(-25 * 3600), Now));
+  CHECK(UpdateCheck::CheckDue(Now.addDays(400), Now));
+}
+
 int main(int argc, char ** argv)
 {
   if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM"))
@@ -86,6 +97,7 @@ int main(int argc, char ** argv)
   }
   qputenv("NIXSCP_UPDATE_DELAY_MS", "10");
   QApplication App(argc, argv);
+  TestCheckDue();
   QTemporaryDir Dir;
   Configuration & Config = Configuration::Instance();
   Config.SetIniFileName(Dir.path() + QStringLiteral("/nixscp.ini"));

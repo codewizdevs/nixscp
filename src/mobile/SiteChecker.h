@@ -5,6 +5,7 @@
 #pragma once
 
 #include <QElapsedTimer>
+#include <QHostInfo>
 #include <QObject>
 #include <QPointer>
 #include <QTcpSocket>
@@ -16,7 +17,7 @@ class SiteChecker : public QObject
 
 public:
   explicit SiteChecker(QObject * Parent = nullptr) : QObject(Parent) {}
-  bool checking() const { return FSocket != nullptr; }
+  bool checking() const { return (FSocket != nullptr) || (FLookup >= 0); }
 
   Q_INVOKABLE void check(const QString & Site);
   Q_INVOKABLE void stop();
@@ -32,6 +33,10 @@ private:
   QString FSite;
   QStringList FReport;
   bool FConnected = false;
+  // the name is being resolved
+  int FLookup = -1;
+  quint16 FPort = 0;
 
+  void Connect(const QHostInfo & Info);
   void Finish(bool Ok);
 };

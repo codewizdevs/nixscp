@@ -44,8 +44,11 @@ Page {
                 spacing: 2
                 Label { text: modelData.name; font.pixelSize: 16; elide: Text.ElideRight; Layout.fillWidth: true }
                 Label {
-                    text: qsTr("%1 · %2 members").arg(modelData.role).arg(modelData.members)
-                          + (modelData.keyReady ? "" : " · " + qsTr("waiting for the team key"))
+                    text: (modelData.members === 1 ? qsTr("%1 · 1 member").arg(modelData.role)
+                                                   : qsTr("%1 · %2 members").arg(modelData.role).arg(modelData.members))
+                          + (modelData.error ? " · " + qsTr("failed verification")
+                             : (modelData.conflict ? " · " + qsTr("needs a decision")
+                                : (modelData.keyReady ? "" : " · " + qsTr("no team key"))))
                     opacity: 0.65
                     font.pixelSize: 13
                     Layout.fillWidth: true

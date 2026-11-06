@@ -980,6 +980,7 @@ static void Drop(FilePanel * Target, const QStringList & Paths, bool FromRemote,
   auto * Mime = new QMimeData();
   QJsonObject Obj;
   Obj.insert(QStringLiteral("remote"), FromRemote);
+  Obj.insert(QStringLiteral("session"), Target->SessionId());
   Obj.insert(QStringLiteral("paths"), QJsonArray::fromStringList(Paths));
   Mime->setData(QStringLiteral("application/x-nixscp-files"), QJsonDocument(Obj).toJson(QJsonDocument::Compact));
   if (!FromRemote)
@@ -1589,6 +1590,19 @@ static void TestMisc(CommanderWindow & Window, const Env & E)
   CHECK(A(Window, "ShowHiddenFilesAction")->isChecked() != Shown);
   Key(Qt::Key_H, Qt::ControlModifier | Qt::AltModifier);
   CHECK(WaitFor([&]() { return !R->IsLoading() && (Listed(R, QStringLiteral(".hidden-file")) == Shown); }));
+
+  std::printf("  step: %s\n", "Ctrl+F: incremental search");
+  Activate(Window, R);
+  Key(Qt::Key_F, Qt::ControlModifier);
+  {
+    bool Searching = false;
+    for (QLabel * Label : R->findChildren<QLabel *>())
+    {
+      Searching = Searching || Label->text().startsWith(QStringLiteral("Search:"));
+    }
+    CHECK(Searching);
+    Key(Qt::Key_Escape);
+  }
 
   std::printf("  step: %s\n", "Ctrl+L: the path box");
   // Ctrl+L: the path box of the current panel; a typed path + Enter opens it

@@ -4,16 +4,21 @@
 // and the certificate auto-detection AddMatchingKeyCertificate
 // (windows/Tools.cpp).
 #include "core/SecureShell.h"
+#include "core/Configuration.h"
+#include "core/ConfigVault.h"
+#include "core/Security.h"
 #include "core/PuttyKey.h"
 #include "core/SessionLog.h"
 
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QScopeGuard>
 #include <QFileInfo>
 #include <QHostAddress>
 #include <QMutex>
 #include <QNetworkProxyFactory>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QTimer>
 #include <QUrl>
@@ -26,8 +31,10 @@
 #include <fcntl.h>
 #ifndef Q_OS_WIN
 #include <sys/un.h>
+#include <sys/wait.h>
 #endif
 #include <cerrno>
+#include <csignal>
 #include <cstring>
 #include <list>
 
@@ -62,6 +69,7 @@ struct AuthSettings
   QString UserName;
   QString Password;
   QString PublicKeyFile;
+  QString Passphrase;
   QString DetachedCertificate;
   bool TryAgent = true;
   bool AuthKI = true;
@@ -71,8 +79,8 @@ struct AuthSettings
 };
 
 // Authentication part of TSecureShell (PuTTY's ssh2 userauth driven by
-// WinSCP's prompts): none -> public key (file or agent/default keys) ->
-// GSSAPI -> keyboard-interactive -> password
+// WinSCP's prompts): none -> public key (agent, then the key file of the
+// site) -> GSSAPI -> keyboard-interactive -> password
 class Authenticator
 {
 public:
@@ -132,18 +140,23 @@ public:
           return;
         }
       }
-      else if (FSettings.TryAgent)
+      else if (FSettings.TryAgent && !AgentSocketPath().isEmpty())
       {
-        // Agent + default keys (~/.ssh/id_*), like OpenSSH
-        Rc = ssh_userauth_publickey_auto(FSession, nullptr, nullptr);
+        // Keys of the agent only, as PuTTY with Pageant: the default keys of
+        // OpenSSH (~/.ssh/id_*) would be offered to every server
+        Rc = ssh_userauth_agent(FSession, nullptr);
         if (Rc == SSH_AUTH_SUCCESS)
         {
           return;
         }
-        if (Rc == SSH_AUTH_ERROR)
+        if ((Rc == SSH_AUTH_ERROR) && !ssh_is_connected(FSession))
         {
           Error(QStringLiteral("Authentication failed."));
         }
+      }
+      if (FSettings.PublicKeyFile.isEmpty())
+      {
+        LogDefaultKeysNotTried();
       }
     }
 
@@ -199,6 +212,20 @@ private:
     throw FatalException(Message, SshErrorText(FSession));
   }
 
+  // A key that works with OpenSSH does nothing here, so the log tells why
+  // the session goes on to asking for a password
+  void LogDefaultKeysNotTried()
+  {
+    QStringList Keys = QDir(ExpandHome(QStringLiteral("~/.ssh"))).entryList(
+      {QStringLiteral("id_rsa"), QStringLiteral("id_ecdsa"), QStringLiteral("id_ecdsa_sk"), QStringLiteral("id_ed25519"),
+       QStringLiteral("id_ed25519_sk"), QStringLiteral("id_dsa")}, QDir::Files);
+    if (!Keys.isEmpty())
+    {
+      SessionLog::LogEvent(QStringLiteral("The site has no private key set, and the default keys of OpenSSH are not offered to servers: "
+        "%1 in ~/.ssh not tried. To use one, set it as the private key of the site.").arg(Keys.join(QStringLiteral(", "))));
+    }
+  }
+
   // Certificate to use with the private key: the configured
   // DetachedCertificate or an auto-detected "<key>-cert.pub"
   // (TSecureShell::Open / AddMatchingKeyCertificate)
@@ -248,10 +275,34 @@ private:
     {
       throw FatalException(QStringLiteral("Unable to open key file \"%1\".").arg(FileName), KeyFile.errorString());
     }
-    QByteArray Head = KeyFile.read(32);
+    QByteArray Stored = KeyFile.read(1024 * 1024);
     KeyFile.close();
+    bool PassphraseUsed = false;
+    // Android's key store keeps keys encrypted with the configuration's key:
+    // opened here in memory, so a decrypted key never reaches the disk
+    bool Sealed = ConfigVault::IsSealed(Stored);
+    QByteArray Head = Stored;
+    if (Sealed && !ConfigVault::Open(Stored, Head))
+    {
+      throw FatalException(QStringLiteral("Unable to load private key from '%1'.").arg(FileName),
+        QStringLiteral("The key is encrypted and the configuration is locked."));
+    }
+    auto Wipe = qScopeGuard([&Head, Sealed]()
+    {
+      if (Sealed)
+      {
+        Security::WipeBytes(Head);
+      }
+    });
     auto PromptPassphrase = [&](QString & Passphrase) -> bool
     {
+      if (!FSettings.Passphrase.isEmpty() && !PassphraseUsed)
+      {
+        // TunnelPassphrase: asked only when it turns out to be wrong
+        PassphraseUsed = true;
+        Passphrase = FSettings.Passphrase;
+        return true;
+      }
       QList<Prompt> Prompts{Prompt{QStringLiteral("&Passphrase for key '%1':").arg(QFileInfo(FileName).fileName()), false, QString()}};
       if (!FUI->PromptUser(UserInterface::pkPassphrase, FSettings.SessionName, QString(), Prompts))
       {
@@ -265,8 +316,8 @@ private:
     {
       // WinSCP's native key format
       QString Error;
-      PuttyKey::LoadResult Result = PuttyKey::Load(FileName,
-        [&](QString & Passphrase, bool) { return PromptPassphrase(Passphrase); }, &Key, &Error);
+      auto Prompt = [&](QString & Passphrase, bool) { return PromptPassphrase(Passphrase); };
+      PuttyKey::LoadResult Result = Sealed ? PuttyKey::LoadData(Head, Prompt, &Key, &Error) : PuttyKey::Load(FileName, Prompt, &Key, &Error);
       if (Result == PuttyKey::lrCancelled)
       {
         throw AbortException();
@@ -279,7 +330,12 @@ private:
     else
     {
       QByteArray Path = FileName.toUtf8();
-      int Rc = ssh_pki_import_privkey_file(Path.constData(), nullptr, nullptr, nullptr, &Key);
+      auto Import = [&](const char * Passphrase)
+      {
+        return Sealed ? ssh_pki_import_privkey_base64(Head.constData(), Passphrase, nullptr, nullptr, &Key)
+                      : ssh_pki_import_privkey_file(Path.constData(), Passphrase, nullptr, nullptr, &Key);
+      };
+      int Rc = Import(nullptr);
       for (int Attempt = 0; (Rc != SSH_OK) && (Attempt < 3); Attempt++)
       {
         QString Passphrase;
@@ -288,7 +344,7 @@ private:
           throw AbortException();
         }
         QByteArray Utf = Passphrase.toUtf8();
-        Rc = ssh_pki_import_privkey_file(Path.constData(), Utf.constData(), nullptr, nullptr, &Key);
+        Rc = Import(Utf.constData());
       }
       if (Rc != SSH_OK)
       {
@@ -398,6 +454,23 @@ private:
 QString NormalizeFingerprint(QString Str)
 {
   Str = Str.trimmed();
+  // The form of a URL (TSessionData::GenerateSessionUrl): "<type>-<bits>-<hash>"
+  // with base64 made URL safe, and an MD5 hash with dashes
+  static const QRegularExpression UrlForm(QStringLiteral("^(?:ssh-[a-z0-9]+|ecdsa-sha2-[a-z0-9]+)-[0-9]+-(.+)$"));
+  QRegularExpressionMatch UrlMatch = UrlForm.match(Str);
+  if (UrlMatch.hasMatch())
+  {
+    Str = UrlMatch.captured(1);
+    if ((Str.size() == 47) && (Str.count(QLatin1Char('-')) == 15))
+    {
+      Str.replace(QLatin1Char('-'), QLatin1Char(':'));
+    }
+    else
+    {
+      Str.replace(QLatin1Char('-'), QLatin1Char('+'));
+      Str.replace(QLatin1Char('_'), QLatin1Char('/'));
+    }
+  }
   // "ssh-ed25519 255 SHA256:..." / "ssh-rsa 2048 xx:xx:.." -> last word
   int P = Str.lastIndexOf(QLatin1Char(' '));
   if (P >= 0)
@@ -467,7 +540,7 @@ SshHostKeyInfo ServerHostKey(ssh_session Session)
 }
 
 void VerifySessionHostKey(ssh_session Session, const QString & HostName, int Port, const QString & ConfiguredKeys,
-  const QString & SessionName, UserInterface * UI, SshHostKeyInfo * Info = nullptr)
+  bool KeysFromUrl, const QString & SessionName, UserInterface * UI, SshHostKeyInfo * Info = nullptr)
 {
   SshHostKeyInfo HostKey = ServerHostKey(Session);
   if (Info != nullptr)
@@ -478,7 +551,26 @@ void VerifySessionHostKey(ssh_session Session, const QString & HostName, int Por
   const QString & SHA256 = HostKey.SHA256;
   const QString & MD5 = HostKey.MD5;
 
-  if (!ConfiguredKeys.trimmed().isEmpty())
+  // "*" and "acceptnew" are for the site and the switches: a URL can come from anybody
+  const QString Keys = KeysFromUrl ? SessionData::UrlHostKeys(ConfiguredKeys) : ConfiguredKeys;
+  // TSecureShell::HaveAcceptNewHostKeyPolicy (-hostkey=acceptnew)
+  bool AcceptNew = (Keys.trimmed().compare(QStringLiteral("acceptnew"), Qt::CaseInsensitive) == 0);
+  bool UseConfiguredKeys = !Keys.trimmed().isEmpty() && !AcceptNew;
+  if (UseConfiguredKeys && KeysFromUrl)
+  {
+    // FOverrideCachedHostKey off: a fingerprint in a URL does not outrank a key
+    // already known for the host, which is accepted as usual, and a key different
+    // from the known one is a warning. Where known_hosts cannot tell, nothing
+    // is known about the key, and the administrator's policy does not know a URL.
+    ssh_known_hosts_e Known = ssh_session_is_known_server(Session);
+    if (Known == SSH_KNOWN_HOSTS_OK)
+    {
+      return;
+    }
+    UseConfiguredKeys = ((Known == SSH_KNOWN_HOSTS_UNKNOWN) || (Known == SSH_KNOWN_HOSTS_NOT_FOUND)) &&
+      !Configuration::Instance().DisableAcceptingHostKeys();
+  }
+  if (UseConfiguredKeys)
   {
     // As TSecureShell::VerifyHostKey with SshHostKey set: a matching
     // configured fingerprint is accepted, anything else is rejected
@@ -489,10 +581,14 @@ void VerifySessionHostKey(ssh_session Session, const QString & HostName, int Por
     {
       OursMD5 = OursMD5.mid(4);
     }
-    for (const QString & Entry : ConfiguredKeys.split(QLatin1Char(';'), Qt::SkipEmptyParts))
+    for (const QString & Entry : Keys.split(QLatin1Char(';'), Qt::SkipEmptyParts))
     {
       if (Entry.trimmed() == QStringLiteral("*"))
       {
+        // ANY_HOSTKEY
+        const QString Message = QStringLiteral("WARNING! Giving up security and accepting any host key as configured!");
+        UI->Information(Message);
+        SessionLog::LogEvent(Message);
         return;
       }
       QString Normalized = NormalizeFingerprint(Entry);
@@ -501,7 +597,7 @@ void VerifySessionHostKey(ssh_session Session, const QString & HostName, int Por
         return;
       }
     }
-    throw FatalException(QStringLiteral("Host key does not match configured key fingerprint \"%1\"!").arg(ConfiguredKeys.trimmed()),
+    throw FatalException(QStringLiteral("Host key does not match configured key fingerprint \"%1\"!").arg(Keys.trimmed()),
       QStringLiteral("Host key fingerprint is %1 %2.").arg(KeyType, SHA256));
   }
 
@@ -513,6 +609,22 @@ void VerifySessionHostKey(ssh_session Session, const QString & HostName, int Por
   if (State == SSH_KNOWN_HOSTS_ERROR)
   {
     throw FatalException(QStringLiteral("Host key wasn't verified!"), SshErrorText(Session));
+  }
+  if (Configuration::Instance().DisableAcceptingHostKeys())
+  {
+    // Administrator's policy: only a known or configured key connects
+    throw FatalException(QStringLiteral("Host key wasn't verified!"),
+      QStringLiteral("Host key fingerprint is %1 %2.").arg(KeyType, SHA256));
+  }
+  if (AcceptNew && (State != SSH_KNOWN_HOSTS_CHANGED) && (State != SSH_KNOWN_HOSTS_OTHER))
+  {
+    if (ssh_session_update_known_hosts(Session) != SSH_OK)
+    {
+      // STORE_NEW_HOSTKEY_ERROR
+      throw FatalException(QStringLiteral("Failed to store new host key."), SshErrorText(Session));
+    }
+    SessionLog::LogEvent(QStringLiteral("Warning: Stored new host key to known_hosts - This should occur only on the first connection"));
+    return;
   }
 
   UserInterface::HostKeyState UIState =
@@ -699,6 +811,20 @@ bool IsLocalhost(const QString & Host)
     Host.startsWith(QStringLiteral("127.")) || (Host == QStringLiteral("::1"));
 }
 
+// The host is the one value of a proxy command that can come from a URL, and
+// the command goes to a shell (PuTTY and WinSCP put it there as it is, so that
+// a link to "$(id)" runs it for anybody with a local proxy in Default settings)
+void CheckProxyTarget(const QString & Host)
+{
+  for (QChar C : Host)
+  {
+    if (!C.isLetterOrNumber() && !QStringLiteral(".-_:[]%").contains(C))
+    {
+      throw FatalException(QStringLiteral("Host name \"%1\" cannot be passed to the proxy.").arg(Host));
+    }
+  }
+}
+
 // PuTTY format_telnet_command(): %host %port %user %pass %proxyhost %proxyport %%
 // and backslash escapes
 QString FormatProxyCommand(const QString & Format, const SessionData & Data, const QString & TargetHost)
@@ -745,7 +871,10 @@ QString FormatProxyCommand(const QString & Format, const SessionData & Data, con
           {
             case 0: Result += Data.ProxyHost; break;
             case 1: Result += QString::number(Data.ProxyPort); break;
-            case 2: Result += TargetHost; break;
+            case 2:
+              CheckProxyTarget(TargetHost);
+              Result += TargetHost;
+              break;
             case 3: Result += QString::number(Data.PortNumber); break;
             case 4: Result += Data.ProxyUsername; break;
             case 5: Result += Data.ProxyPassword; break;
@@ -797,6 +926,21 @@ addrinfo * ResolveHost(const QString & Host, int Port, int Family)
     QString Reason = QString::fromLocal8Bit(gai_strerror(Rc));
 #endif
     ConnectionError(Host, QStringLiteral("Host does not exist.\n%1").arg(Reason));
+  }
+  if (Family == AF_INET6)
+  {
+    // macOS answers for an address or a name without IPv6 with the IPv4 address
+    // in the form of an IPv6 one: the connection would be what the session rules out
+    bool Mapped = true;
+    for (addrinfo * A = Addresses; Mapped && (A != nullptr); A = A->ai_next)
+    {
+      Mapped = IN6_IS_ADDR_V4MAPPED(&reinterpret_cast<const sockaddr_in6 *>(A->ai_addr)->sin6_addr);
+    }
+    if (Mapped)
+    {
+      freeaddrinfo(Addresses);
+      ConnectionError(Host, QStringLiteral("Host does not exist.\nThe host has no IPv6 address."));
+    }
   }
   return Addresses;
 }
@@ -1298,6 +1442,42 @@ void NegotiateTelnet(ProxyIo & Io, const SessionData & Data, const QString & Tar
   }
 }
 
+// The SSH page options, the same for the session and its tunnel
+// (TSessionData::CreateTunnelData inherits them)
+void ApplySshOptions(ssh_session Session, const SessionData & Data)
+{
+  if (Data.Compression)
+  {
+    ssh_options_set(Session, SSH_OPTIONS_COMPRESSION, "yes");
+  }
+  auto SetAlgorithms = [Session](ssh_options_e Option, ssh_options_e Option2, const QString & Value, const char * What)
+  {
+    if (Value.isEmpty())
+    {
+      return;
+    }
+    QByteArray Utf = Value.toUtf8();
+    if ((ssh_options_set(Session, Option, Utf.constData()) != SSH_OK) ||
+        ((Option2 != Option) && (ssh_options_set(Session, Option2, Utf.constData()) != SSH_OK)))
+    {
+      throw FatalException(QStringLiteral("Connection failed."),
+        QStringLiteral("None of the configured %1 algorithms is supported.\n%2").arg(QString::fromLatin1(What), SshErrorText(Session)));
+    }
+  };
+  SetAlgorithms(SSH_OPTIONS_CIPHERS_C_S, SSH_OPTIONS_CIPHERS_S_C, SecureShell::CipherOption(Data), "encryption");
+  SetAlgorithms(SSH_OPTIONS_KEY_EXCHANGE, SSH_OPTIONS_KEY_EXCHANGE, SecureShell::KexOption(Data), "key exchange");
+  SetAlgorithms(SSH_OPTIONS_HOSTKEYS, SSH_OPTIONS_HOSTKEYS, SecureShell::HostKeyOption(Data), "host key");
+  // Re-keying: RekeyBytes, unless the server "handles SSH key re-exchange
+  // badly" (BugRekey2 forced on). RekeyTime is not applied: with
+  // SSH_OPTIONS_REKEY_TIME set, libssh 0.11 delays every request by a
+  // delayed-ACK round trip (measured: SFTP stat 0.1 ms -> 48 ms)
+  uint64_t RekeyData = static_cast<uint64_t>(std::max<qint64>(Data.RekeyBytes(), 0));
+  if ((RekeyData > 0) && (Data.Bug[sbRekey2] != asOn))
+  {
+    ssh_options_set(Session, SSH_OPTIONS_REKEY_DATA, &RekeyData);
+  }
+}
+
 // Connection > Proxy applies to this connection (PuTTY proxy_for_destination)
 bool UsesProxy(const SessionData & Data)
 {
@@ -1328,6 +1508,7 @@ struct SecureShell::JumpData
   QString HostName;
   int Port = SshPortNumber;
   QString HostKey;
+  bool HostKeyFromUrl = false;
   bool PasswordUsed = false;
   QString Error;
   QString MoreMessages;
@@ -1337,15 +1518,43 @@ struct SecureShell::JumpData
   static int BeforeConnection(ssh_session Session, void * UserData)
   {
     JumpData * Self = static_cast<JumpData *>(UserData);
-    const SessionData & Data = Self->Owner->FData;
-    long Timeout = Data.Timeout;
-    ssh_options_set(Session, SSH_OPTIONS_TIMEOUT, &Timeout);
-    if (!Data.KnownHostsFile.isEmpty())
+    return Self->Guard([&]()
     {
-      QByteArray KnownHosts = QFile::encodeName(Data.KnownHostsFile);
-      ssh_options_set(Session, SSH_OPTIONS_KNOWNHOSTS, KnownHosts.constData());
-    }
-    return 0;
+      SecureShell * Owner = Self->Owner;
+      const SessionData & Data = Owner->FData;
+      // A site is what it says, see SecureShell::ApplyOptions
+      bool ProcessConfig = false;
+      ssh_options_set(Session, SSH_OPTIONS_PROCESS_CONFIG, &ProcessConfig);
+      long Timeout = Data.Timeout;
+      ssh_options_set(Session, SSH_OPTIONS_TIMEOUT, &Timeout);
+      if (!Data.KnownHostsFile.isEmpty())
+      {
+        QByteArray KnownHosts = QFile::encodeName(Data.KnownHostsFile);
+        ssh_options_set(Session, SSH_OPTIONS_KNOWNHOSTS, KnownHosts.constData());
+      }
+      ApplySshOptions(Session, Data);
+      // TSessionData::CreateTunnelData: the proxy of the session is the way to the tunnel host
+      SessionData Tunnel = Data;
+      Tunnel.HostName = Self->HostName;
+      Tunnel.PortNumber = Self->Port;
+      if (UsesProxy(Tunnel))
+      {
+#ifdef Q_OS_WIN
+        if (Tunnel.ProxyMethod == pmCmd)
+        {
+          QByteArray Utf = FormatProxyCommand(Tunnel.ProxyLocalCommand, Tunnel, Tunnel.HostName).toUtf8();
+          ssh_options_set(Session, SSH_OPTIONS_PROXYCOMMAND, Utf.constData());
+          return;
+        }
+        socket_t Fd = Owner->OpenProxySocket(Tunnel);
+#else
+        socket_t Fd = (Tunnel.ProxyMethod == pmCmd) ?
+          Owner->StartProxyCommand(FormatProxyCommand(Tunnel.ProxyLocalCommand, Tunnel, Tunnel.HostName)) :
+          Owner->OpenProxySocket(Tunnel);
+#endif
+        ssh_options_set(Session, SSH_OPTIONS_FD, &Fd);
+      }
+    });
   }
 
   template <typename F>
@@ -1377,7 +1586,7 @@ struct SecureShell::JumpData
     JumpData * Self = static_cast<JumpData *>(UserData);
     return Self->Guard([&]()
     {
-      VerifySessionHostKey(Session, Self->HostName, Self->Port, Self->HostKey, Self->Auth.SessionName, Self->Owner->FUI);
+      VerifySessionHostKey(Session, Self->HostName, Self->Port, Self->HostKey, Self->HostKeyFromUrl, Self->Auth.SessionName, Self->Owner->FUI);
     });
   }
 
@@ -1714,6 +1923,7 @@ void SecureShell::Close()
   }
   FAgent.reset();
   FJump.reset();
+  StopProxyCommand();
 }
 
 QString SecureShell::CipherOption(const SessionData & Data)
@@ -1744,48 +1954,160 @@ QString SecureShell::ProxyCommandOption(const SessionData & Data)
   return FormatProxyCommand(Data.ProxyLocalCommand, Data, Data.HostName);
 }
 
-bool SecureShell::PromptProxyCredentials()
+bool SecureShell::PromptProxyCredentials(SessionData & Data)
 {
   // PROXY_AUTH_TITLE, PROXY_AUTH_USERNAME_PROMPT, PROXY_AUTH_PASSWORD_PROMPT
   QList<Prompt> Prompts{
-    Prompt{QStringLiteral("Proxy &username:"), true, FData.ProxyUsername},
+    Prompt{QStringLiteral("Proxy &username:"), true, Data.ProxyUsername},
     Prompt{QStringLiteral("Proxy &password:"), false, QString()}};
   if (!FUI->PromptUser(UserInterface::pkPassword, QStringLiteral("Proxy authentication"), QString(), Prompts))
   {
     return false;
   }
-  FData.ProxyUsername = Prompts[0].Result;
-  FData.ProxyPassword = Prompts[1].Result;
+  Data.ProxyUsername = Prompts[0].Result;
+  Data.ProxyPassword = Prompts[1].Result;
   return true;
 }
 
-Net::Socket SecureShell::OpenProxySocket()
+#ifndef Q_OS_WIN
+socket_t SecureShell::StartProxyCommand(const QString & Command)
 {
-  bool AtProxy = DnsAtProxy(FData);
+  // Run here rather than by libssh (SSH_OPTIONS_PROXYCOMMAND), which at the end
+  // waits for the command with no limit: nc, for one, does not exit on closed input.
+  // Otherwise as libssh: the shell of the user, stderr to /dev/null.
+  SessionLog::LogEvent(QStringLiteral("Running proxy command: %1").arg(Command));
+  int Sockets[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, Sockets) != 0)
+  {
+    ProxyError(Net::ErrorText(errno));
+  }
+  // (macOS has no SOCK_CLOEXEC)
+  fcntl(Sockets[0], F_SETFD, FD_CLOEXEC);
+  fcntl(Sockets[1], F_SETFD, FD_CLOEXEC);
+  QByteArray Shell = qgetenv("SHELL");
+  if (Shell.isEmpty())
+  {
+    Shell = "/bin/sh";
+  }
+  // "exec": as OpenSSH, so that the command itself gets the signals of StopProxyCommand.
+  // That would end "sleep 1; nc ..." with its first part: what is not one simple
+  // command runs in a process group of its own, which gets the signals. Only then,
+  // as a background group cannot ask on the terminal (ssh -W for a passphrase).
+  static const QRegularExpression Compound(QStringLiteral("[;&|\\n()]|^\\s*[!{]|^\\s*[A-Za-z_][A-Za-z0-9_]*="));
+  bool Group = Command.contains(Compound);
+  QByteArray Exec = (Group ? QByteArray() : QByteArray("exec ")) + Command.toUtf8();
+  const char * Arguments[] = {Shell.constData(), "-c", Exec.constData(), nullptr};
+  int NullDevice = open("/dev/null", O_WRONLY | O_CLOEXEC);
+  pid_t Pid = fork();
+  if (Pid == 0)
+  {
+    // Only what is safe after a fork of a threaded process
+    if (Group)
+    {
+      setpgid(0, 0);
+    }
+    dup2(Sockets[1], STDIN_FILENO);
+    dup2(Sockets[1], STDOUT_FILENO);
+    if (NullDevice >= 0)
+    {
+      dup2(NullDevice, STDERR_FILENO);
+    }
+    execv(Arguments[0], const_cast<char * const *>(Arguments));
+    _exit(127);
+  }
+  int Error = errno;
+  if (NullDevice >= 0)
+  {
+    ::close(NullDevice);
+  }
+  ::close(Sockets[1]);
+  if (Pid < 0)
+  {
+    ::close(Sockets[0]);
+    ProxyError(Net::ErrorText(Error));
+  }
+  if (Group)
+  {
+    // (both sides, so that it is done whichever runs first)
+    setpgid(Pid, Pid);
+  }
+  FProxyCommandPid = Pid;
+  FProxyCommandGroup = Group;
+  return Sockets[0];
+}
+
+void SecureShell::StopProxyCommand()
+{
+  if (FProxyCommandPid <= 0)
+  {
+    return;
+  }
+  pid_t Pid = FProxyCommandPid;
+  // A signal for the whole group of a compound command
+  pid_t Target = FProxyCommandGroup ? -Pid : Pid;
+  FProxyCommandPid = 0;
+  // Its connection is closed by now. A bounded wait in any case: this runs
+  // when the session closes and a script could otherwise never exit.
+  auto Exited = [Pid](int Ms)
+  {
+    QElapsedTimer Timer;
+    Timer.start();
+    do
+    {
+      int Status = 0;
+      pid_t Result = waitpid(Pid, &Status, WNOHANG);
+      if ((Result == Pid) || ((Result < 0) && (errno != EINTR)))
+      {
+        return true;
+      }
+      usleep(10000);
+    }
+    while (Timer.elapsed() < Ms);
+    return false;
+  };
+  if (Exited(200) && !FProxyCommandGroup)
+  {
+    return;
+  }
+  // (the shell of a compound command may be gone with its commands still running)
+  kill(Target, SIGTERM);
+  if (Exited(1000))
+  {
+    return;
+  }
+  SessionLog::LogEvent(QStringLiteral("Proxy command does not exit, killing it."));
+  kill(Target, SIGKILL);
+  Exited(1000);
+}
+#endif
+
+Net::Socket SecureShell::OpenProxySocket(SessionData & Target)
+{
+  bool AtProxy = DnsAtProxy(Target);
   for (int Attempt = 0;; Attempt++)
   {
-    Net::Socket Socket = ConnectTcp(FData.ProxyHost, FData.ProxyPort, FData.AddressFamily, FData.SourceAddress, FData.Timeout);
+    Net::Socket Socket = ConnectTcp(Target.ProxyHost, Target.ProxyPort, Target.AddressFamily, Target.SourceAddress, Target.Timeout);
     try
     {
-      ProxyIo Io(Socket, FData.Timeout);
-      switch (FData.ProxyMethod)
+      ProxyIo Io(Socket, Target.Timeout);
+      switch (Target.ProxyMethod)
       {
         case pmSocks4:
-          NegotiateSocks4(Io, FData, AtProxy);
+          NegotiateSocks4(Io, Target, AtProxy);
           break;
         case pmSocks5:
-          NegotiateSocks5(Io, FData, AtProxy);
+          NegotiateSocks5(Io, Target, AtProxy);
           break;
         case pmHTTP:
         {
           QString Status;
-          if (!NegotiateHttp(Io, FData, AtProxy, Status))
+          if (!NegotiateHttp(Io, Target, AtProxy, Status))
           {
             // 407: ask for the credentials once, when none are configured
             Net::Close(Socket);
             Socket = Net::Invalid;
-            bool CanPrompt = (Attempt == 0) && FData.ProxyUsername.isEmpty();
-            if (CanPrompt && !PromptProxyCredentials())
+            bool CanPrompt = (Attempt == 0) && Target.ProxyUsername.isEmpty();
+            if (CanPrompt && !PromptProxyCredentials(Target))
             {
               throw AbortException();
             }
@@ -1799,15 +2121,15 @@ Net::Socket SecureShell::OpenProxySocket()
         }
         case pmTelnet:
         {
-          QString Target = FData.HostName;
+          QString TelnetHost = Target.HostName;
           int Family = AF_UNSPEC;
-          LiteralAddress(Target, Family);
+          LiteralAddress(TelnetHost, Family);
           if ((Family == AF_UNSPEC) && !AtProxy)
           {
-            QByteArray Address = ResolveAddress(Target, FData.PortNumber, AddressFamilyToAF(FData.AddressFamily), Family);
-            Target = AddressToString(Address, Family);
+            QByteArray Address = ResolveAddress(TelnetHost, Target.PortNumber, AddressFamilyToAF(Target.AddressFamily), Family);
+            TelnetHost = AddressToString(Address, Family);
           }
-          NegotiateTelnet(Io, FData, Target);
+          NegotiateTelnet(Io, Target, TelnetHost);
           break;
         }
         default:
@@ -1831,6 +2153,11 @@ void SecureShell::ApplyOptions()
   QByteArray Host = FData.HostName.toUtf8();
   unsigned int Port = static_cast<unsigned int>(FData.PortNumber);
   long Timeout = FData.Timeout;
+  // A site is what it says: ~/.ssh/config and /etc/ssh/ssh_config would replace
+  // its host, port, algorithms and proxy, and could run a command of their own.
+  // WinSCP reads no such file; SiteImport brings the entries in as sites.
+  bool ProcessConfig = false;
+  ssh_options_set(FSession, SSH_OPTIONS_PROCESS_CONFIG, &ProcessConfig);
   ssh_options_set(FSession, SSH_OPTIONS_HOST, Host.constData());
   ssh_options_set(FSession, SSH_OPTIONS_PORT, &Port);
   ssh_options_set(FSession, SSH_OPTIONS_TIMEOUT, &Timeout);
@@ -1840,10 +2167,6 @@ void SecureShell::ApplyOptions()
   {
     QByteArray KnownHosts = QFile::encodeName(FData.KnownHostsFile);
     ssh_options_set(FSession, SSH_OPTIONS_KNOWNHOSTS, KnownHosts.constData());
-  }
-  if (FData.Compression)
-  {
-    ssh_options_set(FSession, SSH_OPTIONS_COMPRESSION, "yes");
   }
   if (FData.TcpNoDelay || FForceNoDelay)
   {
@@ -1861,34 +2184,7 @@ void SecureShell::ApplyOptions()
   ssh_options_set(FSession, SSH_OPTIONS_GSSAPI_DELEGATE_CREDENTIALS, &Delegate);
 
   // SSH page: algorithm preferences
-  auto SetAlgorithms = [this](ssh_options_e Option, ssh_options_e Option2, const QString & Value, const char * What)
-  {
-    if (Value.isEmpty())
-    {
-      return;
-    }
-    QByteArray Utf = Value.toUtf8();
-    if ((ssh_options_set(FSession, Option, Utf.constData()) != SSH_OK) ||
-        ((Option2 != Option) && (ssh_options_set(FSession, Option2, Utf.constData()) != SSH_OK)))
-    {
-      throw FatalException(QStringLiteral("Connection failed."),
-        QStringLiteral("None of the configured %1 algorithms is supported.\n%2").arg(QString::fromLatin1(What), SshErrorText(FSession)));
-    }
-  };
-  QString Ciphers = CipherOption(FData);
-  SetAlgorithms(SSH_OPTIONS_CIPHERS_C_S, SSH_OPTIONS_CIPHERS_S_C, Ciphers, "encryption");
-  SetAlgorithms(SSH_OPTIONS_KEY_EXCHANGE, SSH_OPTIONS_KEY_EXCHANGE, KexOption(FData), "key exchange");
-  SetAlgorithms(SSH_OPTIONS_HOSTKEYS, SSH_OPTIONS_HOSTKEYS, HostKeyOption(FData), "host key");
-
-  // Re-keying: RekeyBytes, unless the server "handles SSH key re-exchange
-  // badly" (BugRekey2 forced on). RekeyTime is not applied: with
-  // SSH_OPTIONS_REKEY_TIME set, libssh 0.11 delays every request by a
-  // delayed-ACK round trip (measured: SFTP stat 0.1 ms -> 48 ms)
-  uint64_t RekeyData = static_cast<uint64_t>(std::max<qint64>(FData.RekeyBytes(), 0));
-  if ((RekeyData > 0) && (FData.Bug[sbRekey2] != asOn))
-  {
-    ssh_options_set(FSession, SSH_OPTIONS_REKEY_DATA, &RekeyData);
-  }
+  ApplySshOptions(FSession, FData);
 
   // Connection > Tunnel: libssh ProxyJump to the tunnel host (no local
   // forwarded port, so TunnelLocalPortNumber has nothing to control)
@@ -1902,9 +2198,11 @@ void SecureShell::ApplyOptions()
     FJump->HostName = FData.TunnelHostName;
     FJump->Port = FData.TunnelPortNumber;
     FJump->HostKey = FData.TunnelHostKey;
+    FJump->HostKeyFromUrl = FData.TunnelHostKeyFromUrl;
     FJump->Auth.UserName = FData.TunnelUserName;
     FJump->Auth.Password = FData.TunnelPassword;
     FJump->Auth.PublicKeyFile = FData.TunnelPublicKeyFile;
+    FJump->Auth.Passphrase = FData.TunnelPassphrase;
     FJump->Auth.TryAgent = FData.TryAgent;
     FJump->Auth.AuthKI = FData.AuthKI;
     FJump->Auth.AuthKIPassword = FData.AuthKIPassword;
@@ -1938,8 +2236,14 @@ void SecureShell::ApplyOptions()
   bool Proxied = UsesProxy(FData);
   if (Proxied && (FData.ProxyMethod == pmCmd))
   {
-    QByteArray Utf = FormatProxyCommand(FData.ProxyLocalCommand, FData, FData.HostName).toUtf8();
+    QString Command = FormatProxyCommand(FData.ProxyLocalCommand, FData, FData.HostName);
+#ifdef Q_OS_WIN
+    QByteArray Utf = Command.toUtf8();
     ssh_options_set(FSession, SSH_OPTIONS_PROXYCOMMAND, Utf.constData());
+#else
+    socket_t Fd = StartProxyCommand(Command);
+    ssh_options_set(FSession, SSH_OPTIONS_FD, &Fd);
+#endif
     return;
   }
   if (!Proxied && (FData.AddressFamily == afAuto) && FData.LogicalHostName.isEmpty())
@@ -1950,7 +2254,7 @@ void SecureShell::ApplyOptions()
   // Own socket: SOCKS/HTTP/Telnet proxy negotiated here, the address family
   // (libssh has no option for it) or a logical host name (the host key is
   // then looked up under that name, while the real host is connected)
-  Net::Socket Socket = Proxied ? OpenProxySocket() :
+  Net::Socket Socket = Proxied ? OpenProxySocket(FData) :
     ConnectTcp(FData.HostName, FData.PortNumber, FData.AddressFamily, FData.SourceAddress, FData.Timeout);
   socket_t Fd = Socket;
   ssh_options_set(FSession, SSH_OPTIONS_FD, &Fd);
@@ -2007,6 +2311,7 @@ void SecureShell::Connect()
     ssh_free(FSession);
     FSession = nullptr;
     FJump.reset();
+    StopProxyCommand();
     throw;
   }
   QByteArray User = FData.UserName.toUtf8();
@@ -2020,6 +2325,7 @@ void SecureShell::Connect()
     ssh_free(FSession);
     FSession = nullptr;
     std::unique_ptr<JumpData> Jump = std::move(FJump);
+    StopProxyCommand();
     if (Jump && Jump->Aborted)
     {
       throw AbortException();
@@ -2028,13 +2334,46 @@ void SecureShell::Connect()
     {
       throw FatalException(Jump->Error, Jump->MoreMessages);
     }
+    if (TryFtp())
+    {
+      // FTP_SUGGESTION
+      More = QStringLiteral("%1\n\nThe server rejected SFTP connection, but it listens for FTP connections.\n\n"
+        "Did you want to use FTP protocol instead of SFTP? Prefer using encryption.").arg(More);
+    }
     ConnectionError(FData.HostName, More);
   }
 }
 
+bool SecureShell::TryFtp()
+{
+  // TSecureShell::TryFtp
+  if (!Configuration::Instance().TryFtpWhenSshFails)
+  {
+    return false;
+  }
+  if (((FData.FSProtocol != fsSFTP) && (FData.FSProtocol != fsSFTPonly)) || (FData.PortNumber != SshPortNumber) ||
+      FData.Tunnel || (FData.ProxyMethod != pmNone))
+  {
+    SessionLog::LogEvent(QStringLiteral("Using non-standard protocol or port, tunnel or proxy, will not knock FTP port."));
+    return false;
+  }
+  SessionLog::LogEvent(QStringLiteral("Knocking FTP port."));
+  bool Result = false;
+  try
+  {
+    Net::Close(ConnectTcp(FData.HostName, FtpPortNumber, FData.AddressFamily, FData.SourceAddress, 2));
+    Result = true;
+  }
+  catch (const ExtException &)
+  {
+  }
+  SessionLog::LogEvent(Result ? QStringLiteral("FTP port opened, will suggest using FTP protocol.") : QStringLiteral("FTP port did not open."));
+  return Result;
+}
+
 void SecureShell::VerifyHostKey()
 {
-  VerifySessionHostKey(FSession, FKnownHostName, FKnownHostPort, FData.HostKey, FData.SessionName(), FUI, &FHostKey);
+  VerifySessionHostKey(FSession, FKnownHostName, FKnownHostPort, FData.HostKey, FData.HostKeyFromUrl, FData.SessionName(), FUI, &FHostKey);
 }
 
 void SecureShell::Authenticate()
@@ -2085,6 +2424,31 @@ void SecureShell::StartKeepAlive()
     }
   });
   FPingTimer->start();
+}
+
+void SecureShell::ConfirmStalled()
+{
+  // CONFIRM_PROLONG_TIMEOUT3 (TSecureShell::TimeoutPrompt)
+  int Timeout = std::max(FData.Timeout, 1);
+  QueryUserParams Params;
+  Params.Params = qpFatalAbort | qpAllowContinueOnError | qpIgnoreAbort;
+  Params.HelpKeyword = QStringLiteral("message_host_is_not_communicating");
+  Params.Type = qtConfirmation;
+  int AutoStall = Configuration::Instance().SessionReopenAutoStall;
+  if (AutoStall > 0)
+  {
+    // "Automatically reconnect session, if it stalls": Abort after this time
+    Params.Timeout = static_cast<unsigned int>(AutoStall);
+    Params.TimeoutAnswer = qaAbort;
+  }
+  unsigned int Answer = FUI->QueryUserEx(
+    QStringLiteral("**Host is not communicating for %1 seconds.\n\nWait for another %1 seconds?**").arg(Timeout),
+    QString(), qaRetry | qaAbort, Params);
+  if (Answer != qaRetry)
+  {
+    throw FatalException(QStringLiteral("Connection failed."),
+      QStringLiteral("Host is not communicating for %1 seconds.").arg(Timeout));
+  }
 }
 
 void SecureShell::KeepAlive()
@@ -2777,19 +3141,7 @@ bool SshChannel::Fill()
     FShell.CheckConnection();
     if (Idle.elapsed() >= static_cast<qint64>(Timeout) * 1000)
     {
-      // CONFIRM_PROLONG_TIMEOUT3 (TSecureShell::TimeoutPrompt)
-      QueryUserParams Params;
-      Params.Params = qpFatalAbort | qpAllowContinueOnError | qpIgnoreAbort;
-      Params.HelpKeyword = QStringLiteral("message_host_is_not_communicating");
-      Params.Type = qtConfirmation;
-      unsigned int Answer = FShell.UI()->QueryUserEx(
-        QStringLiteral("**Host is not communicating for %1 seconds.\n\nWait for another %1 seconds?**").arg(Timeout),
-        QString(), qaRetry | qaAbort, Params);
-      if (Answer != qaRetry)
-      {
-        throw FatalException(QStringLiteral("Connection failed."),
-          QStringLiteral("Host is not communicating for %1 seconds.").arg(Timeout));
-      }
+      FShell.ConfirmStalled();
       Idle.restart();
     }
   }

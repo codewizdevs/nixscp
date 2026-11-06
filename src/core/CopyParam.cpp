@@ -397,8 +397,18 @@ QString CopyParam::ChangeFileName(const QString & FileName, bool FirstLevel) con
   return ChangeFileName(FileName);
 }
 
-QString CopyParam::ChangeFileName(const QString & FileName) const
+QString CopyParam::ChangeFileName(const QString & AFileName) const
 {
+  QString FileName = AFileName;
+  if (TrimVMSVersions)
+  {
+    // TTerminal::GetBaseFileName
+    qsizetype P = FileName.lastIndexOf(QLatin1Char(';'));
+    if (P >= 0)
+    {
+      FileName.truncate(P);
+    }
+  }
   switch (FileNameCase)
   {
     case ncUpperCase: return FileName.toUpper();
@@ -416,7 +426,7 @@ QString CopyParam::ChangeFileName(const QString & FileName) const
   }
 }
 
-#ifdef Q_OS_WIN
+// The rules of Windows, compiled on every platform: tested on Linux too.
 static constexpr QChar TokenPrefix = QLatin1Char('%');
 
 // LocalInvalidChars ("/\\:*?\"<>|", plus the control characters) + TokenPrefix
@@ -425,18 +435,27 @@ static bool IsTokenizible(QChar Char)
   return (Char.unicode() < 0x20) || QStringView(u"/\\:*?\"<>|%").contains(Char);
 }
 
-// IsReservedName: CON, PRN, AUX, NUL, COM1-9, LPT1-9, also with an extension
+// IsReservedName: a device, also with an extension, and with spaces after the
+// name, which Windows drops before it looks for a device ("NUL .txt" is NUL).
+// CONIN$ and CONOUT$ are consoles; the superscript digits count as digits.
 static bool IsReservedName(const QString & FileName)
 {
   qsizetype Dot = FileName.indexOf(QLatin1Char('.'));
   QString Base = ((Dot >= 0) ? FileName.left(Dot) : FileName).toUpper();
+  while (Base.endsWith(QLatin1Char(' ')))
+  {
+    Base.chop(1);
+  }
   static const QStringList Reserved = {
     QStringLiteral("CON"), QStringLiteral("PRN"), QStringLiteral("AUX"), QStringLiteral("NUL"),
-    QStringLiteral("COM1"), QStringLiteral("COM2"), QStringLiteral("COM3"), QStringLiteral("COM4"), QStringLiteral("COM5"),
-    QStringLiteral("COM6"), QStringLiteral("COM7"), QStringLiteral("COM8"), QStringLiteral("COM9"),
-    QStringLiteral("LPT1"), QStringLiteral("LPT2"), QStringLiteral("LPT3"), QStringLiteral("LPT4"), QStringLiteral("LPT5"),
-    QStringLiteral("LPT6"), QStringLiteral("LPT7"), QStringLiteral("LPT8"), QStringLiteral("LPT9")};
-  return Reserved.contains(Base);
+    QStringLiteral("CONIN$"), QStringLiteral("CONOUT$")};
+  if (Reserved.contains(Base))
+  {
+    return true;
+  }
+  static const QString Digits = QStringLiteral("0123456789\u00B9\u00B2\u00B3");
+  return (Base.size() == 4) && (Base.startsWith(QStringLiteral("COM")) || Base.startsWith(QStringLiteral("LPT"))) &&
+    Digits.contains(Base.at(3));
 }
 
 static QString CharToken(QChar Char)
@@ -455,11 +474,9 @@ static QChar TokenChar(const QString & FileName, qsizetype Index)
   uint Code = FileName.mid(Index + 1, 2).toUInt(&Ok, 16);
   return Ok ? QChar(static_cast<char16_t>(Code)) : QChar();
 }
-#endif
 
-QString CopyParam::ValidLocalFileName(const QString & FileName)
+QString CopyParam::WindowsLocalFileName(const QString & FileName)
 {
-#ifdef Q_OS_WIN
   QString Result;
   Result.reserve(FileName.size());
   for (qsizetype Index = 0; Index < FileName.size(); Index++)
@@ -491,14 +508,10 @@ QString CopyParam::ValidLocalFileName(const QString & FileName)
     Result.insert((Dot >= 0) ? Dot : Result.size(), QStringLiteral("%00"));
   }
   return Result;
-#else
-  return FileName;
-#endif
 }
 
-QString CopyParam::RestoreChars(const QString & FileName)
+QString CopyParam::WindowsRestoreChars(const QString & FileName)
 {
-#ifdef Q_OS_WIN
   QString Result = FileName;
   qsizetype Index = 0;
   while ((Index = Result.indexOf(TokenPrefix, Index)) >= 0)
@@ -523,6 +536,21 @@ QString CopyParam::RestoreChars(const QString & FileName)
     }
   }
   return Result;
+}
+
+QString CopyParam::ValidLocalFileName(const QString & FileName)
+{
+#ifdef Q_OS_WIN
+  return WindowsLocalFileName(FileName);
+#else
+  return FileName;
+#endif
+}
+
+QString CopyParam::RestoreChars(const QString & FileName)
+{
+#ifdef Q_OS_WIN
+  return WindowsRestoreChars(FileName);
 #else
   return FileName;
 #endif

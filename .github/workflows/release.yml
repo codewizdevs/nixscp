@@ -59,7 +59,7 @@ jobs:
             openssl-devel rpm-build file git qt6-qtsvg xdg-utils \
             dejavu-sans-fonts openssh-clients
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Configure
         run: |
@@ -82,7 +82,7 @@ jobs:
           cpack -G ${{ matrix.generator }}
           ls -l *.deb *.rpm 2>/dev/null || true
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: nixscp-${{ matrix.suffix }}
           path: |
@@ -118,12 +118,12 @@ jobs:
             libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1 libxcb-sync1 libxcb-shm0 libxcb-util1 \
             libwayland-client0 libwayland-cursor0 libwayland-egl1
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Qt ${{ env.QT_VERSION }}
         run: |
           python3 -m venv /opt/aqt
-          /opt/aqt/bin/pip install --quiet aqtinstall
+          /opt/aqt/bin/pip install --quiet aqtinstall==3.3.0
           /opt/aqt/bin/aqt install-qt linux desktop "$QT_VERSION" linux_gcc_64 -O /opt/qt
           echo "QT_DIR=/opt/qt/$QT_VERSION/gcc_64" >> "$GITHUB_ENV"
 
@@ -164,7 +164,7 @@ jobs:
           squashfs-root/usr/bin/nixscp-cli /help | head -1
           ! ldd squashfs-root/usr/bin/nixscp | grep "not found"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: nixscp-appimage
           path: appimage/*.AppImage
@@ -179,11 +179,11 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: packages
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: NixSCP ${{ github.ref_name }}
           generate_release_notes: true

@@ -1,7 +1,11 @@
 #include "mobile/ProAccount.h"
 #include "mobile/AndroidFiles.h"
 
+#include "mobile/KeyStore.h"
+
+#include "core/CloudCrypto.h"
 #include "core/CloudSync.h"
+#include "core/ConfigVault.h"
 #include "core/TeamSync.h"
 
 #include <QDesktopServices>
@@ -68,6 +72,21 @@ void ProAccount::Start()
     emit notice(QStringLiteral("Settings uploaded by %1 could not be decrypted with your NixSCP password and were "
       "replaced. Enter your NixSCP password on %1 to sync it again.").arg(Device));
   });
+  auto OfferRecoveryKey = [this]()
+  {
+    QString Key = Sync().PendingRecoveryKey();
+    if (!Key.isEmpty())
+    {
+      emit recoveryKeyWaiting(Key);
+    }
+  };
+  connect(&S, &CloudSync::KeyChangeSettled, this, [this, OfferRecoveryKey](bool, const QString & Message)
+  {
+    emit notice(Message);
+    OfferRecoveryKey();
+    emit changed();
+  });
+  QTimer::singleShot(0, this, OfferRecoveryKey);
   connect(&TeamSync::Instance(), &TeamSync::Changed, this, &ProAccount::sitesChanged);
   connect(&TeamSync::Instance(), &TeamSync::Notice, this, &ProAccount::notice);
   connect(&TeamSync::Instance(), &TeamSync::SitesReceived, this, [this](const QString & Team, int Added, int Removed, int Changed)
@@ -142,7 +161,7 @@ void ProAccount::signIn()
   FState = Request.State;
   FRedirectUri = Request.RedirectUri;
   FSignInTimeout.start();
-  FFiles->keepAlive(true, QStringLiteral("Signing in to NixSCP Pro..."));
+  FFiles->keepAlive(true, QStringLiteral("Signing in to NixSCP Pro..."), -1, QStringLiteral("signin"));
   emit changed();
   QDesktopServices::openUrl(QUrl(FUrl, QUrl::StrictMode));
 }
@@ -155,7 +174,7 @@ void ProAccount::cancelSignIn()
     FServer->deleteLater();
     FServer = nullptr;
     FSignInTimeout.stop();
-    FFiles->keepAlive(false, QString());
+    FFiles->keepAlive(false, QString(), -1, QStringLiteral("signin"));
     emit changed();
   }
 }
@@ -188,9 +207,10 @@ void ProAccount::Accept()
 
 void ProAccount::Respond(QTcpSocket * Socket, int Status, const QString & Message, bool Back)
 {
-  // a button back to the app (Android opens it by its package)
-  QString Link = Back ? QStringLiteral("<p><a href=\"intent:#Intent;action=android.intent.action.MAIN;"
-    "category=android.intent.category.LAUNCHER;package=com.nixscp.android;end\" style=\"display:inline-block;"
+  // a button back to the app: browsers open only BROWSABLE targets (the
+  // manifest's nixscp://signed-in); the package keeps other apps out of it
+  QString Link = Back ? QStringLiteral("<p><a href=\"intent://signed-in#Intent;scheme=nixscp;"
+    "package=com.nixscp.android;end\" style=\"display:inline-block;"
     "padding:.8rem 1.4rem;background:#1d4ed8;color:#fff;border-radius:8px;text-decoration:none\">Back to NixSCP</a></p>")
     : QString();
   QByteArray Body = QStringLiteral(
@@ -246,12 +266,21 @@ void ProAccount::signOut()
 //---------------------------------------------------------------------------
 void ProAccount::probe()
 {
-  Sync().ProbeCloud([this](bool Ok, bool HasData, const QString & Error) { emit probed(Ok, HasData, Error); });
+  Sync().ProbeCloud([this](bool Ok, bool HasData, bool OldFormat, const QString & Error) { emit probed(Ok, HasData, OldFormat, Error); });
 }
 
 void ProAccount::createKey(const QString & Password, bool WithRecoveryKey)
 {
   Sync().CreateKey(Password, WithRecoveryKey, [this](bool Ok, const QString & Result)
+  {
+    emit keyFinished(Ok, Result);
+    emit changed();
+  });
+}
+
+void ProAccount::replaceOldCloud(const QString & Password, bool WithRecoveryKey)
+{
+  Sync().ReplaceOldCloud(Password, WithRecoveryKey, [this](bool Ok, const QString & Result)
   {
     emit keyFinished(Ok, Result);
     emit changed();
@@ -271,9 +300,44 @@ void ProAccount::unlockKey(const QString & Secret, bool IsRecoveryKey)
   });
 }
 
-void ProAccount::changePassword(const QString & Password)
+QString ProAccount::passwordProblem(const QString & Password) const
 {
-  Sync().ChangePassword(Password, [this](bool Ok, const QString & Error) { emit passwordChanged(Ok, Error); });
+  return CloudCrypto::PasswordProblem(Password, Sync().Email());
+}
+
+int ProAccount::passwordScore(const QString & Password) const
+{
+  return CloudCrypto::PasswordScore(Password);
+}
+
+QString ProAccount::generatePassphrase() const
+{
+  return CloudCrypto::NewPassphrase();
+}
+
+void ProAccount::changePassword(const QString & Current, bool CurrentIsRecoveryKey, const QString & Password, bool RotateKey)
+{
+  CloudSync::KeyChange Change;
+  Change.Current = Current;
+  Change.CurrentIsRecoveryKey = CurrentIsRecoveryKey;
+  Change.NewPassword = Password;
+  Change.RotateDataKey = RotateKey;
+  Sync().ChangeKey(Change, [this](bool Ok, const QString & Result) { emit passwordChanged(Ok, Result); });
+}
+
+void ProAccount::newRecoveryKey(const QString & Current, bool CurrentIsRecoveryKey, bool RotateKey)
+{
+  CloudSync::KeyChange Change;
+  Change.Current = Current;
+  Change.CurrentIsRecoveryKey = CurrentIsRecoveryKey;
+  Change.NewRecoveryKey = true;
+  Change.RotateDataKey = RotateKey;
+  Sync().ChangeKey(Change, [this](bool Ok, const QString & Result) { emit recoveryKeyChanged(Ok, Result); });
+}
+
+void ProAccount::recoveryKeySaved()
+{
+  Sync().RecoveryKeySaved();
 }
 
 void ProAccount::syncNow()

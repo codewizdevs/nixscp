@@ -38,6 +38,9 @@ void TerminalView::setTerminal(TerminalSession * Terminal)
   {
     connect(FTerminal, &TerminalSession::updated, this, [this]()
     {
+      // a taller screen takes lines back from the scrollback (the keyboard
+      // hidden, the phone rotated): the offset must not point before it
+      FScrollOffset = TerminalSession::ValidOffset(FScrollOffset, FTerminal->ScrollbackCount());
       emit scrollChanged();
       update();
     });
@@ -68,7 +71,7 @@ void TerminalView::setFontSize(int Size)
 
 void TerminalView::setScrollOffset(int Offset)
 {
-  Offset = qBound(0, Offset, scrollbackCount());
+  Offset = TerminalSession::ValidOffset(Offset, scrollbackCount());
   if (Offset != FScrollOffset)
   {
     FScrollOffset = Offset;
@@ -123,6 +126,7 @@ void TerminalView::paint(QPainter * Painter)
   int Rows = FTerminal->Rows();
   int Cols = FTerminal->Cols();
   int Back = FTerminal->ScrollbackCount();
+  int Offset = TerminalSession::ValidOffset(FScrollOffset, Back);
   QColor DefaultFg(0xd4, 0xd4, 0xd4);
   QColor DefaultBg(0x1e, 0x1e, 0x1e);
   QFont Bold = FFont;
@@ -132,7 +136,7 @@ void TerminalView::paint(QPainter * Painter)
   for (int Row = 0; Row < Rows; Row++)
   {
     // with scrollOffset, the top rows come from the scrollback
-    int Line = Row - FScrollOffset;
+    int Line = Row - Offset;
     const QVector<VTermScreenCell> * Saved = (Line < 0) ? &FTerminal->ScrollbackLine(Back + Line) : nullptr;
     qreal Y = Row * FCellHeight;
     for (int Col = 0; Col < Cols; Col++)
@@ -156,7 +160,7 @@ void TerminalView::paint(QPainter * Painter)
       {
         std::swap(Fg, Bg);
       }
-      bool Cursor = (Saved == nullptr) && (FScrollOffset == 0) && FTerminal->CursorVisible() &&
+      bool Cursor = (Saved == nullptr) && (Offset == 0) && FTerminal->CursorVisible() &&
         (FTerminal->Cursor().row == Line) && (FTerminal->Cursor().col == Col);
       if (Cursor)
       {

@@ -8,6 +8,7 @@
 #include "core/SiteImport.h"
 
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QTemporaryDir>
 #include <cstdio>
@@ -471,7 +472,9 @@ static void TestAgentCommandRules()
   // denied patterns only: everything else allowed
   SessionData Deny;
   Deny.AgentDeny = QStringLiteral("*rm -rf*\nreboot*\nshutdown*");
-  CHECK(AgentAccess::CommandAllowed(Deny, QStringLiteral("echo $(date) > /tmp/x")));
+  CHECK(AgentAccess::CommandAllowed(Deny, QStringLiteral("echo hello > /tmp/x")));
+  // what cannot be checked is refused with denied patterns too: $(...) may hold a denied command
+  CHECK(!AgentAccess::CommandAllowed(Deny, QStringLiteral("echo $(date) > /tmp/x")));
   CHECK(!AgentAccess::CommandAllowed(Deny, QStringLiteral("cd /tmp && rm -rf build")));
   CHECK(!AgentAccess::CommandAllowed(Deny, QStringLiteral("uptime; reboot")));
   // the read-only preset
@@ -655,6 +658,308 @@ static void TestSessionData()
   CHECK(SessionData::MakeValidName(QStringLiteral("a/b")) == QStringLiteral("a\\b"));
 }
 
+// X-M10: a file in the PuTTY folder is not a place to grant agent access from
+static void TestPuttyOnlyPuttySettings(const QString & Home)
+{
+  QString Sessions = Home + QStringLiteral("/hostile-putty");
+  WriteFile(Sessions + QStringLiteral("/evil"),
+    "HostName=evil.example\nPortNumber=22\nProtocol=ssh\nUserName=me\n"
+    "AgentAccess=1\nAgentPermissions=7\nAgentName=prod\nAgentAllow=x\nAgentDeny=y\nAgentRecord=0\n"
+    "Password=abc\nPasswordPlain=plainpw\nTunnel=1\nTunnelHostName=jump.evil.example\nTunnelPasswordPlain=tp\n"
+    "IsWorkspace=1\nLink=other\nPortForwards=x%7C1234%7Ch%7C22\nPostLoginCommands=rm -rf /\nFSProtocol=5\n"
+    "Shell=/bin/evil\nRemoteDirectory=/evil\nSpecial=1\nNote=evil\nTimeout=1\n");
+  WriteFile(Sessions + QStringLiteral("/noport"), "HostName=np.example\nProtocol=ssh\nPortNumber=0\n");
+  WriteFile(Sessions + QStringLiteral("/bigport"), "HostName=bp.example\nProtocol=ssh\nPortNumber=70000\n");
+  WriteFile(Sessions + QStringLiteral("/lat%E8"), "HostName=latin1.example\nProtocol=ssh\n");
+  WriteFile(Sessions + QStringLiteral("/%C5%A1ef"), "HostName=utf8.example\nProtocol=ssh\n");
+  StoredSessionList Stored;
+  SessionData Defaults;
+  ImportSessionList List = SiteImport::SelectPuttySessionsForImport(Stored, Sessions);
+  CHECK(List.Count() == 5);
+  int Evil = IndexOf(List, QStringLiteral("evil"));
+  CHECK(Evil >= 0);
+  if (Evil >= 0)
+  {
+    const SessionData & D = *List.Sessions[Evil];
+    CHECK(D.HostName == QStringLiteral("evil.example"));
+    CHECK(D.UserName == QStringLiteral("me"));
+    CHECK(D.AgentAccess == Defaults.AgentAccess);
+    CHECK(D.AgentPermissions == Defaults.AgentPermissions);
+    CHECK(D.AgentName.isEmpty() && D.AgentAllow.isEmpty() && D.AgentDeny.isEmpty());
+    CHECK(D.AgentRecord == Defaults.AgentRecord);
+    CHECK(D.Password.isEmpty());
+    CHECK(!D.Tunnel && D.TunnelHostName.isEmpty() && D.TunnelPassword.isEmpty());
+    CHECK(!D.IsWorkspace && D.Link.isEmpty());
+    CHECK(D.PortForwards.isEmpty() && D.PostLoginCommands.isEmpty());
+    CHECK(D.FSProtocol == Defaults.FSProtocol);
+    CHECK(D.RemoteDirectory.isEmpty() && D.Note.isEmpty());
+    CHECK(D.Timeout == Defaults.Timeout);
+  }
+  // L30
+  for (const QString & Name : {QStringLiteral("noport"), QStringLiteral("bigport")})
+  {
+    int Index = IndexOf(List, Name);
+    CHECK((Index >= 0) && (List.Sessions[Index]->PortNumber == 22));
+  }
+  // L32: names from before PuTTY used UTF-8
+  CHECK(IndexOf(List, QString::fromLatin1("lat\xE8")) >= 0);
+  CHECK(IndexOf(List, QString::fromUtf8("\xC5\xA1" "ef")) >= 0);
+}
+
+static void TestOpensshTokensAndComments(const QString & Home)
+{
+  // L27
+  QString Directive, Value;
+  CHECK(SiteImport::ParseOpensshDirective(QStringLiteral("Host web # the main one"), Directive, Value));
+  CHECK(Value == QStringLiteral("web"));
+  CHECK(SiteImport::ParseOpensshDirective(QStringLiteral("Port 2200 # not the default"), Directive, Value));
+  CHECK(Value == QStringLiteral("2200"));
+  CHECK(SiteImport::ParseOpensshDirective(QStringLiteral("IdentityFile \"/home/a #b/key\""), Directive, Value));
+  CHECK(Value == QStringLiteral("\"/home/a #b/key\""));
+  CHECK(SiteImport::ParseOpensshDirective(QStringLiteral("Host a#b"), Directive, Value));
+  CHECK(Value == QStringLiteral("a#b"));
+  QString Config = Home + QStringLiteral("/tokens-config");
+  WriteFile(Config,
+    "Host web db # production\n"
+    "  Hostname %h.corp.example\n"
+    "  Port 2200 # moved\n"
+    "Host literal\n"
+    "  Hostname 100%%.example\n"
+    "Host both\n"
+    "  Hostname %h%%%h\n");
+  StoredSessionList Stored;
+  ImportSessionList List = SiteImport::SelectOpensshSessionsForImport(Stored, Config);
+  CHECK(List.Count() == 4);
+  CHECK(IndexOf(List, QStringLiteral("#")) < 0);
+  CHECK(IndexOf(List, QStringLiteral("production")) < 0);
+  int Web = IndexOf(List, QStringLiteral("web"));
+  int Db = IndexOf(List, QStringLiteral("db"));
+  CHECK((Web >= 0) && (Db >= 0));
+  if ((Web >= 0) && (Db >= 0))
+  {
+    // L26
+    CHECK(List.Sessions[Web]->HostName == QStringLiteral("web.corp.example"));
+    CHECK(List.Sessions[Db]->HostName == QStringLiteral("db.corp.example"));
+    CHECK(List.Sessions[Web]->PortNumber == 2200);
+  }
+  int Literal = IndexOf(List, QStringLiteral("literal"));
+  CHECK((Literal >= 0) && (List.Sessions[Literal]->HostName == QStringLiteral("100%.example")));
+  int Both = IndexOf(List, QStringLiteral("both"));
+  CHECK((Both >= 0) && (List.Sessions[Both]->HostName == QStringLiteral("both%both")));
+}
+
+// L28: was quadratic, with a regular expression per pattern per host: 45 seconds
+static void TestOpensshManyHosts(const QString & Home)
+{
+  QByteArray Text;
+  for (int I = 0; I < 2000; I++)
+  {
+    Text += "Host h" + QByteArray::number(I) + "\n  Hostname %h.example\n  User u" + QByteArray::number(I) + "\n  Port 22" + QByteArray::number(I % 10) + "\n";
+  }
+  Text += "Host *\n  Compression yes\n";
+  QString Config = Home + QStringLiteral("/many-config");
+  WriteFile(Config, Text);
+  StoredSessionList Stored;
+  QElapsedTimer Timer;
+  Timer.start();
+  ImportSessionList List = SiteImport::SelectOpensshSessionsForImport(Stored, Config);
+  qint64 Elapsed = Timer.elapsed();
+  std::printf("2000 OpenSSH hosts: %lld ms\n", static_cast<long long>(Elapsed));
+  CHECK(Elapsed < 5000);
+  CHECK(List.Count() == 2000);
+  int Last = IndexOf(List, QStringLiteral("h1999"));
+  CHECK(Last >= 0);
+  if (Last >= 0)
+  {
+    const SessionData & D = *List.Sessions[Last];
+    CHECK(D.HostName == QStringLiteral("h1999.example"));
+    CHECK(D.UserName == QStringLiteral("u1999"));
+    CHECK(D.PortNumber == 229);
+    CHECK(D.Compression);
+  }
+}
+
+static void TestFilezillaEdgeCases(const QString & Home)
+{
+  QString Folder = Home + QStringLiteral("/fz-edge");
+  WriteFile(Folder + QStringLiteral("/sitemanager.xml"), QByteArray(R"(<?xml version="1.0" encoding="UTF-8"?>
+<FileZilla3 version="3.60" platform="unix"><Servers>
+<Server><Host>crypt.example</Host><Port>22</Port><Protocol>1</Protocol><User>u</User><Pass encoding="crypt" pubkey="AAAA">QkFEQ0lQSEVSVEVYVA==</Pass><Logontype>1</Logontype><Name>crypted</Name></Server>
+<Server><Host>b64.example</Host><Port>21</Port><Protocol>0</Protocol><Logontype>1</Logontype><User>u</User><Pass encoding="base64">c2VjcmV0</Pass><Name>base64</Name><TimezoneOffset>120</TimezoneOffset><RemoteDir>1 0 4 home 5 vasek</RemoteDir></Server>
+<Server><Host>plain.example</Host><Port>21</Port><Protocol>0</Protocol><Logontype>1</Logontype><User>u</User><Pass>literal</Pass><Name>plain</Name></Server>
+<Server><Host>noname.example</Host><Port>21</Port><Protocol>0</Protocol><Logontype>0</Logontype></Server>
+<Server><Port>21</Port><Protocol>0</Protocol><Logontype>0</Logontype><Name>nohost</Name></Server>
+<Server><Host>big.example</Host><Port>99999</Port><Protocol>1</Protocol><Logontype>1</Logontype><Name>badport</Name></Server>
+<Server><Host>noport.example</Host><Protocol>0</Protocol><Logontype>1</Logontype><Name>noport-ftp</Name></Server>
+<Server><Host>noport2.example</Host><Protocol>3</Protocol><Logontype>1</Logontype><Name>noport-ftps</Name></Server>
+<Server><Host>noport3.example</Host><Protocol>1</Protocol><Logontype>1</Logontype><Name>noport-sftp</Name></Server>
+<Server><Host>vms.example</Host><Port>21</Port><Protocol>0</Protocol><Logontype>1</Logontype><Name>prefix</Name><RemoteDir>8 4 VOL: 3 dir</RemoteDir></Server>
+<Server><Host>emoji.example</Host><Port>21</Port><Protocol>0</Protocol><Logontype>1</Logontype><Name>points</Name><RemoteDir>1 0 1 &#x1F642; 3 abc</RemoteDir></Server>
+<Server><Host>emoji2.example</Host><Port>21</Port><Protocol>0</Protocol><Logontype>1</Logontype><Name>units</Name><RemoteDir>1 0 2 &#x1F642; 3 abc</RemoteDir></Server>
+<Server><Host>s3.example</Host><Port>443</Port><Protocol>7</Protocol><Logontype>1</Logontype><User>AK</User><Pass encoding="base64">c2VjcmV0</Pass><Name>s3site</Name></Server>
+<Server><Host>dav.example</Host><Protocol>9</Protocol><Logontype>1</Logontype><User>w</User><Name>dav</Name></Server>
+<Server><Host>dav2.example</Host><Protocol>19</Protocol><Logontype>1</Logontype><User>w</User><Name>dav-plain</Name></Server>
+<Server><Host>insecure.example</Host><Port>21</Port><Protocol>6</Protocol><Logontype>1</Logontype><User>w</User><Name>insecure-ftp</Name></Server>
+<Server><Host>azure.example</Host><Port>443</Port><Protocol>10</Protocol><Logontype>1</Logontype><User>w</User><Pass>token</Pass><Name>azure</Name></Server>
+<Server><Host>http.example</Host><Port>80</Port><Protocol>2</Protocol><Logontype>1</Logontype><User>w</User><Pass>pw</Pass><Name>http</Name></Server>
+<Folder expanded="1">Team
+  <Server><Host>infolder.example</Host><Port>21</Port><Protocol>0</Protocol><Logontype>0</Logontype></Server>
+</Folder>
+</Servers></FileZilla3>)"));
+  StoredSessionList Stored;
+  ImportSessionList List = SiteImport::SelectFilezillaSessionsForImport(Stored, Folder);
+  auto Site = [&List](const char * Name) -> const SessionData *
+  {
+    int Index = IndexOf(List, QString::fromLatin1(Name));
+    CHECK(Index >= 0);
+    return (Index >= 0) ? List.Sessions[Index].get() : nullptr;
+  };
+  // X-M18: ciphertext is not a password
+  if (const SessionData * D = Site("crypted"))
+  {
+    CHECK(D->Password.isEmpty());
+    CHECK(D->HostName == QStringLiteral("crypt.example"));
+  }
+  if (const SessionData * D = Site("base64"))
+  {
+    CHECK(D->Password == QStringLiteral("secret"));
+    // L35: minutes; two hours, in days
+    CHECK(qAbs(D->TimeDifference - (2.0 / 24.0)) < 0.0001);
+    CHECK(!D->TimeDifferenceAuto);
+    CHECK(D->RemoteDirectory == QStringLiteral("/home/vasek"));
+  }
+  if (const SessionData * D = Site("plain"))
+  {
+    CHECK(D->Password == QStringLiteral("literal"));
+  }
+  // L29: a site without a name is called after its host; without a host there is nothing to import
+  if (const SessionData * D = Site("noname.example"))
+  {
+    CHECK(D->HostName == QStringLiteral("noname.example"));
+  }
+  CHECK(Site("Team/infolder.example") != nullptr);
+  CHECK(IndexOf(List, QStringLiteral("nohost")) < 0);
+  for (const auto & Data : List.Sessions)
+  {
+    CHECK(!Data->Name.isEmpty() && !Data->Name.endsWith(QLatin1Char('/')));
+  }
+  // L30: an impossible or missing port is the protocol's default
+  if (const SessionData * D = Site("badport"))
+  {
+    CHECK(D->PortNumber == 22);
+  }
+  if (const SessionData * D = Site("noport-ftp"))
+  {
+    CHECK(D->PortNumber == 21);
+  }
+  if (const SessionData * D = Site("noport-ftps"))
+  {
+    CHECK(D->PortNumber == 990);
+  }
+  if (const SessionData * D = Site("noport-sftp"))
+  {
+    CHECK(D->PortNumber == 22);
+  }
+  // L31: the prefix is skipped with its space, so the path survives
+  if (const SessionData * D = Site("prefix"))
+  {
+    CHECK(D->RemoteDirectory == QStringLiteral("/dir"));
+  }
+  // sizes in code points (FileZilla on Linux) and UTF-16 units (Windows)
+  QString Emoji = QStringLiteral("/") + QString::fromUtf8("\xF0\x9F\x99\x82") + QStringLiteral("/abc");
+  if (const SessionData * D = Site("points"))
+  {
+    CHECK(D->RemoteDirectory == Emoji);
+  }
+  if (const SessionData * D = Site("units"))
+  {
+    CHECK(D->RemoteDirectory == Emoji);
+  }
+  // L34: never plain FTP for what was not FTP
+  if (const SessionData * D = Site("s3site"))
+  {
+    CHECK(D->FSProtocol == fsS3);
+    CHECK(D->Ftps != ftpsNone);
+  }
+  if (const SessionData * D = Site("dav"))
+  {
+    CHECK((D->FSProtocol == fsWebDAV) && (D->Ftps != ftpsNone) && (D->PortNumber == 443));
+  }
+  if (const SessionData * D = Site("dav-plain"))
+  {
+    CHECK((D->FSProtocol == fsWebDAV) && (D->Ftps == ftpsNone) && (D->PortNumber == 80));
+  }
+  if (const SessionData * D = Site("insecure-ftp"))
+  {
+    CHECK(D->FSProtocol == fsFTP);
+  }
+  CHECK(IndexOf(List, QStringLiteral("azure")) < 0);
+  CHECK(IndexOf(List, QStringLiteral("http")) < 0);
+}
+
+// L33
+static void TestKnownHostsPorts(const QString & Home)
+{
+  StoredSessionList Stored;
+  ImportSessionList List = SiteImport::SelectKnownHostsSessionsForImport(Stored,
+    {QStringLiteral("[bad.example]:abc ssh-ed25519 AAAA"), QStringLiteral("[zero.example]:0 ssh-ed25519 BBBB"),
+     QStringLiteral("[big.example]:70000 ssh-ed25519 CCCC"), QStringLiteral("[good.example]:2222 ssh-ed25519 DDDD"),
+     QStringLiteral("plain.example ssh-ed25519 EEEE")},
+    Home + QStringLiteral("/kh-ports/known_hosts"));
+  CHECK(List.Count() == 2);
+  CHECK(IndexOf(List, QStringLiteral("good.example:2222")) >= 0);
+  CHECK(IndexOf(List, QStringLiteral("plain.example")) >= 0);
+  for (const auto & Data : List.Sessions)
+  {
+    CHECK((Data->PortNumber > 0) && (Data->PortNumber <= 65535));
+  }
+}
+
+// X-M14, L2: an agent never reaches a server by chance
+static void TestAgentSiteLookup()
+{
+  StoredSessionList Sites;
+  SessionData D;
+  D.HostName = QStringLiteral("a.example");
+  D.FSProtocol = fsSFTP;
+  D.AgentAccess = AgentAccess::amAllow;
+  D.Name = QStringLiteral("original");
+  D.AgentName = QStringLiteral("prod");
+  Sites.Add(std::make_shared<SessionData>(D));
+  bool Ambiguous = true;
+  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("prod"), &Ambiguous) != nullptr);
+  CHECK(!Ambiguous);
+  // two sites under one name: neither, and the broker can say why
+  D.Name = QStringLiteral("copy");
+  D.HostName = QStringLiteral("b.example");
+  Sites.Add(std::make_shared<SessionData>(D));
+  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("prod"), &Ambiguous) == nullptr);
+  CHECK(Ambiguous);
+  // a site whose name equals the agent name of another
+  StoredSessionList Mixed;
+  D.Name = QStringLiteral("alias-holder");
+  Mixed.Add(std::make_shared<SessionData>(D));
+  D.Name = QStringLiteral("prod");
+  D.AgentName.clear();
+  Mixed.Add(std::make_shared<SessionData>(D));
+  CHECK(AgentAccess::FindAgentSite(Mixed, QStringLiteral("prod"), &Ambiguous) == nullptr);
+  CHECK(Ambiguous);
+  // a mode this version does not know is off, not "runs without asking"
+  for (int Mode : {3, 4, 100, -1})
+  {
+    StoredSessionList Odd;
+    D.Name = QStringLiteral("odd");
+    D.AgentAccess = Mode;
+    Odd.Add(std::make_shared<SessionData>(D));
+    CHECK(!AgentAccess::UsableByAgents(D));
+    CHECK(AgentAccess::FindAgentSite(Odd, QStringLiteral("odd")) == nullptr);
+  }
+  D.AgentAccess = AgentAccess::amAsk;
+  CHECK(AgentAccess::UsableByAgents(D));
+  D.AgentAccess = AgentAccess::amOff;
+  CHECK(!AgentAccess::UsableByAgents(D));
+}
+
 int main()
 {
   QTemporaryDir Dir;
@@ -674,6 +979,12 @@ int main()
   TestSessionData();
   TestAgentSettings();
   TestAgentCommandRules();
+  TestPuttyOnlyPuttySettings(Home);
+  TestOpensshTokensAndComments(Home);
+  TestOpensshManyHosts(Home);
+  TestFilezillaEdgeCases(Home);
+  TestKnownHostsPorts(Home);
+  TestAgentSiteLookup();
   if (Failures == 0)
   {
     std::printf("test_siteimport: all tests passed\n");

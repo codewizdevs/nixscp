@@ -35,9 +35,13 @@ LocalBrowser::LocalBrowser(QObject * Parent) : QObject(Parent)
   FAccessible = AndroidFiles::HasStorageAccess();
   // Download (shown before the access is granted, then listed)
   FDirectory = QDir(FRoot).filePath(QStringLiteral("Download"));
-  if (FAccessible && !Load(FDirectory))
+  if (FAccessible && !QDir(FDirectory).exists())
   {
-    Load(FRoot);
+    FDirectory = FRoot;
+  }
+  if (FAccessible)
+  {
+    Load(FDirectory);
   }
 }
 
@@ -58,6 +62,7 @@ bool LocalBrowser::Load(const QString & Directory)
   if (!Dir.exists() || !QFileInfo(Directory).isReadable())
   {
     FLastError = QStringLiteral("Cannot open the folder %1.").arg(Directory);
+    emit failed(FLastError);
     return false;
   }
   QList<FileListModel::Entry> Entries;
@@ -216,10 +221,7 @@ void LocalBrowser::checkAccess()
   {
     // just allowed: to Download (the root was all that could be seen before)
     QString Downloads = QDir(FRoot).filePath(QStringLiteral("Download"));
-    if (!Load(Downloads))
-    {
-      Load(FRoot);
-    }
+    Load(QDir(Downloads).exists() ? Downloads : FRoot);
   }
   else if (FAccessible)
   {

@@ -259,7 +259,7 @@ void CommanderActions::CreateActions()
   Add("LocalRefreshAction", "&Refresh", "Refresh|Refresh directory content", ssLocal);
   Add("LocalAddBookmarkAction2", "&Add Path to Bookmarks", "Add to bookmarks|Add the current directory to bookmark list", ssLocal, {K(Ctrl, Qt::Key_B)});
   Add("LocalPathToClipboardAction2", "Copy &Path to Clipboard", "Copy the current path to the clipboard", ssLocal, {K(Ctrl, Qt::Key_BracketLeft)});
-  Add("LocalFilterAction", "&Filter...", "Filter|Filter displayed files", ssLocal, {K(Ctrl | Alt, Qt::Key_F)});
+  Add("LocalFilterAction", "&Filter...", "Filter|Filter displayed files", ssLocal, {K(Ctrl | Alt, Qt::Key_F)}, true);
 
   // ---- Remote directory (right panel)
   Add("RemoteChangePathAction2", "&Change Directory", "Allows selection of different directory for panel", ssWindow, {K(Alt, Qt::Key_F2)});
@@ -274,10 +274,11 @@ void CommanderActions::CreateActions()
   Add("RemoteRefreshAction", "&Refresh", "Refresh|Refresh directory content", ssRemote);
   Add("RemoteAddBookmarkAction2", "&Add Path to Bookmarks", "Add to bookmarks|Add the current directory to bookmark list", ssRemote, {K(Ctrl, Qt::Key_B)});
   Add("RemotePathToClipboardAction2", "Copy &Path to Clipboard", "Copy the current path to the clipboard", ssRemote, {K(Ctrl, Qt::Key_BracketRight)});
-  Add("RemoteFilterAction", "&Filter...", "Filter|Filter displayed files", ssRemote, {K(Ctrl | Alt, Qt::Key_F)});
+  Add("RemoteFilterAction", "&Filter...", "Filter|Filter displayed files", ssRemote, {K(Ctrl | Alt, Qt::Key_F)}, true);
   Add("RemoteFindFilesAction2", "&Find Files...", "Find files|Find files and directories", ssWindow);
   // Address bar (GoToAddressAction): Ctrl+L, Alt+D
   Add("GoToAddressAction", "Go to &Address", "Go to the path box of the current panel", ssWindow, {K(Ctrl, Qt::Key_L), K(Alt, Qt::Key_D)});
+  Add("IncrementalSearchStartAction", "Incremental Search", "Start searching the files of the current panel as you type", ssWindow, {K(Ctrl, Qt::Key_F)});
 
   // ---- Sort
   Add("LocalSortAscendingAction2", "&Ascending", "Ascending/descending|Toggle ascending/descending sorting of files in the panel", ssDisplay, {}, true);
@@ -593,9 +594,13 @@ void CommanderActions::AddDropDownButton(QToolBar * Bar, QAction * Action, QMenu
 #include <QApplication>
 #include <QClipboard>
 #include <QComboBox>
+#include <QDir>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QMainWindow>
 #include <QMenuBar>
+#include <QMouseEvent>
+#include <QScopedValueRollback>
 #include <QSplitter>
 #include <QStatusBar>
 #include <QTabBar>
@@ -845,6 +850,7 @@ void CommanderWindow::ConnectActions()
     if (PanelReady(Panel)) Panel->ShowPathComboPopup();
   });
   A.On("RemoteFindFilesAction2", [this]() { FindFiles(); });
+  A.On("IncrementalSearchStartAction", [this]() { if (PanelReady(ActivePanel())) ActivePanel()->StartIncrementalSearch(); });
   A.On("GoToAddressAction", [this]() { GoToAddress(); });
 
   // ---- Selection
@@ -1219,12 +1225,12 @@ void CommanderWindow::CreateMenus()
   // NixSCP Teams: shared sites (gui/TeamsDialog)
   TeamsDialog::SetupMenu(menuBar()->addMenu(QStringLiteral("Tea&ms")), this, [this]() { return CurrentSiteName(); });
 
-  // Help: Contents (F1), Homepage, Report a Bug, Send Feedback, History, About
-  QMenu * Help = menuBar()->addMenu(QStringLiteral("&Help"));
-  HelpSystem::PopulateHelpMenu(Help, this);
-
   // NixSCP Pro: "Cloud Sync" when signed out, "Pro" when signed in
   CloudSyncUi::SetupMenu(menuBar()->addMenu(QStringLiteral("Cloud Sync")), this);
+
+  // Help, the last menu: Contents (F1), Homepage, Report a Bug, Send Feedback, History, About
+  QMenu * Help = menuBar()->addMenu(QStringLiteral("&Help"));
+  HelpSystem::PopulateHelpMenu(Help, this);
   Q_UNUSED(FileNames);
 }
 
@@ -1829,7 +1835,10 @@ void CommanderWindow::UpdateActions()
   A("NextTabAction")->setEnabled(FTabs.size() > 1);
   A("PreviousTabAction")->setEnabled(FTabs.size() > 1);
   A("DuplicateTabAction")->setEnabled(LocalBrowser || !Tab->Data.HostName.isEmpty());
-  A("SaveWorkspaceAction")->setEnabled(!WorkspaceTabs().isEmpty());
+  A("SaveWorkspaceAction")->setEnabled(std::any_of(FTabs.cbegin(), FTabs.cend(), [](const SessionTab * T)
+  {
+    return T->LocalBrowser ? !T->Implicit : !T->Data.HostName.isEmpty();
+  }));
   A("ColorMenuAction2")->setEnabled(!LocalBrowser);
   if (FColorMenu != nullptr) FColorMenu->setEnabled(!LocalBrowser);
   for (int Index = 0; Index < FSelectTabActions.size(); Index++)
@@ -1845,8 +1854,8 @@ void CommanderWindow::UpdateActions()
     QString S = Remote ? QStringLiteral("Remote") : QStringLiteral("Local");
     auto E = [&A, &S](const char * Suffix, bool Enabled) { A.Get(S + QString::fromLatin1(Suffix))->setEnabled(Enabled); };
     E("OpenDirAction", PR);
-    E("ParentDirAction", PR);
-    E("RootDirAction", PR);
+    E("ParentDirAction", PR && !P->IsRoot());
+    E("RootDirAction", PR && !P->IsRoot());
     E("HomeDirAction", PR);
     E("BackAction", PR && P->CanBack());
     E("ForwardAction", PR && P->CanForward());
@@ -1854,8 +1863,14 @@ void CommanderWindow::UpdateActions()
     E("AddBookmarkAction2", PR);
     E("PathToClipboardAction2", PR);
     E("FilterAction", PR);
-    // Path from Other Panel: local-local tabs only (NonVisual.cpp:291)
-    E("OtherDirAction", PR && LocalBrowser);
+    {
+      // Checked while a mask is on (NonVisual.cpp PANEL_ACTIONS)
+      QAction * Filter = A.Get(S + QStringLiteral("FilterAction"));
+      QSignalBlocker Blocker(Filter);
+      Filter->setChecked(PR && !P->FilterMask().isEmpty());
+    }
+    // Path from Other Panel: local-local tabs only, the panels differ (NonVisual.cpp:291)
+    E("OtherDirAction", PR && LocalBrowser && (QDir::cleanPath(L->CurrentDirectory()) != QDir::cleanPath(R->CurrentDirectory())));
     // Explore Directory: local directories only
     E("ExploreDirectoryAction", PR && !P->IsRemote());
     bool PSelected = HasSelection(P);
@@ -1882,6 +1897,7 @@ void CommanderWindow::UpdateActions()
   A("ResetLayoutRemoteColumnsAction")->setEnabled(RReady);
   A("RemoteFindFilesAction2")->setEnabled(Ready);
   A("GoToAddressAction")->setEnabled(Ready);
+  A("IncrementalSearchStartAction")->setEnabled(Ready);
 
   // Selection
   for (const char * Name : {"SelectOneAction", "SelectAction", "UnselectAction", "SelectAllAction", "InvertSelectionAction",
@@ -1966,6 +1982,60 @@ void CommanderWindow::UpdateActions()
 // Popups (NonVisual.dfm LocalFilePopup, RemoteFilePopup, LocalDirViewPopup,
 // RemoteDirViewPopup, LocalPanelPopup, RemotePanelPopup, CommanderBarPopup)
 
+namespace
+{
+// A TTBXSubmenuItem with DropdownCombo in a popup (RemoteEditMenuItem,
+// RemoteCopyMenuItem...): a click on the item or Enter runs its default action,
+// the arrow opens the submenu. Qt menus only open it, so the default action is
+// picked here and run once the popup has closed (Pending).
+class DropdownComboFilter : public QObject
+{
+public:
+  explicit DropdownComboFilter(QMenu * Menu) : QObject(Menu), FMenu(Menu) { Menu->installEventFilter(this); }
+
+  void Add(QMenu * Submenu, QAction * Default) { FDefaults.insert(Submenu->menuAction(), Default); }
+  QAction * Pending() const { return FPending; }
+
+protected:
+  bool eventFilter(QObject *, QEvent * Event) override
+  {
+    QAction * Item = nullptr;
+    if (Event->type() == QEvent::MouseButtonRelease)
+    {
+      auto * Mouse = static_cast<QMouseEvent *>(Event);
+      QPoint Pos = Mouse->position().toPoint();
+      Item = FMenu->actionAt(Pos);
+      int ArrowWidth = FMenu->fontMetrics().height() * 3 / 2;
+      if ((Mouse->button() != Qt::LeftButton) || (Item == nullptr) || (Pos.x() >= FMenu->actionGeometry(Item).right() - ArrowWidth))
+      {
+        Item = nullptr;
+      }
+    }
+    else if (Event->type() == QEvent::KeyPress)
+    {
+      int Key = static_cast<QKeyEvent *>(Event)->key();
+      if ((Key == Qt::Key_Return) || (Key == Qt::Key_Enter))
+      {
+        Item = FMenu->activeAction();
+      }
+    }
+    QAction * Default = FDefaults.value(Item, nullptr);
+    if ((Default != nullptr) && Default->isEnabled())
+    {
+      FPending = Default;
+      FMenu->close();
+      return true;
+    }
+    return false;
+  }
+
+private:
+  QMenu * FMenu;
+  QHash<QAction *, QAction *> FDefaults;
+  QAction * FPending = nullptr;
+};
+}
+
 QMenu * CommanderWindow::CreateEditPopupSubmenu(QMenu * Parent, bool Bold)
 {
   // CurrentEditFocusedAction with the editor list (EditorManager::EditorListMenu)
@@ -1984,6 +2054,17 @@ QMenu * CommanderWindow::CreateEditPopupSubmenu(QMenu * Parent, bool Bold)
 }
 
 void CommanderWindow::ShowFilePopup(FilePanel * Panel, const QPoint & GlobalPos, bool OnItem)
+{
+  // LocalFilePopup / RemoteFilePopup hold the *Focused actions: a right click or
+  // the Menu key on a file that is not marked is about that file, not the marks
+  {
+    QScopedValueRollback<bool> OnFocused(FOnFocused, OnItem);
+    ExecuteFilePopup(Panel, GlobalPos, OnItem);
+  }
+  UpdateActions();
+}
+
+void CommanderWindow::ExecuteFilePopup(FilePanel * Panel, const QPoint & GlobalPos, bool OnItem)
 {
   SessionTab * Tab = CurrentTab();
   if (!PanelReady(Panel))
@@ -2062,7 +2143,8 @@ void CommanderWindow::ShowFilePopup(FilePanel * Panel, const QPoint & GlobalPos,
     EditLink->setVisible(Panel->HasFocusedFile() && Panel->FocusedFile().IsSymLink);
   }
   AddProxy((*FA)("CurrentOpenAction"), FocusedDirectory || (DoubleClick == dcaOpen));
-  CreateEditPopupSubmenu(&Menu, !FocusedDirectory && (DoubleClick == dcaEdit));
+  auto * Combo = new DropdownComboFilter(&Menu);
+  Combo->Add(CreateEditPopupSubmenu(&Menu, !FocusedDirectory && (DoubleClick == dcaEdit)), FEditorManager->EditAction());
   if (Tab->LocalBrowser)
   {
     // LocalLocalCopyFocusedAction / LocalLocalMoveFocusedAction
@@ -2074,6 +2156,7 @@ void CommanderWindow::ShowFilePopup(FilePanel * Panel, const QPoint & GlobalPos,
     QString S = Remote ? QStringLiteral("Remote") : QStringLiteral("Local");
     QAction * Copy = FA->Get(S + QStringLiteral("CopyAction"));
     QMenu * CopyMenu = Menu.addMenu(Copy->icon(), Copy->text());
+    Combo->Add(CopyMenu, Copy);
     CopyMenu->setEnabled(Copy->isEnabled());
     CopyMenu->menuAction()->setStatusTip(Copy->statusTip());
     if (!FocusedDirectory && (DoubleClick == dcaCopy))
@@ -2109,6 +2192,10 @@ void CommanderWindow::ShowFilePopup(FilePanel * Panel, const QPoint & GlobalPos,
   AddProxy((*FA)("CurrentPropertiesAction"), false);
   // CurrentSystemMenuFocusedAction (the Windows shell context menu) has no Linux equivalent
   Menu.exec(GlobalPos);
+  if (Combo->Pending() != nullptr)
+  {
+    Combo->Pending()->trigger();
+  }
 }
 
 void CommanderWindow::ShowPanelPopup(FilePanel * Panel, const QPoint & GlobalPos)

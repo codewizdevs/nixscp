@@ -2,6 +2,10 @@
 #include "core/CloudCrypto.h"
 
 #include <QCryptographicHash>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QStringList>
+#include <QtEndian>
 
 #include <openssl/core_names.h>
 #include <openssl/evp.h>
@@ -17,6 +21,10 @@ namespace
 {
 
 const char Alphabet[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const QByteArray SnapshotMagic = QByteArrayLiteral("NXT2");
+const QByteArray SnapshotDomain = QByteArrayLiteral("NXT2-SNAPSHOT|");
+constexpr quint32 MaxSnapshotHeader = 4096;
+constexpr int NonceAndTag = 12 + 16;
 
 QString Base32(const QByteArray & Data)
 {
@@ -173,15 +181,112 @@ QByteArray PublicKey(const QByteArray & Private)
   return Result;
 }
 
-QByteArray WrapPrivateKey(const QByteArray & Dek, const QByteArray & Private)
+bool IsUsableBoxKey(const QByteArray & Public)
 {
-  return CloudCrypto::Seal(Dek, Private, QByteArray());
+  // X25519 fails on the low-order points whatever the private key is
+  static const KeyPair Probe = NewKeyPair();
+  return !X25519(Probe.Private, Public).isEmpty();
+}
+
+QByteArray WrapPrivateKey(const QByteArray & Dek, const QByteArray & Blob)
+{
+  return CloudCrypto::Seal(Dek, Blob, QByteArray());
 }
 
 QByteArray UnwrapPrivateKey(const QByteArray & Dek, const QByteArray & Wrapped)
 {
-  QByteArray Private;
-  return (CloudCrypto::Open(Dek, Wrapped, QByteArray(), Private) && (Private.size() == 32)) ? Private : QByteArray();
+  QByteArray Blob;
+  return (CloudCrypto::Open(Dek, Wrapped, QByteArray(), Blob) && (Blob.size() == 64)) ? Blob : QByteArray();
+}
+
+QByteArray KeyBlob(const KeyPair & Box, const SignKey & Identity)
+{
+  return Box.Private + Identity.Seed;
+}
+
+bool SplitKeyBlob(const QByteArray & Blob, KeyPair & Box, SignKey & Identity)
+{
+  if (Blob.size() != 64)
+  {
+    return false;
+  }
+  Box.Private = Blob.left(32);
+  Box.Public = PublicKey(Box.Private);
+  Identity = SignKeyFromSeed(Blob.mid(32));
+  return !Box.Public.isEmpty() && Identity.IsValid();
+}
+
+SignKey NewSignKey()
+{
+  return SignKeyFromSeed(CloudCrypto::RandomBytes(32));
+}
+
+SignKey SignKeyFromSeed(const QByteArray & Seed)
+{
+  SignKey Result;
+  if (Seed.size() != 32)
+  {
+    return Result;
+  }
+  PKey Key(EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nullptr, reinterpret_cast<const unsigned char *>(Seed.constData()),
+    static_cast<size_t>(Seed.size())), EVP_PKEY_free);
+  QByteArray Public(32, '\0');
+  size_t Length = 32;
+  if (!Key || (EVP_PKEY_get_raw_public_key(Key.get(), reinterpret_cast<unsigned char *>(Public.data()), &Length) != 1) || (Length != 32))
+  {
+    return Result;
+  }
+  Result.Public = Public;
+  Result.Seed = Seed;
+  return Result;
+}
+
+QByteArray Sign(const SignKey & Key, const QByteArray & Message)
+{
+  PKey Private(EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nullptr, reinterpret_cast<const unsigned char *>(Key.Seed.constData()),
+    static_cast<size_t>(Key.Seed.size())), EVP_PKEY_free);
+  std::unique_ptr<EVP_MD_CTX, void (*)(EVP_MD_CTX *)> Ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+  QByteArray Signature(SignatureLength, '\0');
+  size_t Length = SignatureLength;
+  if (!Private || !Ctx || (EVP_DigestSignInit(Ctx.get(), nullptr, nullptr, nullptr, Private.get()) != 1) ||
+      (EVP_DigestSign(Ctx.get(), reinterpret_cast<unsigned char *>(Signature.data()), &Length,
+        reinterpret_cast<const unsigned char *>(Message.constData()), static_cast<size_t>(Message.size())) != 1) ||
+      (Length != SignatureLength))
+  {
+    return QByteArray();
+  }
+  return Signature;
+}
+
+bool Verify(const QByteArray & Public, const QByteArray & Message, const QByteArray & Signature)
+{
+  if ((Public.size() != 32) || (Signature.size() != SignatureLength))
+  {
+    return false;
+  }
+  PKey Key(EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, reinterpret_cast<const unsigned char *>(Public.constData()),
+    static_cast<size_t>(Public.size())), EVP_PKEY_free);
+  std::unique_ptr<EVP_MD_CTX, void (*)(EVP_MD_CTX *)> Ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+  return Key && Ctx && (EVP_DigestVerifyInit(Ctx.get(), nullptr, nullptr, nullptr, Key.get()) == 1) &&
+    (EVP_DigestVerify(Ctx.get(), reinterpret_cast<const unsigned char *>(Signature.constData()), static_cast<size_t>(Signature.size()),
+      reinterpret_cast<const unsigned char *>(Message.constData()), static_cast<size_t>(Message.size())) == 1);
+}
+
+QString Fingerprint(const QByteArray & IdentityPublic)
+{
+  // 120 bits, as 24 digits in groups of four
+  QString Digits = Base32(QCryptographicHash::hash(IdentityPublic, QCryptographicHash::Sha256).left(15));
+  QStringList Groups;
+  for (qsizetype I = 0; I < Digits.size(); I += 4)
+  {
+    Groups.append(Digits.mid(I, 4));
+  }
+  return Groups.join(QLatin1Char('-'));
+}
+
+QByteArray BoxKeyMessage(const QString & UserUuid, const QByteArray & BoxPublic)
+{
+  return QByteArrayLiteral("NXT2-BOX-KEY|") + UserUuid.toLower().toUtf8() + '|' + BoxPublic;
 }
 
 QByteArray NewTeamKey()
@@ -253,19 +358,30 @@ bool ParseInviteCode(const QString & Text, Invite & Result)
   return !Result.Secret.isEmpty();
 }
 
-QByteArray WrapForInvite(const Invite & Code, const QByteArray & TeamKey, const QString & TeamUuid, qint64 KeyVersion)
+QByteArray WrapForInvite(const Invite & Code, const InviteContent & Content, const QString & TeamUuid, qint64 KeyVersion)
 {
-  QByteArray InfoBytes = Info("NXT1-INVITE|", TeamUuid, KeyVersion);
+  QByteArray InfoBytes = Info("NXT2-INVITE|", TeamUuid, KeyVersion);
   QByteArray Key = HkdfSha256(Code.Secret, Code.Id.toLatin1(), InfoBytes);
-  return CloudCrypto::Seal(Key, TeamKey, InfoBytes);
+  QJsonObject Plain{{QStringLiteral("key"), QString::fromLatin1(Content.TeamKey.toBase64())}, {QStringLiteral("name"), Content.TeamName},
+    {QStringLiteral("seq"), Content.RosterSeq}, {QStringLiteral("hash"), Content.RosterHash}};
+  return CloudCrypto::Seal(Key, QJsonDocument(Plain).toJson(QJsonDocument::Compact), InfoBytes);
 }
 
-QByteArray UnwrapForInvite(const Invite & Code, const QByteArray & Wrap, const QString & TeamUuid, qint64 KeyVersion)
+bool UnwrapForInvite(const Invite & Code, const QByteArray & Wrap, const QString & TeamUuid, qint64 KeyVersion, InviteContent & Content)
 {
-  QByteArray InfoBytes = Info("NXT1-INVITE|", TeamUuid, KeyVersion);
+  QByteArray InfoBytes = Info("NXT2-INVITE|", TeamUuid, KeyVersion);
   QByteArray Key = HkdfSha256(Code.Secret, Code.Id.toLatin1(), InfoBytes);
-  QByteArray TeamKey;
-  return (CloudCrypto::Open(Key, Wrap, InfoBytes, TeamKey) && (TeamKey.size() == KeyLength)) ? TeamKey : QByteArray();
+  QByteArray Plain;
+  if (!CloudCrypto::Open(Key, Wrap, InfoBytes, Plain))
+  {
+    return false;
+  }
+  QJsonObject Json = QJsonDocument::fromJson(Plain).object();
+  Content.TeamKey = QByteArray::fromBase64(Json.value(QStringLiteral("key")).toString().toLatin1());
+  Content.TeamName = Json.value(QStringLiteral("name")).toString();
+  Content.RosterSeq = Json.value(QStringLiteral("seq")).toInteger();
+  Content.RosterHash = Json.value(QStringLiteral("hash")).toString();
+  return (Content.TeamKey.size() == KeyLength) && (Content.RosterSeq > 0) && (Content.RosterHash.size() == 64);
 }
 
 QByteArray InviteVerifier(const Invite & Code)
@@ -276,6 +392,117 @@ QByteArray InviteVerifier(const Invite & Code)
 QString InviteVerifierHash(const Invite & Code)
 {
   return QString::fromLatin1(QCryptographicHash::hash(InviteVerifier(Code), QCryptographicHash::Sha256).toHex());
+}
+
+SignKey InviteSignKey(const Invite & Code)
+{
+  return SignKeyFromSeed(HkdfSha256(Code.Secret, Code.Id.toLatin1(), QByteArray("NXT2-INVITE-SIGN|") + Code.Id.toLatin1()));
+}
+
+//---------------------------------------------------------------------------
+// Team snapshots
+
+QByteArray EncodeSnapshot(const Snapshot & Header, const QByteArray & TeamKey, const SignKey & Author, const QByteArray & Plaintext)
+{
+  QJsonObject Json{
+    {QStringLiteral("fmt"), 2},
+    {QStringLiteral("team"), Header.Team},
+    {QStringLiteral("version"), Header.Version},
+    {QStringLiteral("key_version"), Header.KeyVersion},
+    {QStringLiteral("author"), Header.Author},
+    {QStringLiteral("roster_seq"), Header.RosterSeq},
+    {QStringLiteral("prev"), Header.Previous},
+    {QStringLiteral("saved_at"), Header.SavedAt.toUTC().toString(Qt::ISODateWithMs)},
+  };
+  QByteArray Text = QJsonDocument(Json).toJson(QJsonDocument::Compact);
+  QByteArray Prefix = SnapshotMagic;
+  char Length[4];
+  qToLittleEndian<quint32>(static_cast<quint32>(Text.size()), Length);
+  Prefix.append(Length, 4);
+  Prefix.append(Text);
+  QByteArray Signed = Prefix + CloudCrypto::Seal(TeamKey, CloudCrypto::Pack(Plaintext), Prefix);
+  return Signed + Sign(Author, SnapshotDomain + Signed);
+}
+
+// Splits a snapshot; Prefix = magic || length || header (the additional data)
+static bool SplitSnapshot(const QByteArray & Data, QByteArray & Prefix, QByteArray & Sealed)
+{
+  if ((Data.size() < 8) || !Data.startsWith(SnapshotMagic))
+  {
+    return false;
+  }
+  quint32 Length = qFromLittleEndian<quint32>(Data.constData() + 4);
+  if ((Length == 0) || (Length > MaxSnapshotHeader) ||
+      (Data.size() < 8 + static_cast<qsizetype>(Length) + NonceAndTag + SignatureLength))
+  {
+    return false;
+  }
+  Prefix = Data.left(8 + Length);
+  Sealed = Data.mid(8 + Length, Data.size() - 8 - Length - SignatureLength);
+  return true;
+}
+
+bool ReadSnapshot(const QByteArray & Data, Snapshot & Header, QString * Error)
+{
+  QByteArray Prefix, Sealed;
+  QJsonObject Json;
+  if (SplitSnapshot(Data, Prefix, Sealed))
+  {
+    Json = QJsonDocument::fromJson(Prefix.mid(8)).object();
+  }
+  if (Json.value(QStringLiteral("fmt")).toInt() != 2)
+  {
+    if (Error != nullptr)
+    {
+      *Error = QStringLiteral("This is not a team snapshot of this version of NixSCP.");
+    }
+    return false;
+  }
+  Header = Snapshot();
+  Header.Team = Json.value(QStringLiteral("team")).toString();
+  Header.Version = Json.value(QStringLiteral("version")).toInteger();
+  Header.KeyVersion = Json.value(QStringLiteral("key_version")).toInteger();
+  Header.Author = Json.value(QStringLiteral("author")).toString();
+  Header.RosterSeq = Json.value(QStringLiteral("roster_seq")).toInteger();
+  Header.Previous = Json.value(QStringLiteral("prev")).toString();
+  Header.SavedAt = QDateTime::fromString(Json.value(QStringLiteral("saved_at")).toString(), Qt::ISODateWithMs).toUTC();
+  return true;
+}
+
+bool VerifySnapshot(const QByteArray & Data, const QByteArray & AuthorPublic)
+{
+  if (Data.size() <= SignatureLength)
+  {
+    return false;
+  }
+  return Verify(AuthorPublic, SnapshotDomain + Data.left(Data.size() - SignatureLength), Data.right(SignatureLength));
+}
+
+bool DecodeSnapshot(const QByteArray & Data, const QByteArray & TeamKey, QByteArray & Plaintext, QString * Error)
+{
+  auto Fail = [Error](const QString & Message)
+  {
+    if (Error != nullptr)
+    {
+      *Error = Message;
+    }
+    return false;
+  };
+  QByteArray Prefix, Sealed, Packed;
+  if (!SplitSnapshot(Data, Prefix, Sealed))
+  {
+    return Fail(QStringLiteral("The team snapshot is damaged."));
+  }
+  if (!CloudCrypto::Open(TeamKey, Sealed, Prefix, Packed))
+  {
+    return Fail(QStringLiteral("The team snapshot cannot be decrypted with the team key."));
+  }
+  if (!CloudCrypto::Unpack(Packed, Plaintext))
+  {
+    Plaintext.clear();
+    return Fail(QStringLiteral("The team snapshot is damaged or too large."));
+  }
+  return true;
 }
 
 }

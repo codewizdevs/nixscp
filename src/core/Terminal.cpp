@@ -7,6 +7,7 @@
 #include "core/Terminal.h"
 #include "core/Platform.h"
 #include "core/ActionsLog.h"
+#include "core/LocalFileSystem.h"
 #include "core/SessionLog.h"
 #include "core/Configuration.h"
 #include "core/DirectoryCache.h"
@@ -287,6 +288,7 @@ bool Terminal::ProtocolCapability(TFSProtocol Protocol, FSCapability Capability)
         case fcModeChangingUpload:
         case fcTextMode:
         case fcResumeOverwrite:
+        case fcAppendUpload:
           return true;
         default:
           // incl. fcMoveOverExistingFile: SFTP 3 rename fails on an existing target
@@ -943,10 +945,64 @@ bool Terminal::TryReopen(const FatalException & E, OperationState & State, QElap
 //---------------------------------------------------------------------------
 // Session
 
+QString Terminal::InitialDirectory(const QString & Directory, bool Reopening)
+{
+  QString Dir = Directory.isEmpty() ? FFileSystem->HomeDirectory() : Directory;
+  try
+  {
+    Dir = FFileSystem->CanonicalizePath(Dir);
+    if (!Directory.isEmpty())
+    {
+      FFileSystem->CheckDirectory(Dir);
+    }
+    return Dir;
+  }
+  catch (const FatalException &)
+  {
+    throw;
+  }
+  catch (const AbortException &)
+  {
+    throw;
+  }
+  catch (const ExtException & E)
+  {
+    // TTerminal::DoStartup. A reconnect is not about the directory: the one the
+    // session was in may be gone by now, and that must not cost the session
+    if (!Reopening && !Directory.isEmpty() && (FData.RequireDirectories || !FData.UpdateDirectories))
+    {
+      QString More = E.Message();
+      if (!E.MoreMessages().isEmpty())
+      {
+        More += QLatin1Char('\n') + E.MoreMessages();
+      }
+      // CHANGE_DIR_ERROR
+      throw ExtException(QStringLiteral("Error changing directory to '%1'.").arg(Directory), More);
+    }
+    SessionLog::LogEvent(Reopening ?
+      QStringLiteral("Directory '%1' cannot be opened after reconnecting, staying in the home directory.").arg(Directory) :
+      QStringLiteral("Configured initial remote directory cannot be opened, staying in the home directory."));
+    return FFileSystem->HomeDirectory();
+  }
+}
+
 void Terminal::Open(Callback Done)
 {
   auto Info = std::make_shared<QStringList>();
   bool Created = false;
+  if (FData.Tunnel && !FData.IsSsh())
+  {
+    // Only SSH sessions tunnel (Connection > Tunnel); connecting directly
+    // instead, past the tunnel the site asks for, is not an option
+    QMetaObject::invokeMethod(this, [Done]()
+    {
+      OperationResult Result;
+      Result.Ok = false;
+      Result.Message = QStringLiteral("Connecting through an SSH tunnel is supported for the SFTP and SCP protocols only.");
+      Done(Result);
+    }, Qt::QueuedConnection);
+    return;
+  }
   QMetaObject::invokeMethod(FWorker, [this, &Created]()
   {
     FFileSystem = CreateFileSystem(FData, FUI);
@@ -968,19 +1024,16 @@ void Terminal::Open(Callback Done)
   Run([this, Info]()
   {
     DoOpen(*FFileSystem);
-    QString Dir = FData.RemoteDirectory.isEmpty() ? FFileSystem->HomeDirectory() : FData.RemoteDirectory;
+    QString Dir;
     try
     {
-      Dir = FFileSystem->CanonicalizePath(Dir);
+      Dir = InitialDirectory(FData.RemoteDirectory);
     }
-    catch (const FatalException &)
+    catch (...)
     {
+      // the session did not open: the connection must not stay behind
+      FFileSystem->Close();
       throw;
-    }
-    catch (const ExtException &)
-    {
-      // Initial directory from site settings does not exist; fall back to home
-      Dir = FFileSystem->HomeDirectory();
     }
     UpdateCapabilities();
     *Info << Dir << FFileSystem->ProtocolName() << FFileSystem->ServerInfo();
@@ -1010,23 +1063,7 @@ void Terminal::Reopen(Callback Done)
       QMutexLocker Lock(&FMutex);
       Dir = FReopenDirectory;
     }
-    if (Dir.isEmpty())
-    {
-      Dir = FData.RemoteDirectory.isEmpty() ? FFileSystem->HomeDirectory() : FData.RemoteDirectory;
-    }
-    try
-    {
-      Dir = FFileSystem->CanonicalizePath(Dir);
-    }
-    catch (const FatalException &)
-    {
-      throw;
-    }
-    catch (const ExtException &)
-    {
-      // the last directory does not exist anymore
-      Dir = FFileSystem->HomeDirectory();
-    }
+    Dir = InitialDirectory(Dir.isEmpty() ? FData.RemoteDirectory : Dir, true);
     FCanAnyCommand = (dynamic_cast<AnyCommandFileSystem *>(FFileSystem.get()) != nullptr);
     *Info << Dir << FFileSystem->ProtocolName() << FFileSystem->ServerInfo();
   },
@@ -1173,11 +1210,17 @@ Terminal::BatchOverwrite Terminal::EffectiveBatchOverwrite(const CopyParam & Par
 }
 
 bool Terminal::ConfirmOverwrite(const QString & SourceFullFileName, const QString & TargetFileName, bool ToRemote,
-  qint64 SourceSize, const QDateTime & SourceTime, qint64 DestSize, const QDateTime & DestTime,
+  qint64 SourceSize, const QDateTime & SourceTime, qint64 DestSize, const QDateTime & DestTime, TModificationFmt Precision,
   bool AsciiTransfer, CopyParam & Param, OperationState & State, OverwriteMode & Mode, QString & NewName)
 {
   Mode = omOverwrite;
   NewName.clear();
+  if (Param.Append)
+  {
+    // cpAppend (put -append, get -append): no question
+    Mode = omAppend;
+    return true;
+  }
   TFSProtocol Protocol = FData.FSProtocol;
   bool Sftp = (Protocol == fsSFTP) || (Protocol == fsSFTPonly);
   bool Ftp = (Protocol == fsFTP);
@@ -1271,9 +1314,10 @@ bool Terminal::ConfirmOverwrite(const QString & SourceFullFileName, const QStrin
       Answer = qaNo;
       break;
     case boOlder:
-      // compared with the precision of the less precise side (seconds)
-      Answer = (SourceTime.isValid() && DestTime.isValid() && (SourceTime.toSecsSinceEpoch() > DestTime.toSecsSinceEpoch())) ?
-        qaYes : qaNo;
+      // with the precision of the less precise side: the seconds of an FTP
+      // LIST are made up, so a local file would always look newer
+      Answer = (SourceTime.isValid() && DestTime.isValid() && (Precision != mfNone) &&
+        IsNewerModification(SourceTime, Precision, DestTime, Precision)) ? qaYes : qaNo;
       break;
     case boAlternateResume:
       Answer = qaSkip;
@@ -1377,7 +1421,8 @@ bool Terminal::ConfirmResume(const QString & FileName, bool PartialBiggerThanSou
   // TSFTPFileSystem::SFTPConfirmResume
   if (PartialBiggerThanSource)
   {
-    if (Attempt.Retrying)
+    // cpNoConfirmation: restarted without asking (TSFTPFileSystem::Source, Sink)
+    if (Attempt.Retrying || !Param.ConfirmOverwriting)
     {
       return false;
     }
@@ -1471,7 +1516,7 @@ void Terminal::ScanRemote(const QString & Path, const RemoteFile & File, const Q
     return;
   }
   qsizetype Index = Items.size();
-  Items.append(TransferItem{Path, Target, File.IsDirectory, File.IsDirectory ? 0 : File.Size, File.Modification, File.Permissions});
+  Items.append(TransferItem{Path, Target, File.IsDirectory, File.IsDirectory ? 0 : File.Size, File.Modification, File.Permissions, File.ModificationFmt});
   if (File.IsDirectory)
   {
     // shown as "Calculating directory size" by the progress dialog
@@ -1629,7 +1674,7 @@ bool Terminal::DownloadFile(const TransferItem & Item, CopyParam & Param, Operat
     QString DestFileName = QFileInfo(DestFullName).fileName();
     // .filepart only with protocols that can resume (TSFTPFileSystem::Sink;
     // IsCapable(fcResumeSupport) is off for SCP and S3)
-    ResumeAllowed = !AsciiTransfer && WorkerCapable(fcResumeSupport) && Param.AllowResume(Item.Size, DestFileName);
+    ResumeAllowed = !AsciiTransfer && WorkerCapable(fcResumeSupport) && Param.AllowResume(Item.Size, DestFileName) && !Param.Append;
     LocalFileName = DestFullName;
     Params = TransferParams();
     Params.KeepPartial = ResumeAllowed;
@@ -1670,7 +1715,7 @@ bool Terminal::DownloadFile(const TransferItem & Item, CopyParam & Param, Operat
       {
         QString NewName;
         if (!ConfirmOverwrite(Item.Source, DestFileName, false, Item.Size, Item.Modification, ExistingSize, Existing.lastModified(),
-              AsciiTransfer, Param, State, OMode, NewName))
+              Item.ModificationFmt, AsciiTransfer, Param, State, OMode, NewName))
         {
           return false;
         }
@@ -1725,6 +1770,12 @@ bool Terminal::DownloadFile(const TransferItem & Item, CopyParam & Param, Operat
     // rename() replaces an existing target atomically
     CheckRename(LocalFileName, DestFullName);
   }
+  LocalFs::Stat St;
+  if (Param.PreserveReadOnly && (Item.Mode != 0) && LocalFs::StatFollow(DestFullName, St))
+  {
+    // TCopyParamType::LocalFileAttrs: a remote file with no owner write permission
+    LocalFs::SetMode(DestFullName, PreserveReadOnlyMode(St.Mode, Item.Mode, true));
+  }
   return true;
 }
 
@@ -1747,7 +1798,7 @@ bool Terminal::UploadFile(const TransferItem & Item, CopyParam & Param, Operatio
     // .filepart + rename only with protocols that can resume (TSFTPFileSystem::Source;
     // IsCapable(fcResumeSupport) is off for SCP and S3)
     ResumeAllowed = !AsciiTransfer && WorkerCapable(fcResumeSupport) && Param.AllowResume(Item.Size, DestFileName) &&
-      WorkerCapable(fcRename);
+      WorkerCapable(fcRename) && !Param.Append;
     Existing = RemoteFile();
     DestFileExists = FFileSystem->FileExists(DestFullName, &Existing);
     if (ResumeAllowed && DestFileExists)
@@ -1796,7 +1847,7 @@ bool Terminal::UploadFile(const TransferItem & Item, CopyParam & Param, Operatio
       {
         QString NewName;
         if (!ConfirmOverwrite(Item.Source, DestFileName, true, Item.Size, Item.Modification, Existing.Size, Existing.Modification,
-              AsciiTransfer, Param, State, OMode, NewName))
+              Existing.ModificationFmt, AsciiTransfer, Param, State, OMode, NewName))
         {
           return false;
         }
@@ -1841,12 +1892,97 @@ bool Terminal::UploadFile(const TransferItem & Item, CopyParam & Param, Operatio
     RecycleFile(DestFullName, State);
     Recycled = true;
   }
-  unsigned int Mode = Param.PreserveRights ? Param.RemoteFileRights(false) : (DestFileExists ? Existing.Permissions : 0644);
+  // The rights of a new file are the server's unless they are set (as WinSCP);
+  // a file that replaces another (.filepart) starts with the rights of that one
+  int Mode = ServerDefaultMode;
+  if (Param.PreserveRights)
+  {
+    Mode = static_cast<int>(Param.RemoteFileRights(false));
+  }
+  else if (DestFileExists && (Existing.Permissions != 0))
+  {
+    Mode = static_cast<int>(Existing.Permissions);
+  }
   if (Params.ResumeOffset > 0)
   {
     FProgress.AddResumed(Params.ResumeOffset);
   }
-  FFileSystem->Upload(Item.Source, RemoteFileName, static_cast<int>(Mode), Params, FProgress);
+  bool DeletedForOverwrite = false;
+  for (;;)
+  {
+    try
+    {
+      FFileSystem->Upload(Item.Source, RemoteFileName, Mode, Params, FProgress);
+      break;
+    }
+    catch (const CannotCreateFileException & E)
+    {
+      // TSFTPFileSystem::SFTPOpenRemote
+      if (ResumeAllowed && (Params.ResumeOffset == 0) && (Param.ResumeSupport == CopyParam::rsSmart))
+      {
+        // The target may be writable in a folder where no new file can be created.
+        // Writing to it takes the protection of .filepart away: whatever goes wrong
+        // from there, the old contents are gone. WinSCP goes on, and even deletes
+        // what is left; here that is for the user to decide, unless the recycle bin
+        // keeps the old file. Skip is the answer when nobody can be asked.
+        if (DestFileExists && !RecycleOverwritten)
+        {
+          QueryUserParams QueryParams;
+          QueryParams.Params = qpAllowContinueOnError;
+          QueryParams.Type = qtWarning;
+          QueryParams.Aliases.append(QueryButtonAlias{qaYes, QStringLiteral("&Overwrite")});
+          unsigned int Answer = QueryUser(QStringLiteral("Cannot create temporary file '%1' for the upload.\n \n"
+            "Press 'Overwrite' to write directly to the existing file '%2'. If the upload then fails, the file stays incomplete and its old contents are lost.")
+              .arg(UnixPath::ExtractFileName(RemoteFileName), DestFileName),
+            E.MoreMessages(), qaYes | qaSkip | qaAbort, QueryParams, &State);
+          if (Answer == qaSkip)
+          {
+            throw SkipFileException();
+          }
+          if (Answer != qaYes)
+          {
+            FProgress.Cancel();
+            throw AbortException();
+          }
+        }
+        SessionLog::LogEvent(QStringLiteral("Cannot create new partial file \"%1\", trying to create target file \"%2\"").arg(RemoteFileName, DestFullName));
+        ResumeAllowed = false;
+        RemoteFileName = DestFullName;
+        // A failed upload deletes only a file of its own
+        Params.KeepPartial = DestFileExists && !RecycleOverwritten;
+        if (RecycleOverwritten)
+        {
+          RecycleFile(DestFullName, State);
+          Recycled = true;
+        }
+      }
+      else if (Sftp && DestFileExists && !Recycled && !DeletedForOverwrite && (OMode == omOverwrite) && (RemoteFileName == DestFullName))
+      {
+        // SFTP_OVERWRITE_FILE_ERROR2, SFTP_OVERWRITE_DELETE_BUTTON
+        QueryUserParams QueryParams;
+        QueryParams.Params = qpAllowContinueOnError;
+        QueryParams.Type = qtError;
+        QueryParams.Aliases.append(QueryButtonAlias{qaRetry, QStringLiteral("&Delete")});
+        unsigned int Answer = QueryUser(QStringLiteral("Cannot overwrite remote file '%1'.\n \nPress 'Delete' to delete the file and create new one instead of overwriting it.").arg(RemoteFileName),
+          E.MoreMessages(), qaRetry | qaSkip | qaAbort, QueryParams, &State);
+        if (Answer == qaSkip)
+        {
+          throw SkipFileException();
+        }
+        if (Answer != qaRetry)
+        {
+          FProgress.Cancel();
+          throw AbortException();
+        }
+        FFileSystem->DeleteFile(RemoteFileName);
+        DeletedForOverwrite = true;
+      }
+      else
+      {
+        throw;
+      }
+    }
+  }
 
   if (ResumeAllowed)
   {
@@ -1910,9 +2046,18 @@ bool Terminal::UploadFile(const TransferItem & Item, CopyParam & Param, Operatio
     {
       SetMode = static_cast<int>(Existing.Permissions);
     }
+    // TSFTPFileSystem::SFTPSource: TTouchSessionAction, TChmodSessionAction
+    SessionAction TouchAction(laTouch, Param.PreserveTime ? ActionsLog::Current() : nullptr);
+    TouchAction.FileName(DestFullName);
+    TouchAction.Modification(Item.Modification);
+    SessionAction ChmodAction(laChmod, Param.PreserveRights ? ActionsLog::Current() : nullptr);
+    ChmodAction.FileName(DestFullName);
+    ChmodAction.Rights(Param.RemoteFileRights(false));
     try
     {
       SftpFs->SetFileProperties(DestFullName, SetMode, Param.PreserveTime ? Item.Modification : QDateTime());
+      TouchAction.Commit();
+      ChmodAction.Commit();
     }
     catch (const FatalException &)
     {
@@ -1933,7 +2078,10 @@ bool Terminal::UploadFile(const TransferItem & Item, CopyParam & Param, Operatio
   {
     if (Param.PreserveRights)
     {
+      SessionAction ChmodAction(laChmod, DestFullName);
+      ChmodAction.Rights(Param.RemoteFileRights(false));
       FFileSystem->ChangeMode(DestFullName, Param.RemoteFileRights(false));
+      ChmodAction.Commit();
     }
     else if (PreserveExistingRights && (Existing.Permissions != 0))
     {
@@ -1953,7 +2101,10 @@ bool Terminal::UploadFile(const TransferItem & Item, CopyParam & Param, Operatio
     }
     if (Param.PreserveTime)
     {
+      SessionAction TouchAction(laTouch, DestFullName);
+      TouchAction.Modification(Item.Modification);
       FFileSystem->SetModificationTime(DestFullName, Item.Modification);
+      TouchAction.Commit();
     }
   }
   catch (const FatalException &)
@@ -2077,7 +2228,7 @@ void Terminal::ScpPrepareUpload(const QList<TransferItem> & Items, CopyParam & P
     bool AsciiTransfer = Param.UseAsciiTransfer(Item.Source, true, MaskParams(Item.Size, Item.Modification));
     OverwriteMode OMode = omOverwrite;
     QString NewName;
-    if (!ConfirmOverwrite(Item.Source, Name, true, Item.Size, Item.Modification, Existing.Size, Existing.Modification,
+    if (!ConfirmOverwrite(Item.Source, Name, true, Item.Size, Item.Modification, Existing.Size, Existing.Modification, Existing.ModificationFmt,
           AsciiTransfer, Param, State, OMode, NewName))
     {
       FProgress.AddTransferred(Item.Size);
@@ -2129,7 +2280,7 @@ void Terminal::ScpPrepareDownload(const QList<TransferItem> & Items, CopyParam &
     OverwriteMode OMode = omOverwrite;
     QString NewName;
     if (!ConfirmOverwrite(Item.Source, Existing.fileName(), false, Item.Size, Item.Modification, Existing.size(),
-          Existing.lastModified(), AsciiTransfer, Param, State, OMode, NewName))
+          Existing.lastModified(), Item.ModificationFmt, AsciiTransfer, Param, State, OMode, NewName))
     {
       FProgress.AddTransferred(Item.Size);
       State.AnySkipped = true;
@@ -2271,6 +2422,20 @@ void Terminal::ScpBatchTransfer(bool ToRemote, const QStringList & Sources, cons
     }
     States[Index] = tsDone;
     SessionAction(ToRemote ? laUpload : laDownload, Items[Index].Source, Items[Index].Target).Commit(true, Items[Index].Size);
+    // TSCPFileSystem::SCPSource: SCP cannot tell which part failed, so touch
+    // and chmod are logged only after a successful upload
+    if (ToRemote && Param.PreserveTime)
+    {
+      SessionAction TouchAction(laTouch, Items[Index].Target);
+      TouchAction.Modification(Items[Index].Modification);
+      TouchAction.Commit();
+    }
+    if (ToRemote && Param.PreserveRights)
+    {
+      SessionAction ChmodAction(laChmod, Items[Index].Target);
+      ChmodAction.Rights(Param.RemoteFileRights(false));
+      ChmodAction.Commit();
+    }
     if (Index == Current)
     {
       Current = -1;
@@ -2432,6 +2597,7 @@ void Terminal::CopyToLocal(const QStringList & RemotePaths, const QString & Targ
   RunOperation([this, RemotePaths, TargetDir, Param, Move](OperationState & State)
   {
     CopyParam AParam = Param;
+    AParam.TrimVMSVersions = FData.TrimVMSVersions;
     if (!TargetDir.isEmpty() && !QFileInfo(TargetDir).isDir())
     {
       // CREATE_LOCAL_DIRECTORY (forms/Copy.cpp)
@@ -2457,7 +2623,17 @@ void Terminal::CopyToLocal(const QStringList & RemotePaths, const QString & Targ
     {
       RemoteFile File;
       FileAttempt Attempt;
-      if (ProcessFile(State, Attempt, [&](FileAttempt &) { File = FFileSystem->ReadFile(Path); return true; }))
+      if (ProcessFile(State, Attempt, [&](FileAttempt &)
+          {
+            // The target is named after the last component: "x/.." from a hostile
+            // listing, selected by the user, would leave the target directory
+            if (!UnixPath::HasValidFileName(Path))
+            {
+              throw ExtException(QStringLiteral("Invalid file name '%1'.").arg(Path));
+            }
+            File = FFileSystem->ReadFile(Path);
+            return true;
+          }))
       {
         ScanRemote(Path, File, QDir(TargetDir).filePath(CopyParam::ValidLocalFileName(AParam.ChangeFileName(UnixPath::ExtractFileName(Path), true))), Items, AParam, State);
       }
@@ -2592,6 +2768,7 @@ void Terminal::CopyToRemote(const QStringList & LocalPaths, const QString & Targ
   RunOperation([this, LocalPaths, TargetDir, Param, Move](OperationState & State)
   {
     CopyParam AParam = Param;
+    AParam.TrimVMSVersions = FData.TrimVMSVersions;
     QList<TransferItem> Items;
     QSet<QString> Visited;
     for (const QString & Path : LocalPaths)
@@ -2655,9 +2832,9 @@ void Terminal::CopyToRemote(const QStringList & LocalPaths, const QString & Targ
           RemoteFile Existing;
           if (!FFileSystem->FileExists(Item.Target, &Existing))
           {
-            unsigned int Mode = AParam.PreserveRights ? AParam.RemoteFileRights(true) : 0755;
+            int Mode = AParam.PreserveRights ? static_cast<int>(AParam.RemoteFileRights(true)) : ServerDefaultMode;
             SessionAction Action(laMkdir, Item.Target);
-            FFileSystem->CreateDirectory(Item.Target, static_cast<int>(Mode));
+            FFileSystem->CreateDirectory(Item.Target, Mode);
             Action.Commit();
           }
           return true;
@@ -3078,13 +3255,13 @@ void Terminal::RunOnWorker(WorkerJob Job, Callback Done)
   Run([this, Job = std::move(Job)]() { Job(*FFileSystem, FProgress, *FUI); }, std::move(Done));
 }
 
-void Terminal::AnyCommand(const QString & Command, CommandOutputCallback Output, CommandCallback Done)
+void Terminal::AnyCommand(const QString & Command, CommandOutputCallback Output, CommandCallback Done, bool RecordAction)
 {
   auto ExitCode = std::make_shared<int>(-1);
   auto Directory = std::make_shared<QString>();
   QString StartDirectory = FCurrentDirectory;
   FProgress.Start(FileOperationProgress::Calculate, FileOperationProgress::ToRemote, 1);
-  Run([this, Command, Output, ExitCode, Directory, StartDirectory]()
+  Run([this, Command, Output, ExitCode, Directory, StartDirectory, RecordAction]()
   {
     AnyCommandFileSystem * Fs = dynamic_cast<AnyCommandFileSystem *>(FFileSystem.get());
     if (Fs == nullptr)
@@ -3107,7 +3284,7 @@ void Terminal::AnyCommand(const QString & Command, CommandOutputCallback Output,
       }, Qt::QueuedConnection);
     };
     SessionLog::LogEvent(QStringLiteral("Executing user defined command."));
-    SessionAction Action(laCall);
+    SessionAction Action(laCall, RecordAction ? ActionsLog::Current() : nullptr);
     Action.Command(Command);
     Action.Destination(StartDirectory);
     AnyCommandFileSystem::OutputEvent LoggedEvent = [&Action, Event](const QString & Line, bool StdError) { Action.AddOutput(Line, StdError); Event(Line, StdError); };
@@ -3206,7 +3383,7 @@ void Terminal::CreateDirectory(const QString & Path, const RemoteProperties & Pr
     FProgress.ResetCancel();
     // the mode of SSH_FXP_MKDIR is subject to the server's umask; the
     // properties are applied afterwards anyway
-    int Mode = Properties.ValidRights ? static_cast<int>(Properties.CombineRights(0755, true)) : 0755;
+    int Mode = Properties.ValidRights ? static_cast<int>(Properties.CombineRights(0755, true)) : ServerDefaultMode;
     // CREATE_DIR_ERROR
     SessionLog::LogEvent(QStringLiteral("Creating directory \"%1\".").arg(Path));
     SessionAction Action(laMkdir, Path);
@@ -3330,6 +3507,21 @@ QString Terminal::ShellChecksumCommand(const QString & Alg)
     if (QString(Name).remove(QLatin1Char('-')).compare(Normalized, Qt::CaseInsensitive) == 0)
     {
       return QString::fromLatin1(Def[1]);
+    }
+  }
+  return QString();
+}
+
+QString Terminal::ShellChecksumFallback(const QString & Command)
+{
+  static const char * const Fallbacks[][2] = {
+    {"sha512sum", "shasum -a 512"}, {"sha384sum", "shasum -a 384"}, {"sha256sum", "shasum -a 256"},
+    {"sha224sum", "shasum -a 224"}, {"sha1sum", "shasum -a 1"}, {"md5sum", "md5 -r"}};
+  for (const auto & Fallback : Fallbacks)
+  {
+    if (Command == QLatin1String(Fallback[0]))
+    {
+      return QString::fromLatin1(Fallback[1]);
     }
   }
   return QString();
@@ -3513,17 +3705,28 @@ void Terminal::CalculateFilesChecksum(const QString & Alg, const QStringList & P
       }
     }
 
-    auto Run = [&](const QString & CommandLine, QStringList & Output) -> bool
+    QString Fallback = ShellChecksumFallback(Command);
+    auto Run = [&](const QString & Arguments, QStringList & Output) -> bool
     {
-      Output.clear();
-      AnyCommandFileSystem::OutputEvent Event = [&Output](const QString & Line, bool StdError)
+      while (true)
       {
-        if (!StdError)
+        Output.clear();
+        AnyCommandFileSystem::OutputEvent Event = [&Output](const QString & Line, bool StdError)
         {
-          Output.append(Line);
+          if (!StdError)
+          {
+            Output.append(Line);
+          }
+        };
+        int ExitCode = Shell->AnyCommand(Command + Arguments, QString(), Event, FProgress, nullptr);
+        // 126/127: the command does not exist or cannot be executed
+        if (((ExitCode != 126) && (ExitCode != 127)) || Fallback.isEmpty())
+        {
+          return (ExitCode == 0);
         }
-      };
-      return (Shell->AnyCommand(CommandLine, QString(), Event, FProgress, nullptr) == 0);
+        Command = Fallback;
+        Fallback.clear();
+      }
     };
 
     qsizetype Index = 0;
@@ -3531,17 +3734,17 @@ void Terminal::CalculateFilesChecksum(const QString & Alg, const QStringList & P
     {
       CheckOperationCancel(FProgress);
       // Batches of up to 2048 characters / 1 GB
-      QString CommandLine = Command;
+      QString Arguments;
       qint64 BatchSize = 0;
       qsizetype First = Index;
       while (Index < Items.size())
       {
         QString Arg = QLatin1Char(' ') + ShellQuoteStr(Items[Index].Path);
-        if ((Index > First) && (((CommandLine.size() + Arg.size()) > 2048) || ((BatchSize + Items[Index].Size) > 1024LL * 1024 * 1024)))
+        if ((Index > First) && (((Command.size() + Arguments.size() + Arg.size()) > 2048) || ((BatchSize + Items[Index].Size) > 1024LL * 1024 * 1024)))
         {
           break;
         }
-        CommandLine += Arg;
+        Arguments += Arg;
         BatchSize += Items[Index].Size;
         Index++;
       }
@@ -3551,7 +3754,7 @@ void Terminal::CalculateFilesChecksum(const QString & Alg, const QStringList & P
       bool BatchOk = false;
       try
       {
-        BatchOk = Run(CommandLine, Output);
+        BatchOk = Run(Arguments, Output);
       }
       catch (const AbortException &)
       {
@@ -3589,13 +3792,13 @@ void Terminal::CalculateFilesChecksum(const QString & Alg, const QStringList & P
           if (!RetryLoop(State, QStringLiteral("Error calculating checksum for file '%1'.").arg(It.Path), [&]()
               {
                 QStringList Single;
-                QString SingleCommand = Command + QLatin1Char(' ') + ShellQuoteStr(It.Path);
-                bool Ok = Run(SingleCommand, Single);
+                QString SingleArgument = QLatin1Char(' ') + ShellQuoteStr(It.Path);
+                bool Ok = Run(SingleArgument, Single);
                 QHash<QString, QString> Parsed = ParseChecksumOutput(Single);
                 if (!Ok || !Parsed.contains(It.Path))
                 {
                   // INVALID_OUTPUT_ERROR
-                  throw ExtException(QStringLiteral("Unexpected output of command '%1'.").arg(SingleCommand),
+                  throw ExtException(QStringLiteral("Unexpected output of command '%1'.").arg(Command + SingleArgument),
                     Single.join(QLatin1Char('\n')));
                 }
                 Checksum = Parsed.value(It.Path);

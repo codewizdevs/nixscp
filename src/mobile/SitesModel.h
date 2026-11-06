@@ -2,12 +2,11 @@
 // flat list of section headers and sites. Without a search: Favourites,
 // Recent, then each folder (collapsible); with a search: the matching sites
 // of every folder. Favourites, recent sites and collapsed folders are this
-// phone's own (mobile.ini next to the configuration).
+// phone's own (PrivateState, read after the unlock).
 #pragma once
 
 #include <QAbstractListModel>
 #include <QSet>
-#include <QSettings>
 #include <QVariantMap>
 
 class MobileSettings;
@@ -26,6 +25,8 @@ public:
     IsHeaderRole, SectionRole, CollapsedRole, SiteCountRole, FavouriteRole };
 
   explicit SitesModel(MobileSettings * Settings, QObject * Parent = nullptr);
+  // the phone's own lists, once they can be read
+  void LoadState();
   // Key files of this phone kept in sites by earlier versions become the
   // phone's own choice (the site's key file is synced to other devices)
   void MigrateKeys();
@@ -61,14 +62,23 @@ public:
   Q_INVOKABLE void toggleSection(const QString & Section);
   // a site was connected: first of the recent ones
   Q_INVOKABLE void addRecent(const QString & Name);
+  // a site got another name outside this list (core/TeamSync): its favourite,
+  // recent and key entries follow
+  void SiteMoved(const QString & From, const QString & To);
 
 signals:
   void countChanged();
   void rowsChanged();
   void filterChanged();
+  // something could not be saved
+  void failed(const QString & message);
 
 private:
-  struct Site { QString Name; QString Title; QString Folder; QString Host; QString User; QString Protocol; };
+  struct Site
+  {
+    QString Name; QString Title; QString Folder; QString Host; QString User; QString Protocol;
+    bool operator==(const Site &) const = default;
+  };
   struct Row
   {
     bool Header = false;
@@ -84,8 +94,8 @@ private:
   QStringList FFavourites;
   QStringList FRecent;
   QSet<QString> FCollapsed;
-  QSettings FSettings;
   MobileSettings * FMobile;
+  bool FReloaded = false;
 
   void Rebuild();
   void SaveState();

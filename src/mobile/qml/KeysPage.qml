@@ -98,10 +98,8 @@ Page {
         standardButtons: Dialog.Cancel | Dialog.Ok
         onOpened: { keyName.text = ""; passphrase.text = ""; keyType.currentIndex = 0; keyName.forceActiveFocus() }
         onAccepted: {
-            var name = keys.generate(keyName.text, keyType.currentIndex === 0 ? "ed25519" : "rsa", passphrase.text)
+            keys.generate(keyName.text, keyType.currentIndex === 0 ? "ed25519" : "rsa", passphrase.text)
             passphrase.text = ""
-            if (name) { keyDialog.show(name); page.added(keys.path(name)) }
-            else app.toast(keys.lastError())
         }
         ColumnLayout {
             width: generateDialog.availableWidth
@@ -111,6 +109,28 @@ Page {
             ComboBox { id: keyType; Layout.fillWidth: true; model: ["Ed25519", "RSA 4096"] }
             Label { text: qsTr("Passphrase (optional)"); opacity: 0.7 }
             TextField { id: passphrase; Layout.fillWidth: true; echoMode: TextInput.Password; inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText }
+        }
+    }
+
+    Connections {
+        target: keys
+        function onGenerated(name, error) {
+            if (name) { keyDialog.show(name); page.added(keys.path(name)) }
+            else app.toast(error)
+        }
+    }
+
+    // generating takes a while (RSA 4096)
+    Rectangle {
+        anchors.fill: parent
+        color: "#66000000"
+        visible: keys.generating
+        MouseArea { anchors.fill: parent }
+        RowLayout {
+            anchors.centerIn: parent
+            spacing: 12
+            BusyIndicator { running: keys.generating; Layout.preferredWidth: 40; Layout.preferredHeight: 40 }
+            Label { text: qsTr("Generating the key…"); color: "white" }
         }
     }
 

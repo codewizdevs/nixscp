@@ -13,17 +13,26 @@
 
 #include <QApplication>
 #include <QDateTime>
+#include <QDialog>
+#include <QDir>
+#include <QFontDatabase>
+#include <QHBoxLayout>
 #include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLabel>
 #include <QLocalServer>
 #include <QLocalSocket>
-#include <QMessageBox>
+#include <QLockFile>
 #include <QMutex>
+#include <QPlainTextEdit>
 #include <QPointer>
 #include <QPushButton>
+#include <QScreen>
 #include <QThread>
+#include <QTimer>
+#include <QVBoxLayout>
 #include <QWaitCondition>
 
 #include <libssh/libssh.h>
@@ -33,16 +42,12 @@
 #include <fcntl.h>
 #include <memory>
 
-#ifndef Q_OS_WIN
-#include <sys/socket.h>
-#include <unistd.h>
-#endif
-
 using namespace AgentAccess;
 
 namespace
 {
 
+// Requests running at the same time, tunnels included
 constexpr int MaxJobs = 8;
 // Output waiting for the client before the worker stops reading from the server
 constexpr qint64 MaxPendingOutput = 8 * 1024 * 1024;
@@ -50,6 +55,8 @@ constexpr int ChunkSize = 64 * 1024;
 
 
 std::atomic<int> GActiveJobs{0};
+// Why the broker could not start listening (see AgentBroker::ListenError)
+QString GListenError;
 
 // Input from the client to a running job (thread-safe)
 struct JobInput
@@ -57,6 +64,7 @@ struct JobInput
   QMutex Mutex;
   QWaitCondition Changed;
   QByteArray Data;           // stdin (exec/shell) or file data (put)
+  std::atomic<qint64> Taken{0}; // what the job took from Data and did not send yet
   bool End = false;          // frStdinEof / frDataEnd
   bool Cancelled = false;    // client gone
   bool ResizePending = false;
@@ -167,7 +175,6 @@ signals:
 public slots:
   void Run()
   {
-    GActiveJobs++;
     FStarted = QDateTime::currentDateTimeUtc();
     int Code = 0;
     QString Error;
@@ -225,7 +232,6 @@ public slots:
     {
       SaveRecording(FStarted, LogName(FData), FRequest.Op, FRequest.Detail(), FTranscript, FTruncated, FInputBytes, Code, Error);
     }
-    GActiveJobs--;
     emit Finished(Code, Error);
   }
 
@@ -287,7 +293,7 @@ private:
     bool Shell = (FRequest.Op == QStringLiteral("shell"));
     if (Shell)
     {
-      QByteArray Term = FRequest.Term.isEmpty() ? QByteArrayLiteral("xterm-256color") : FRequest.Term.toLatin1();
+      QByteArray Term = FRequest.Term.isEmpty() ? QByteArrayLiteral("xterm-256color") : FRequest.Term.toUtf8();
       if (ssh_channel_request_pty_size(Channel, Term.constData(), FRequest.Cols, FRequest.Rows) != SSH_OK)
       {
         SessionError(Session, QStringLiteral("Cannot open a terminal"));
@@ -303,29 +309,53 @@ private:
     }
 
     bool EofSent = false;
+    // input the channel did not take yet
+    QByteArray Unsent;
     char Buffer[ChunkSize];
     while (!FInput->IsCancelled())
     {
       // client -> server
-      QByteArray In;
       bool End = false;
       bool Resize = false;
       int Cols = 0, Rows = 0;
       {
         QMutexLocker Lock(&FInput->Mutex);
-        In.swap(FInput->Data);
+        Unsent.append(FInput->Data);
+        FInput->Data.clear();
+        FInput->Taken = Unsent.size();
         End = FInput->End;
         Resize = FInput->ResizePending;
         FInput->ResizePending = false;
         Cols = FInput->Cols;
         Rows = FInput->Rows;
       }
-      FInputBytes += In.size();
-      if (!In.isEmpty() && !EofSent && (ssh_channel_write(Channel, In.constData(), static_cast<uint32_t>(In.size())) == SSH_ERROR))
+      // only what the window has room for: a longer write waits inside libssh
+      // and stops the output, while a program that does not read its input
+      // yet may be waiting for that output to be taken
+      uint32_t Room = qMin<uint64_t>(ssh_channel_window_size(Channel), static_cast<uint64_t>(Unsent.size()));
+      if ((Room > 0) && !EofSent)
       {
-        SessionError(Session, QStringLiteral("Cannot send input"));
+        int N = ssh_channel_write(Channel, Unsent.constData(), Room);
+        if (N == SSH_ERROR)
+        {
+          if (!ssh_channel_is_closed(Channel))
+          {
+            SessionError(Session, QStringLiteral("Cannot send input"));
+          }
+          // the program is gone, and with it the need for its input
+          Unsent.clear();
+          FInput->Taken = 0;
+        }
+        else if (N > 0)
+        {
+          Unsent.remove(0, N);
+          // before the client hears of it, or its next input looks like too much
+          FInput->Taken = Unsent.size();
+          FInputBytes += N;
+          Send(frAck, QByteArray::number(FInputBytes));
+        }
       }
-      if (End && !EofSent && In.isEmpty())
+      if (End && !EofSent && Unsent.isEmpty())
       {
         ssh_channel_send_eof(Channel);
         EofSent = true;
@@ -368,28 +398,46 @@ private:
     {
       return ErrorExitCode;
     }
-    // the exit status follows the end of the output
+    // the exit status follows the end of the output, as late as the program
+    // takes after closing it
     uint32_t ExitCode = 0;
     char * Signal = nullptr;
     int CoreDumped = 0;
-    for (int Wait = 0; Wait < 500; Wait++)
+    bool StatusKnown = false;
+    // blocking, this call waits without a limit: a client that gave up on a
+    // program still running would hold on to this job for as long as it runs
+    ssh_set_blocking(Session, 0);
+    while (!StatusKnown && !FInput->IsCancelled())
     {
       int Rc = ssh_channel_get_exit_state(Channel, &ExitCode, &Signal, &CoreDumped);
       if (Rc == SSH_OK)
       {
-        break;
+        StatusKnown = true;
       }
-      if ((Rc == SSH_ERROR) || ssh_channel_is_closed(Channel))
+      else if ((Rc == SSH_ERROR) || ssh_channel_is_closed(Channel))
       {
         break;
       }
-      ssh_channel_poll_timeout(Channel, 20, 0);
+      else
+      {
+        QThread::msleep(20);
+      }
+    }
+    ssh_set_blocking(Session, 1);
+    if (FInput->IsCancelled())
+    {
+      return ErrorExitCode;
     }
     if (Signal != nullptr)
     {
       QString Name = QString::fromUtf8(Signal);
       ssh_string_free_char(Signal);
       throw ExtException(QStringLiteral("The remote command was terminated by signal %1.").arg(Name));
+    }
+    if (!StatusKnown)
+    {
+      // not 0: a caller would take the command for a success
+      throw ExtException(QStringLiteral("The server did not report the exit status of the command."));
     }
     return static_cast<int>(qMin<uint32_t>(ExitCode, 254));
   }
@@ -497,6 +545,7 @@ private:
           throw ExtException(QStringLiteral("Upload cancelled."));
         }
         Chunk.swap(FInput->Data);
+        FInput->Taken = Chunk.size();
         End = FInput->End;
       }
       for (qsizetype Offset = 0; Offset < Chunk.size(); )
@@ -509,6 +558,7 @@ private:
         Offset += N;
         Written += N;
       }
+      FInput->Taken = 0;
       if (!Chunk.isEmpty())
       {
         Send(frAck, QByteArray::number(Written));
@@ -528,6 +578,100 @@ private:
 
 class Broker;
 
+// A question to the person at the computer about a request of a program. A
+// window of its own (no parent): answering it does not bring the whole NixSCP
+// window to the front; it stays on top so it is not missed. The request is
+// shown whole, as plain text, in a field of limited size that scrolls: neither
+// its length nor markup in it can push the dangerous part or the buttons out
+// of sight.
+class RequestPrompt : public QDialog
+{
+public:
+  RequestPrompt(const QString & Question, const QString & What, const QString & Detail) : QDialog(nullptr)
+  {
+    setWindowTitle(QStringLiteral("NixSCP Agent Access"));
+    setWindowFlag(Qt::WindowStaysOnTopHint, true);
+    setWindowModality(Qt::NonModal);
+    setWindowIcon(QApplication::windowIcon());
+    setAttribute(Qt::WA_DeleteOnClose);
+    auto * Layout = new QVBoxLayout(this);
+    for (const QString & Text : {Question, What})
+    {
+      auto * Label = new QLabel(VisibleText(Text, false), this);
+      Label->setTextFormat(Qt::PlainText);
+      Label->setWordWrap(true);
+      Layout->addWidget(Label);
+    }
+    if (!Detail.isEmpty())
+    {
+      QString Shown = VisibleText(Detail, true);
+      constexpr int Columns = 80;
+      constexpr int MaxRows = 12;
+      int Rows = 0;
+      for (const QString & Line : Shown.split(QLatin1Char('\n')))
+      {
+        Rows += 1 + static_cast<int>(Line.size() / Columns);
+      }
+      if (Rows > MaxRows)
+      {
+        auto * Long = new QLabel(QStringLiteral("This request is long (%1 characters in %2 lines): scroll through all of it before you answer.")
+          .arg(Detail.size()).arg(Detail.count(QLatin1Char('\n')) + 1), this);
+        Long->setObjectName(QStringLiteral("RequestLong"));
+        Long->setTextFormat(Qt::PlainText);
+        Long->setWordWrap(true);
+        QFont Bold = Long->font();
+        Bold.setBold(true);
+        Long->setFont(Bold);
+        Layout->addWidget(Long);
+      }
+      auto * Field = new QPlainTextEdit(Shown, this);
+      Field->setObjectName(QStringLiteral("RequestText"));
+      Field->setReadOnly(true);
+      Field->setWordWrapMode(QTextOption::WrapAnywhere);
+      Field->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+      QFontMetrics Metrics(Field->font());
+      Field->setMinimumWidth(Metrics.averageCharWidth() * Columns);
+      Field->setFixedHeight(Metrics.lineSpacing() * qBound(2, Rows, MaxRows) + 12);
+      Layout->addWidget(Field);
+    }
+    FButtons = new QHBoxLayout();
+    FButtons->addStretch();
+    Layout->addLayout(FButtons);
+    if (QScreen * Screen = QApplication::primaryScreen())
+    {
+      setMaximumSize(Screen->availableGeometry().size() * 0.9);
+    }
+  }
+
+  QPushButton * AddButton(const QString & Caption, const QString & ToolTip)
+  {
+    auto * Button = new QPushButton(Caption, this);
+    Button->setAutoDefault(false);
+    Button->setToolTip(ToolTip);
+    FButtons->addWidget(Button);
+    connect(Button, &QPushButton::clicked, this, [this, Button]()
+    {
+      FClicked = Button;
+      accept();
+    });
+    return Button;
+  }
+
+  // nullptr when it was closed without an answer
+  QPushButton * Clicked() const { return FClicked; }
+
+  void Ask()
+  {
+    show();
+    raise();
+    activateWindow();
+  }
+
+private:
+  QHBoxLayout * FButtons;
+  QPushButton * FClicked = nullptr;
+};
+
 // One client connection
 class Connection : public QObject
 {
@@ -543,12 +687,16 @@ private:
   FrameReader FReader;
   bool FHaveRequest = false;
   bool FDone = false;
+  // nothing runs any more; goes once the last output reached the client
+  bool FOver = false;
+  // holds one of the MaxJobs places
+  bool FHasSlot = false;
   Request FRequest;
   // the site as the user knows it (audit log): its name, and the agent name when different
   QString FLogSite;
   std::shared_ptr<JobInput> FInput = std::make_shared<JobInput>();
   QThread * FThread = nullptr;
-  QPointer<QMessageBox> FApproval;
+  QPointer<RequestPrompt> FPrompt;
   // tunnel requests: the forward runs while the client stays connected
   PortForwardSpec FTunnelSpec;
   std::unique_ptr<AgentUserInterface> FTunnelUI;
@@ -558,7 +706,14 @@ private:
   void Read();
   void Fail(const QString & Message, const QString & AuditResult = QString());
   void Finish(int Code);
+  void Hangup();
+  void Over();
+  void ReleaseSlot();
   void Authorize();
+  // the decision on the request, from the settings as they are now
+  void Decide();
+  void AskSettings(const SessionData & Data);
+  void AskApproval(const SessionData & Data);
   void Authorized(const SessionData & Data);
   void SendList();
   void Start(const SessionData & Data);
@@ -574,23 +729,11 @@ public:
   {
     FServer = new QLocalServer(this);
     FServer->setSocketOptions(QLocalServer::UserAccessOption);
-    QString Name = SocketName();
-    if (!FServer->listen(Name))
-    {
-      // a stale socket of a crashed instance; another running NixSCP answers
-      QLocalSocket Probe;
-      Probe.connectToServer(Name);
-      if (!Probe.waitForConnected(500))
-      {
-        QLocalServer::removeServer(Name);
-        FServer->listen(Name);
-      }
-    }
     connect(FServer, &QLocalServer::newConnection, this, [this]()
     {
       while (QLocalSocket * Socket = FServer->nextPendingConnection())
       {
-        if (!SameUser(Socket))
+        if (!PeerIsSameUser(Socket->socketDescriptor()))
         {
           Socket->abort();
           Socket->deleteLater();
@@ -599,6 +742,19 @@ public:
         new Connection(this, Socket);
       }
     });
+    if (!Listen())
+    {
+      // another NixSCP serves the agents: this one takes over when it exits
+      auto * Retry = new QTimer(this);
+      connect(Retry, &QTimer::timeout, this, [this, Retry]()
+      {
+        if (Listen())
+        {
+          Retry->deleteLater();
+        }
+      });
+      Retry->start(5000);
+    }
   }
 
   QWidget * Window() const { return FWindow; }
@@ -617,31 +773,51 @@ private:
   QWidget * FWindow;
   GuiUserInterface * FGui;
   QLocalServer * FServer;
+  std::unique_ptr<QLockFile> FLock;
   QHash<QString, QDateTime> FAllowedUntil;
 
-  static bool SameUser(QLocalSocket * Socket)
+  // One broker per user, the instance holding the lock: with it held, a socket
+  // already there is what a crashed instance left, and no running one is cut off
+  bool Listen()
   {
-#if defined(Q_OS_LINUX)
-    struct ucred Credentials = {};
-    socklen_t Length = sizeof(Credentials);
-    if (getsockopt(static_cast<int>(Socket->socketDescriptor()), SOL_SOCKET, SO_PEERCRED, &Credentials, &Length) != 0)
+    QString Name = SocketName();
+    if (FLock == nullptr)
     {
-      return false;
-    }
-    return Credentials.uid == getuid();
-#elif defined(Q_OS_MACOS)
-    uid_t Uid = 0;
-    gid_t Gid = 0;
-    if (getpeereid(static_cast<int>(Socket->socketDescriptor()), &Uid, &Gid) != 0)
-    {
-      return false;
-    }
-    return Uid == getuid();
+#ifdef Q_OS_WIN
+      // the name of a pipe, not a path
+      FLock = std::make_unique<QLockFile>(QDir::tempPath() + QLatin1Char('/') + Name + QStringLiteral(".lock"));
 #else
-    // Windows: the pipe's ACL (UserAccessOption) admits the current user only
-    Q_UNUSED(Socket);
-    return true;
+      FLock = std::make_unique<QLockFile>(Name + QStringLiteral(".lock"));
 #endif
+      FLock->setStaleLockTime(0);
+    }
+    if (!FLock->isLocked() && !FLock->tryLock(0))
+    {
+      if (FLock->error() != QLockFile::LockFailedError)
+      {
+        ReportProblem(QStringLiteral("Cannot create %1.lock").arg(Name));
+      }
+      return false;
+    }
+    QLocalServer::removeServer(Name);
+    if (!FServer->listen(Name))
+    {
+      ReportProblem(QStringLiteral("Cannot listen on %1: %2").arg(Name, FServer->errorString()));
+      return false;
+    }
+    GListenError.clear();
+    return true;
+  }
+
+  // Once: this runs again every few seconds
+  static void ReportProblem(const QString & Problem)
+  {
+    if (GListenError != Problem)
+    {
+      GListenError = Problem;
+      qWarning("NixSCP Agent Access: %s", qPrintable(Problem));
+      AppendAudit(QString(), QStringLiteral("broker"), QString(), QStringLiteral("failed: ") + Problem);
+    }
   }
 };
 
@@ -657,16 +833,16 @@ Connection::Connection(Broker * Owner, QLocalSocket * Socket) : QObject(Owner), 
       FInput->Cancelled = true;
       FInput->Changed.wakeAll();
     }
-    if (FApproval)
+    if (FPrompt)
     {
-      FApproval->reject();
+      FPrompt->reject();
     }
-    if (FTunnel != nullptr)
+    if ((FTunnel != nullptr) && !FOver)
     {
       // the client ended the tunnel (Ctrl+C); Stopped deletes this connection
       FTunnel->Stop();
     }
-    else if (FThread == nullptr)
+    else if ((FThread == nullptr) || FOver)
     {
       deleteLater();
     }
@@ -683,21 +859,39 @@ Connection::~Connection()
     FThread->quit();
     FThread->wait();
   }
+  ReleaseSlot();
+}
+
+void Connection::ReleaseSlot()
+{
+  if (FHasSlot)
+  {
+    FHasSlot = false;
+    GActiveJobs--;
+  }
 }
 
 void Connection::Read()
 {
-  FReader.Append(FSocket->readAll());
+  QByteArray Received = FSocket->readAll();
+  if (FDone)
+  {
+    // answered: what the client was still sending does not matter any more,
+    // but it has to be taken (see Hangup)
+    return;
+  }
+  FReader.Append(Received);
   quint8 Type = 0;
   QByteArray Payload;
   bool Error = false;
-  while (FReader.Next(Type, Payload, Error))
+  while (!FDone && FReader.Next(Type, Payload, Error))
   {
     if (!FHaveRequest)
     {
       if (Type != frRequest)
       {
         Fail(QStringLiteral("Protocol error."));
+        Hangup();
         return;
       }
       QJsonObject J = QJsonDocument::fromJson(Payload).object();
@@ -712,36 +906,78 @@ void Connection::Read()
       FRequest.Rows = qBound(2, J.value(QStringLiteral("rows")).toInt(24), 1000);
       FRequest.Forward = J.value(QStringLiteral("forward")).toString();
       FHaveRequest = true;
+      // libssh takes C strings: a NUL (\u0000 in the JSON) would end the text
+      // the server gets, after the rules, the prompt and the log saw all of it
+      for (const QString * Text : {&FRequest.Op, &FRequest.Site, &FRequest.Command, &FRequest.Term, &FRequest.Remote, &FRequest.Name, &FRequest.Forward})
+      {
+        if (Text->contains(QChar(0)))
+        {
+          Fail(QStringLiteral("A request cannot contain a NUL character."), QStringLiteral("denied: NUL character in the request"));
+          return;
+        }
+        // and all of them go out as UTF-8: what was checked, shown and logged has
+        // to be what the server gets
+        if (!ExactUtf8(*Text))
+        {
+          Fail(QStringLiteral("A request must be valid Unicode text: no lone surrogates, no byte order mark at the start."),
+            QStringLiteral("denied: invalid text in the request"));
+          return;
+        }
+      }
       Authorize();
       continue;
     }
-    QMutexLocker Lock(&FInput->Mutex);
-    switch (Type)
+    bool TooMuch = false;
     {
-      case frStdin:
-      case frData:
-        FInput->Data.append(Payload);
-        break;
-      case frStdinEof:
-      case frDataEnd:
-        FInput->End = true;
-        break;
-      case frResize:
+      QMutexLocker Lock(&FInput->Mutex);
+      switch (Type)
       {
-        QJsonObject J = QJsonDocument::fromJson(Payload).object();
-        FInput->Cols = qBound(10, J.value(QStringLiteral("cols")).toInt(80), 1000);
-        FInput->Rows = qBound(2, J.value(QStringLiteral("rows")).toInt(24), 1000);
-        FInput->ResizePending = true;
-        break;
+        case frStdin:
+        case frData:
+          FInput->Data.append(Payload);
+          TooMuch = (FInput->Data.size() + FInput->Taken > MaxBufferedInput);
+          break;
+        case frStdinEof:
+        case frDataEnd:
+          FInput->End = true;
+          break;
+        case frResize:
+        {
+          QJsonObject J = QJsonDocument::fromJson(Payload).object();
+          FInput->Cols = qBound(10, J.value(QStringLiteral("cols")).toInt(80), 1000);
+          FInput->Rows = qBound(2, J.value(QStringLiteral("rows")).toInt(24), 1000);
+          FInput->ResizePending = true;
+          break;
+        }
+        default:
+          break;
       }
-      default:
-        break;
+      FInput->Changed.wakeAll();
     }
-    FInput->Changed.wakeAll();
+    if (TooMuch)
+    {
+      // a client waits for frAck: memory must not depend on one that does not
+      Fail(QStringLiteral("Protocol error: more input than the flow control allows."));
+      Hangup();
+      return;
+    }
   }
   if (Error)
   {
     Fail(QStringLiteral("Protocol error."));
+    Hangup();
+  }
+}
+
+// The answer goes out and the client hangs up after reading it. Not the other
+// way round: closing a socket with input not taken yet resets it, and the
+// client, typically still sending stdin to a program that ended, would lose
+// the output, the exit code or the error message waiting for it.
+void Connection::Hangup()
+{
+  if (FSocket->state() == QLocalSocket::ConnectedState)
+  {
+    FSocket->disconnectFromServer();
   }
 }
 
@@ -756,9 +992,11 @@ void Connection::Fail(const QString & Message, const QString & AuditResult)
     AppendAudit(FLogSite.isEmpty() ? FRequest.Site : FLogSite, FRequest.Op, FRequest.Detail(), AuditResult);
   }
   FDone = true;
-  FSocket->write(Frame(frError, Message.toUtf8()));
-  FSocket->flush();
-  FSocket->disconnectFromServer();
+  if (FSocket->state() == QLocalSocket::ConnectedState)
+  {
+    FSocket->write(Frame(frError, Message.toUtf8()));
+    FSocket->flush();
+  }
 }
 
 void Connection::Finish(int Code)
@@ -768,15 +1006,35 @@ void Connection::Finish(int Code)
     return;
   }
   FDone = true;
-  FSocket->write(Frame(frExit, QJsonDocument(QJsonObject{{QStringLiteral("code"), Code}}).toJson(QJsonDocument::Compact)));
-  FSocket->flush();
-  FSocket->disconnectFromServer();
+  if (FSocket->state() == QLocalSocket::ConnectedState)
+  {
+    FSocket->write(Frame(frExit, QJsonDocument(QJsonObject{{QStringLiteral("code"), Code}}).toJson(QJsonDocument::Compact)));
+    FSocket->flush();
+  }
+}
+
+void Connection::Over()
+{
+  FOver = true;
+  // otherwise the socket is still writing out what the client has not read
+  // yet: deleting it now would cut that off, disconnected deletes this later
+  if (FSocket->state() == QLocalSocket::UnconnectedState)
+  {
+    deleteLater();
+  }
 }
 
 bool Connection::CheckAccess(std::shared_ptr<SessionData> & Data, QString & Error)
 {
   // by the name agents see: the site's agent name, else its name
-  Data = FindAgentSite(Configuration::Instance().StoredSessions(), FRequest.Site);
+  bool Ambiguous = false;
+  Data = FindAgentSite(Configuration::Instance().StoredSessions(), FRequest.Site, &Ambiguous);
+  if (Ambiguous)
+  {
+    Error = QStringLiteral("More than one site is available to agents as \"%1\", so it is not clear which server is meant. "
+      "The user gives each its own name in NixSCP (site settings: Agent Access...).").arg(FRequest.Site);
+    return false;
+  }
   if (Data == nullptr)
   {
     Error = QStringLiteral("Site \"%1\" is not available to agents. Run \"nixscp --list\" for the sites you may use; "
@@ -786,13 +1044,21 @@ bool Connection::CheckAccess(std::shared_ptr<SessionData> & Data, QString & Erro
   FLogSite = LogName(*Data);
   if (!(Data->AgentPermissions & FRequest.Permission()))
   {
-    Error = QStringLiteral("Site \"%1\" does not allow %2 for agents.")
-      .arg(FRequest.Site, (FRequest.Permission() == apTransfer) ? QStringLiteral("file transfers") : QStringLiteral("commands"));
+    Error = QStringLiteral("Site \"%1\" does not allow %2 for agents.").arg(FRequest.Site,
+      (FRequest.Permission() == apTransfer) ? QStringLiteral("file transfers") :
+      (FRequest.Permission() == apTunnels) ? QStringLiteral("tunnels") : QStringLiteral("commands"));
     return false;
   }
   if ((FRequest.Op == QStringLiteral("put")) && (Data->AgentPermissions & apDownloadOnly))
   {
     Error = QStringLiteral("Site \"%1\" allows downloads only; uploads are not allowed for agents.").arg(FRequest.Site);
+    return false;
+  }
+  // the question shows "a.txt -> /srv/in": "../x" would land somewhere else
+  if ((FRequest.Op == QStringLiteral("put")) && (FRequest.Name.contains(QLatin1Char('/')) || FRequest.Name.contains(QLatin1Char('\\')) ||
+      (FRequest.Name == QStringLiteral(".")) || (FRequest.Name == QStringLiteral(".."))))
+  {
+    Error = QStringLiteral("The file name of an upload cannot contain a path. Give the folder as the remote file.");
     return false;
   }
   if ((FRequest.Op == QStringLiteral("shell")) && HasCommandRules(*Data))
@@ -803,29 +1069,26 @@ bool Connection::CheckAccess(std::shared_ptr<SessionData> & Data, QString & Erro
   }
   if (FRequest.Op == QStringLiteral("tunnel"))
   {
-    // "<local port>:<host>:<port>", or the name of one of the site's saved forwards
-    QString ParseError;
+    // the name of one of the site's saved forwards (which may contain a
+    // colon), or "<local port>:<host>:<port>"
     bool Found = false;
-    if (FRequest.Forward.contains(QLatin1Char(':')))
+    for (const PortForwardSpec & Spec : PortForwardSpec::LoadAll(Data->PortForwards))
     {
-      Found = PortForwardSpec::Parse(FRequest.Forward, FTunnelSpec, &ParseError);
-    }
-    else
-    {
-      for (const PortForwardSpec & Spec : PortForwardSpec::LoadAll(Data->PortForwards))
+      if (Spec.Name.compare(FRequest.Forward, Qt::CaseInsensitive) == 0)
       {
-        if (Spec.Name.compare(FRequest.Forward, Qt::CaseInsensitive) == 0)
-        {
-          FTunnelSpec = Spec;
-          Found = true;
-        }
+        FTunnelSpec = Spec;
+        Found = true;
+        break;
       }
-      ParseError = QStringLiteral("Site \"%1\" has no saved tunnel \"%2\". Give <local port>:<host>:<port> instead.")
-        .arg(FRequest.Site, FRequest.Forward);
     }
-    if (!Found)
+    if (!Found && !FRequest.Forward.contains(QLatin1Char(':')))
     {
-      Error = ParseError;
+      Error = QStringLiteral("Site \"%1\" has no saved tunnel \"%2\". Give <local port>:<host>:<port> instead.")
+        .arg(FRequest.Site, FRequest.Forward);
+      return false;
+    }
+    if (!Found && !PortForwardSpec::Parse(FRequest.Forward, FTunnelSpec, &Error))
+    {
       return false;
     }
     if (FTunnelSpec.LocalPort < 1024)
@@ -862,95 +1125,164 @@ void Connection::Authorize()
       QStringLiteral("denied: passwords not encrypted"));
     return;
   }
-  auto Continue = [Guard = QPointer<Connection>(this)]()
+  if (FRequest.Op == QStringLiteral("list"))
   {
-    if (Guard == nullptr)
+    SendList();
+    return;
+  }
+  Decide();
+}
+
+void Connection::Decide()
+{
+  std::shared_ptr<SessionData> Data;
+  QString Error;
+  if (!CheckAccess(Data, Error))
+  {
+    Fail(Error, QStringLiteral("denied: not allowed - ") + Error);
+  }
+  else if (!SettingsConfirmed(*Data))
+  {
+    AskSettings(*Data);
+  }
+  else if ((Data->AgentAccess == amAsk) && !FOwner->AllowedUntilNow(Data->Name))
+  {
+    AskApproval(*Data);
+  }
+  else
+  {
+    Authorized(*Data);
+  }
+}
+
+void Connection::AskSettings(const SessionData & Data)
+{
+  QString Shown = SettingsText(Data);
+  auto * Box = new RequestPrompt(QStringLiteral("A program wants to use the site \"%1\", whose Agent Access settings are new, or "
+    "were changed outside this question. With a master password alone, any program can edit them in the configuration file.").arg(Data.Name),
+    QStringLiteral("Accept them only if they are what you set:"), Shown);
+  QPushButton * Accept = Box->AddButton(QStringLiteral("Accept these settings"), QStringLiteral("Trust these settings until they change"));
+  Box->AddButton(QStringLiteral("Deny"), QStringLiteral("Refuse this request and keep asking"));
+  FPrompt = Box;
+  connect(Box, &QDialog::finished, this, [this, Box, Accept, Shown]()
+  {
+    FPrompt.clear();
+    if (FInput->IsCancelled())
     {
+      Fail(QString(), QStringLiteral("denied: the program went away"));
       return;
     }
-    if (Guard->FRequest.Op == QStringLiteral("list"))
+    if (Box->Clicked() != Accept)
     {
-      Guard->SendList();
+      Fail(QStringLiteral("The user did not accept the Agent Access settings of the site in NixSCP."), QStringLiteral("denied: settings not accepted"));
       return;
     }
     std::shared_ptr<SessionData> Data;
     QString Error;
-    if (!Guard->CheckAccess(Data, Error))
+    if (!CheckAccess(Data, Error) || (SettingsText(*Data) != Shown))
     {
-      Guard->Fail(Error, QStringLiteral("denied: not allowed - ") + Error);
+      Fail(QStringLiteral("The settings of the site changed while NixSCP was asking about them."), QStringLiteral("denied: settings changed meanwhile"));
       return;
     }
-    if ((Data->AgentAccess == amAsk) && !Guard->FOwner->AllowedUntilNow(Data->Name))
+    if (!ConfirmSettings(*Data))
     {
-      SessionData Copy = *Data;
-      auto * Box = new QMessageBox(QMessageBox::Question, QStringLiteral("NixSCP Agent Access"),
-        (AgentSiteName(*Data) == Data->Name) ?
-          QStringLiteral("A program wants to use the site \"%1\".").arg(Data->Name) :
-          QStringLiteral("A program wants to use the site \"%1\" (agents know it as \"%2\").").arg(Data->Name, AgentSiteName(*Data)),
-        QMessageBox::NoButton, nullptr);
-      // a window of its own (no parent): answering it does not bring the whole
-      // NixSCP window to the front; it stays on top so it is not missed
-      Box->setWindowFlag(Qt::WindowStaysOnTopHint, true);
-      Box->setWindowModality(Qt::NonModal);
-      Box->setWindowIcon(QApplication::windowIcon());
-      QString What = (Guard->FRequest.Op == QStringLiteral("exec")) ? QStringLiteral("Run command:\n%1").arg(Guard->FRequest.Command) :
-        (Guard->FRequest.Op == QStringLiteral("shell")) ? QStringLiteral("Open an interactive shell.") :
-        (Guard->FRequest.Op == QStringLiteral("get")) ? QStringLiteral("Download file:\n%1").arg(Guard->FRequest.Remote) :
-        (Guard->FRequest.Op == QStringLiteral("tunnel")) ? QStringLiteral("Open a tunnel:\n127.0.0.1:%1").arg(Guard->FTunnelSpec.Text()) :
-        QStringLiteral("Upload file:\n%1").arg(Guard->FRequest.Detail());
-      Box->setInformativeText(What);
-      Box->setAttribute(Qt::WA_DeleteOnClose);
-      QPushButton * Once = Box->addButton(QStringLiteral("Allow once"), QMessageBox::AcceptRole);
-      QPushButton * Hour = Box->addButton(QStringLiteral("1 hour"), QMessageBox::AcceptRole);
-      QPushButton * Day = Box->addButton(QStringLiteral("24 hours"), QMessageBox::AcceptRole);
-      QPushButton * Always = Box->addButton(QStringLiteral("Always"), QMessageBox::AcceptRole);
-      Box->addButton(QStringLiteral("Deny"), QMessageBox::RejectRole);
-      Once->setToolTip(QStringLiteral("Allow this request only"));
-      Hour->setToolTip(QStringLiteral("Allow requests for this site for one hour without asking"));
-      Day->setToolTip(QStringLiteral("Allow requests for this site for 24 hours without asking"));
-      Always->setToolTip(QStringLiteral("Allow requests for this site without asking from now on "
-        "(changeable in the site settings: Agent Access...)"));
-      Box->setDefaultButton(Once);
-      Guard->FApproval = Box;
-      QObject::connect(Box, &QMessageBox::finished, Guard, [Guard, Box, Once, Hour, Day, Always, Copy]()
-      {
-        QAbstractButton * Clicked = Box->clickedButton();
-        if ((Clicked == Once) || (Clicked == Hour) || (Clicked == Day) || (Clicked == Always))
-        {
-          if (Clicked == Hour)
-          {
-            Guard->FOwner->AllowFor(Copy.Name, 60 * 60);
-          }
-          else if (Clicked == Day)
-          {
-            Guard->FOwner->AllowFor(Copy.Name, 24 * 60 * 60);
-          }
-          else if (Clicked == Always)
-          {
-            // stored: the site is allowed without asking from now on
-            Configuration & Config = Configuration::Instance();
-            if (auto Stored = Config.StoredSessions().FindByName(Copy.Name))
-            {
-              Stored->AgentAccess = amAllow;
-              Config.Save();
-            }
-            AppendAudit(LogName(Copy), QStringLiteral("settings"), QStringLiteral("approval changed to always allow"), QStringLiteral("by user"));
-          }
-          Guard->Authorized(Copy);
-        }
-        else
-        {
-          Guard->Fail(QStringLiteral("The user denied the request in NixSCP."), QStringLiteral("denied: by user"));
-        }
-      });
-      Box->show();
-      Box->raise();
-      Box->activateWindow();
+      Fail(QStringLiteral("NixSCP cannot store that the settings were accepted."), QStringLiteral("denied: cannot store the accepted settings"));
       return;
     }
-    Guard->Authorized(*Data);
-  };
-  Continue();
+    AppendAudit(LogName(*Data), QStringLiteral("settings"), SettingsText(*Data), QStringLiteral("accepted by user"));
+    Decide();
+  });
+  Box->Ask();
+}
+
+void Connection::AskApproval(const SessionData & Data)
+{
+  QString What, Detail;
+  if (FRequest.Op == QStringLiteral("exec"))
+  {
+    What = QStringLiteral("Run command:");
+    Detail = FRequest.Command;
+  }
+  else if (FRequest.Op == QStringLiteral("shell"))
+  {
+    What = QStringLiteral("Open an interactive shell.");
+  }
+  else if (FRequest.Op == QStringLiteral("get"))
+  {
+    What = QStringLiteral("Download file:");
+    Detail = FRequest.Remote;
+  }
+  else if (FRequest.Op == QStringLiteral("tunnel"))
+  {
+    What = QStringLiteral("Open a tunnel:");
+    Detail = QStringLiteral("127.0.0.1:%1").arg(FTunnelSpec.Text());
+  }
+  else
+  {
+    What = QStringLiteral("Upload file:");
+    Detail = FRequest.Detail();
+  }
+  auto * Box = new RequestPrompt((AgentSiteName(Data) == Data.Name) ?
+    QStringLiteral("A program wants to use the site \"%1\".").arg(Data.Name) :
+    QStringLiteral("A program wants to use the site \"%1\" (agents know it as \"%2\").").arg(Data.Name, AgentSiteName(Data)),
+    What, Detail);
+  QPushButton * Once = Box->AddButton(QStringLiteral("Allow once"), QStringLiteral("Allow this request only"));
+  QPushButton * Hour = Box->AddButton(QStringLiteral("1 hour"), QStringLiteral("Allow requests for this site for one hour without asking"));
+  QPushButton * Day = Box->AddButton(QStringLiteral("24 hours"), QStringLiteral("Allow requests for this site for 24 hours without asking"));
+  QPushButton * Always = Box->AddButton(QStringLiteral("Always"), QStringLiteral("Allow requests for this site without asking from now on "
+    "(changeable in the site settings: Agent Access...)"));
+  // Enter or a stray key press must not approve a request
+  Box->AddButton(QStringLiteral("Deny"), QString())->setDefault(true);
+  FPrompt = Box;
+  QString Asked = Data.Name;
+  connect(Box, &QDialog::finished, this, [this, Box, Once, Hour, Day, Always, Asked]()
+  {
+    // reject() after the answer must not answer a second time
+    FPrompt.clear();
+    QPushButton * Clicked = Box->Clicked();
+    if (FInput->IsCancelled())
+    {
+      // not the user's decision: the program gave up on the question
+      Fail(QString(), QStringLiteral("denied: the program went away"));
+      return;
+    }
+    if ((Clicked != Once) && (Clicked != Hour) && (Clicked != Day) && (Clicked != Always))
+    {
+      Fail(QStringLiteral("The user denied the request in NixSCP."), QStringLiteral("denied: by user"));
+      return;
+    }
+    // the settings as they are now: the question may have been open for long
+    std::shared_ptr<SessionData> Data;
+    QString Error;
+    if (!CheckAccess(Data, Error))
+    {
+      Fail(Error, QStringLiteral("denied: not allowed - ") + Error);
+      return;
+    }
+    if ((Data->Name != Asked) || !SettingsConfirmed(*Data))
+    {
+      Fail(QStringLiteral("The settings of the site changed while NixSCP was asking."), QStringLiteral("denied: settings changed meanwhile"));
+      return;
+    }
+    if (Clicked == Hour)
+    {
+      FOwner->AllowFor(Data->Name, 60 * 60);
+    }
+    else if (Clicked == Day)
+    {
+      FOwner->AllowFor(Data->Name, 24 * 60 * 60);
+    }
+    else if (Clicked == Always)
+    {
+      // stored: the site is allowed without asking from now on
+      Data->AgentAccess = amAllow;
+      ConfirmSettings(*Data);
+      Configuration::Instance().Save();
+      AppendAudit(LogName(*Data), QStringLiteral("settings"), QStringLiteral("approval changed to always allow"), QStringLiteral("by user"));
+    }
+    Authorized(*Data);
+  });
+  Box->Ask();
 }
 
 void Connection::SendList()
@@ -958,7 +1290,7 @@ void Connection::SendList()
   QJsonArray Sites;
   for (const auto & Data : Configuration::Instance().StoredSessions().Sessions())
   {
-    if ((Data->AgentAccess == amOff) || !Data->IsSsh() || Data->IsWorkspace)
+    if (!UsableByAgents(*Data))
     {
       continue;
     }
@@ -969,10 +1301,14 @@ void Connection::SendList()
       {QStringLiteral("port"), Data->PortNumber},
       {QStringLiteral("permissions"), PermissionsText(Data->AgentPermissions) +
         (HasCommandRules(*Data) ? QStringLiteral(" (restricted commands)") : QString())},
-      {QStringLiteral("approval"), (Data->AgentAccess == amAsk) ? QStringLiteral("ask") : QStringLiteral("none")},
+      {QStringLiteral("approval"), ((Data->AgentAccess == amAsk) || !SettingsConfirmed(*Data)) ? QStringLiteral("ask") : QStringLiteral("none")},
     });
   }
-  AppendAudit(QString(), FRequest.Op, QString(), QStringLiteral("allowed"));
+  if (!AppendAudit(QString(), FRequest.Op, QString(), QStringLiteral("allowed")))
+  {
+    Fail(QStringLiteral("The agent access log cannot be written, so NixSCP refuses agent requests."));
+    return;
+  }
   FSocket->write(Frame(frList, QJsonDocument(Sites).toJson(QJsonDocument::Compact)));
   Finish(0);
 }
@@ -988,7 +1324,16 @@ void Connection::Authorized(const SessionData & Data)
     Fail(QStringLiteral("Too many agent requests are running; try again shortly."), QStringLiteral("denied: busy"));
     return;
   }
-  AppendAudit(LogName(Data), FRequest.Op, FRequest.Detail(), QStringLiteral("allowed"));
+  // no request without its line in the log: that is what the log is for
+  QString Result = (Data.AgentRecord && !CanRecord()) ?
+    QStringLiteral("allowed; not recorded: recordings need the NixSCP password") : QStringLiteral("allowed");
+  if (!AppendAudit(LogName(Data), FRequest.Op, FRequest.Detail(), Result))
+  {
+    Fail(QStringLiteral("The agent access log cannot be written, so NixSCP refuses agent requests."));
+    return;
+  }
+  GActiveJobs++;
+  FHasSlot = true;
   Start(Data);
 }
 
@@ -1015,6 +1360,7 @@ void Connection::StartTunnel(const SessionData & Data)
   });
   connect(FTunnel, &PortForward::Stopped, this, [this, Data, Started](const QString & AError)
   {
+    ReleaseSlot();
     QString Error = (!AError.isEmpty() && !FTunnelUI->Problem.isEmpty()) ? FTunnelUI->Problem : AError;
     if (Data.AgentRecord)
     {
@@ -1031,14 +1377,7 @@ void Connection::StartTunnel(const SessionData & Data)
     {
       Finish(0);
     }
-    if (FSocket->state() != QLocalSocket::ConnectedState)
-    {
-      deleteLater();
-    }
-    else
-    {
-      connect(FSocket, &QLocalSocket::disconnected, this, &QObject::deleteLater);
-    }
+    Over();
   });
   FTunnel->Start();
 }
@@ -1069,6 +1408,7 @@ void Connection::Start(const SessionData & Data)
   connect(Job, &AgentJob::Finished, this, [this](int Code, const QString & Error)
   {
     FThread->quit();
+    ReleaseSlot();
     if (!Error.isEmpty())
     {
       AppendAudit(FLogSite.isEmpty() ? FRequest.Site : FLogSite, FRequest.Op, FRequest.Detail(), QStringLiteral("failed: ") + Error);
@@ -1078,14 +1418,7 @@ void Connection::Start(const SessionData & Data)
     {
       Finish(Code);
     }
-    if (FSocket->state() != QLocalSocket::ConnectedState)
-    {
-      deleteLater();
-    }
-    else
-    {
-      connect(FSocket, &QLocalSocket::disconnected, this, &QObject::deleteLater);
-    }
+    Over();
   });
   FThread->start();
 }
@@ -1108,6 +1441,11 @@ void Start(QWidget * Window)
 int ActiveJobs()
 {
   return GActiveJobs;
+}
+
+QString ListenError()
+{
+  return GListenError;
 }
 
 }

@@ -84,7 +84,7 @@ public:
   TDSTMode DSTMode;                 // ConsiderDST: daylight saving time (dstmUnix default)
   double TimeDifference;            // TimeDifference: timezone offset in days (TDateTime units), SCP/FTP
   bool TimeDifferenceAuto;          // TimeDifferenceAuto: FTP only, detect automatically
-  bool TrimVMSVersions;             // TrimVMSVersions (n/a, stored)
+  bool TrimVMSVersions;             // TrimVMSVersions: ";n" version suffix dropped from transferred names
   bool VMSAllRevisions;             // VMSAllRevisions (n/a, stored)
 
   // ---- Environment > Directories ----
@@ -146,6 +146,7 @@ public:
   TTlsVersion MinTlsVersion;        // MinTlsVersion
   TTlsVersion MaxTlsVersion;        // MaxTlsVersion
   TAutoSwitch CompleteTlsShutdown;  // CompleteTlsShutdown
+  QString ProtocolFeatures;         // ProtocolFeatures: overrides of the server's FTP features (TTerminal::ProcessFeatures)
 
   // ---- Environment > S3 / WebDAV (stored) ----
   QString S3DefaultRegion;          // S3DefaultRegion
@@ -187,6 +188,7 @@ public:
   QString TunnelUserName;           // TunnelUserName
   QString TunnelPassword;           // TunnelPassword (key TunnelUserName+TunnelHostName) / TunnelPasswordPlain
   QString TunnelPublicKeyFile;      // TunnelPublicKeyFile
+  QString TunnelPassphrase;         // TunnelPassphrase (encrypted, key TunnelPublicKeyFile) / TunnelPassphrasePlain
   int TunnelLocalPortNumber;        // TunnelLocalPortNumber (0 = autoselect)
   QString TunnelHostKey;            // TunnelHostKey (fingerprint(s) accepted)
 
@@ -221,7 +223,22 @@ public:
   // Runtime only (not persisted): overrides libssh's default ~/.ssh/known_hosts.
   // libssh resolves ~ via getpwuid(), not $HOME, so tests need this to stay
   // away from the user's real file. Empty = libssh default.
+  // Never set from a URL or raw settings: it is the trust store of the session.
   QString KnownHostsFile;
+  // Runtime only (RequireDirectories): an ad-hoc URL or a path in the URL makes
+  // an initial directory that cannot be opened an error; a stored site falls
+  // back to the home directory (with UpdateDirectories on)
+  bool RequireDirectories;
+  // Runtime only (FOverrideCachedHostKey): the fingerprint came from a URL
+  // (";fingerprint=", "x-SshHostKey"), so a host key known already is accepted
+  // without comparing it, it never outranks a known key and it is never saved
+  bool HostKeyFromUrl;
+  // The same for TunnelHostKey ("x-TunnelHostKey")
+  bool TunnelHostKeyFromUrl;
+  // NoExpansion: the session came from a URL or another instance, so nothing
+  // in it is expanded (a host or user name would send the value to the server).
+  // Stored with a site saved from a URL, never taken from a URL or raw settings.
+  bool NoExpansion;
 
   // Algorithm names as used in CipherList/KexList/HostKeyList, in WinSCP's
   // enum order; "WARN" is the "-- warn below here --" separator.
@@ -258,9 +275,17 @@ public:
   // session and tunnel passwords are neither loaded from nor saved to sites
   static bool DisablePasswordStoring;
 
-  // TSessionData::HasPassword / HasAnySessionPassword
+  // TSessionData::HasPassword / HasAnySessionPassword; unlike WinSCP the proxy
+  // password and the S3 session token count too ("Do not save passwords")
   bool HasPassword() const { return !Password.isEmpty(); }
-  bool HasAnySessionPassword() const { return !Password.isEmpty() || !TunnelPassword.isEmpty(); }
+  bool HasAnySessionPassword() const
+  {
+    return !Password.isEmpty() || !TunnelPassword.isEmpty() || !ProxyPassword.isEmpty() || !S3SessionToken.isEmpty() ||
+      !TunnelPassphrase.isEmpty();
+  }
+  // TSessionData::GetIsLocalBrowser / GetCanOpen: a workspace entry of a local tab
+  bool IsLocalBrowser() const { return !LocalDirectory.isEmpty() && !OtherLocalDirectory.isEmpty(); }
+  bool CanOpen() const { return CanLogin() || IsLocalBrowser(); }
   // TSessionData::GetInfoTip (SESSION_INFO_TIP2 / SESSION_INFO_TIP_NO_SSH)
   QString InfoTip() const;
   // TNamedObject::MakeUniqueIn: appends " (2)", " (3)"... while List has a site of the name
@@ -284,12 +309,15 @@ public:
   // WinSCP.ini files) and a leading ~ (home folder). Unknown variables are
   // kept as they are.
   static QString ExpandEnvironmentVariables(const QString & Str);
-  QString HostNameExpanded() const { return ExpandEnvironmentVariables(HostName); }
-  QString UserNameExpanded() const { return ExpandEnvironmentVariables(UserName); }
-  QString LocalDirectoryExpanded() const { return ExpandEnvironmentVariables(LocalDirectory); }
+  QString HostNameExpanded() const { return NoExpansion ? HostName : ExpandEnvironmentVariables(HostName); }
+  QString UserNameExpanded() const { return NoExpansion ? UserName : ExpandEnvironmentVariables(UserName); }
+  QString LocalDirectoryExpanded() const { return NoExpansion ? LocalDirectory : ExpandEnvironmentVariables(LocalDirectory); }
   // Expands host/user names and all local file/directory fields in place
   // (session about to be opened; stored sites keep the unexpanded values)
   void ExpandEnvironmentVariables();
+  // The values that differ from Base came from a URL or another instance:
+  // those stay literal for good (NoExpansion), the others are expanded now
+  void ProtectFromExpansion(const SessionData & Base);
 
   // TSessionData::ParseUrl as used by the Login dialog (pufPreferProtocol,
   // no stored site lookup): [protocol://][user[:password][;fingerprint=..][;x-name=value]@]host[:port][/path]
@@ -297,11 +325,28 @@ public:
   enum { ParsedProtocolDefined = 0x01, ParsedDefaultsOnly = 0x02, ParsedUnsafeSettings = 0x04 };
   bool ParseUrl(const QString & Url, int & ParsedInfo);
   static bool IsIPv6Literal(const QString & HostName);
+  // Hosts of S3 services: a "dav" or "http(s)" URL naming one is an S3 URL
+  static bool IsS3HostName(const QString & HostName);
 
   // TSessionData::SaveToOptions: settings as "Key=Value" lines (WinSCP.ini
   // key names, unescaped values), only those differing from Default
   // (nullptr = all). Used by the "Raw Site Settings" dialog and URL code.
+  // TSessionData::GetRawSettingsForUrl: what a URL needs as "x-" settings
+  QStringList RawSettingsForUrl() const;
   QStringList SaveToOptions(const SessionData * Default) const;
+  // A URL can come from anybody. These are the settings it may set without
+  // asking, of how to talk to the server only: not who to trust, what to run,
+  // where to connect or which local file to use, so that a setting added later
+  // is out until somebody decides otherwise
+  static bool IsUrlSetting(const QString & Key);
+  // Keys without "*" and "acceptnew": those give up a check, which is for the
+  // site or a switch to decide, never for a URL
+  static QString UrlHostKeys(const QString & Keys);
+  // HostKey as far as it counts for this session
+  QString TrustedHostKey() const;
+  // ApplyRawSettings for the "x-" settings of a URL: what they say about host
+  // keys is that of a URL. Returns true when one is outside of IsUrlSetting.
+  bool ApplyUrlSettings(const QStringList & Settings);
   // TSessionData::ApplyRawSettings: applies "Key=Value" lines; returns true
   // when a potentially unsafe setting (shell, commands, recycle bin, SFTP
   // server, proxy command) changed (UNSAFE_SESSION confirmation)
@@ -345,6 +390,8 @@ public:
   std::shared_ptr<SessionData> FindByName(const QString & Name) const;
   void Add(std::shared_ptr<SessionData> Data);
   void Remove(const QString & Name);
+  // Remove of Names and Add of Items in one pass: many sites at once
+  void Replace(const QStringList & Names, const QList<std::shared_ptr<SessionData>> & Items);
   void RenameFolder(const QString & From, const QString & To);
   void RemoveFolder(const QString & Folder);
   void AddFolder(const QString & Folder);

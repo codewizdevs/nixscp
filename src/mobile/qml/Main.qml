@@ -45,6 +45,11 @@ ApplicationWindow {
     // Android's Back: the page first (selection, filter, up a folder, the
     // search), then back a page; on the sites it leaves the app
     onClosing: function(close) {
+        // nothing behind the lock moves; before the first unlock Back leaves the app
+        if (lock.locked) {
+            close.accepted = !lock.started
+            return
+        }
         var page = stack.currentItem
         if (page && page.back && page.back()) {
             close.accepted = false
@@ -88,10 +93,7 @@ ApplicationWindow {
                 stack.pop()
             }
         }
-        function onSessionsChanged() {
-            if (sessions.count === 0 && app.inBrowser())
-                stack.pop(null)
-        }
+        function onSessionsChanged() { app.leaveEmptyBrowser() }
         function onError(site, message, details) {
             errorDialog.title = site && site !== session.site ? site : qsTr("Error")
             errorDialog.text = message
@@ -102,6 +104,11 @@ ApplicationWindow {
         function onEditReady(owner, localPath, remotePath) {
             if (settings.editor === "builtin" || !androidFiles.edit(localPath, settings.editor))
                 stack.push(Qt.resolvedUrl("EditorPage.qml"), { owner: owner, localPath: localPath, remotePath: remotePath })
+        }
+        // changes made in another app, and no connection left to upload them
+        function onEditUnsent(site, localPath) {
+            unsentDialog.items = unsentDialog.items.concat([{ site: site, path: localPath }])
+            if (!unsentDialog.visible) unsentDialog.open()
         }
         function onArchived(path) {
             phone.refresh()
@@ -129,7 +136,7 @@ ApplicationWindow {
         }
         function onTransferChanged() { app.updateKeepAlive() }
         function onPreviewReady(owner, localPath, name) {
-            stack.push(Qt.resolvedUrl("PreviewPage.qml"), { localPath: localPath, name: name, kind: owner.files.previewKind(name) || "text" })
+            stack.push(Qt.resolvedUrl("PreviewPage.qml"), { owner: owner, localPath: localPath, name: name, kind: owner.files.previewKind(name) || "text" })
         }
         function onDownloaded(paths) {
             // into the public Downloads folder, where the Files app shows them
@@ -149,7 +156,9 @@ ApplicationWindow {
         function onDownloaded(paths) {
             var places = androidFiles.publish(paths)
             var saved = places.filter(function(p) { return p.length > 0 })
-            if (saved.length > 0)
+            if (saved.length === 0)
+                app.toast(qsTr("Saved in NixSCP's own folder: %1").arg(paths[0]))
+            else
                 app.toast(saved.length === 1 ? qsTr("Saved to %1").arg(saved[0]) : qsTr("%1 files saved to Downloads/NixSCP").arg(saved.length))
         }
         function onCopied(targetDir, count) {
@@ -167,6 +176,28 @@ ApplicationWindow {
             errorDialog.open()
         }
     }
+    // the phone pane and the site list tell what failed
+    Connections {
+        target: phone
+        function onFailed(message) { app.toast(message) }
+    }
+    Connections {
+        target: sites
+        function onFailed(message) { app.toast(message) }
+    }
+
+    // no tab left: back to the sites, unless an editor still holds text of
+    // the session that ended
+    function leaveEmptyBrowser() {
+        if (sessions.count !== 0 || !app.inBrowser())
+            return
+        for (var i = 0; i < stack.depth; i++) {
+            var item = stack.get(i, StackView.DontLoad)
+            if (item && item.objectName === "editor" && item.modified) return
+        }
+        stack.pop(null)
+    }
+
     // the queue's progress in the notification; a busy tab keeps it too
     function updateKeepAlive() {
         if (transfers.active > 0)
@@ -199,9 +230,49 @@ ApplicationWindow {
         target: pro
         function onNotice(message) { app.toast(message) }
         function onConflict(device, time) { app.askConflict(device, time) }
+        function onRecoveryKeyWaiting(key) {
+            waitingRecoveryDialog.key = key
+            waitingRecoveryDialog.open()
+        }
         function onLicenseNotice(betaEnded) {
             licenseDialog.betaEnded = betaEnded
             licenseDialog.open()
+        }
+    }
+    // a new recovery key that a crash or a lost connection kept from being shown
+    Dialog {
+        id: waitingRecoveryDialog
+        property string key
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 32, 480)
+        modal: true
+        closePolicy: Popup.NoAutoClose
+        title: qsTr("Your recovery key")
+        ColumnLayout {
+            width: waitingRecoveryDialog.availableWidth
+            spacing: 8
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                text: qsTr("Your data key was replaced, and this is its new recovery key. Keep it somewhere safe, away from this phone "
+                           + "(a password manager, or printed). It opens your data if you forget the NixSCP password.")
+            }
+            TextArea {
+                id: waitingRecoveryText
+                Layout.fillWidth: true
+                readOnly: true
+                wrapMode: TextEdit.WrapAnywhere
+                font.family: monoFont
+                font.pixelSize: 15
+                text: waitingRecoveryDialog.key
+            }
+            RowLayout {
+                Button { text: qsTr("Copy"); flat: true; onClicked: { waitingRecoveryText.selectAll(); waitingRecoveryText.copy(); waitingRecoveryText.deselect(); app.toast(qsTr("Copied.")) } }
+                Button { text: qsTr("Share…"); flat: true; onClicked: androidFiles.shareText(waitingRecoveryDialog.key) }
+            }
+        }
+        footer: DialogButtonBox {
+            Button { text: qsTr("I saved it"); flat: true; highlighted: true; onClicked: { waitingRecoveryDialog.key = ""; pro.recoveryKeySaved(); waitingRecoveryDialog.close() } }
         }
     }
     function askConflict(device, time) {
@@ -254,20 +325,26 @@ ApplicationWindow {
         }
     }
 
-    // ---- the lock of the encrypted configuration, over everything ----
-    LockPage {
-        anchors.fill: parent
+    // ---- the lock of the encrypted configuration, over everything: a popup
+    // too, as dialogs and menus are popups and would show above a page ----
+    Popup {
+        id: lockCover
+        parent: Overlay.overlay
+        x: 0
+        y: 0
         z: 1000
+        width: parent ? parent.width : 0
+        height: parent ? parent.height : 0
+        padding: 0
+        modal: true
+        // the focus too: Back goes to the popup that has it, and would close a dialog behind the lock
+        focus: true
+        closePolicy: Popup.NoAutoClose
         visible: lock.locked
-    }
-
-    // the connection of the current tab was lost: the tab closes
-    Connections {
-        target: session
-        function onStateChanged() {
-            if (!session.connected && !session.busy && session.site.length > 0)
-                sessions.closeCurrent()
-        }
+        background: null
+        enter: null
+        exit: null
+        LockPage { anchors.fill: parent }
     }
 
     // Android cuts the connections of apps in the background (the system
@@ -337,6 +414,13 @@ ApplicationWindow {
             errorDialog.text = banner
             errorDialog.details = ""
             errorDialog.open()
+        }
+        // the session asking closed: no answer is expected any more
+        function onQuestionCancelled() {
+            hostKeyDialog.answered = promptDialog.answered = queryDialog.answered = true
+            hostKeyDialog.close()
+            promptDialog.close()
+            queryDialog.close()
         }
     }
 
@@ -484,6 +568,45 @@ ApplicationWindow {
                     flat: true
                     highlighted: index === 0
                     onClicked: { queryDialog.answered = true; ui.answerQuery(modelData.answer); queryDialog.close() }
+                }
+            }
+        }
+    }
+
+    // what another app changed and could not be uploaded: gone at the next start
+    Dialog {
+        id: unsentDialog
+        property var items: []
+        readonly property var item: items.length > 0 ? items[0] : ({ site: "", path: "" })
+        function next() {
+            items = items.slice(1)
+            close()
+            if (items.length > 0) Qt.callLater(open)
+        }
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 32, 480)
+        modal: true
+        closePolicy: Popup.NoAutoClose
+        title: qsTr("Changes not uploaded")
+        ColumnLayout {
+            width: parent.width
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                text: qsTr("The changes of %1 did not reach %2: the connection ended first.")
+                      .arg(unsentDialog.item.path.substring(unsentDialog.item.path.lastIndexOf("/") + 1)).arg(unsentDialog.item.site)
+            }
+        }
+        footer: DialogButtonBox {
+            Button { text: qsTr("Discard"); flat: true; onClicked: unsentDialog.next() }
+            Button {
+                text: qsTr("Save to Download")
+                flat: true
+                highlighted: true
+                onClicked: {
+                    var place = androidFiles.publish([unsentDialog.item.path])[0]
+                    app.toast(place ? qsTr("Saved to %1").arg(place) : qsTr("The file could not be saved."))
+                    unsentDialog.next()
                 }
             }
         }

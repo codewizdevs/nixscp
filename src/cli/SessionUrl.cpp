@@ -88,39 +88,28 @@ static bool IsProtocolUrl(const QString & Url, const QString & Protocol, int & P
   return false;
 }
 
-void ApplySessionRawSettings(SessionData & Data, SessionExtras & Extras, const QStringList & Settings)
+// Settings outside of the WinSCP.ini site format
+static void ReadRawExtras(SessionExtras & Extras, const QStringList & Settings)
 {
-  // TSessionData::ApplyRawSettings: TOptionsStorage over "Key=Value" lines;
-  // SessionData::Load keeps the current values for keys that are not present.
-  // Note that "HostKey" is the host key algorithm list (HostKeyList) and
-  // "SshHostKey" the expected fingerprint(s), exactly as in WinSCP.ini.
-  IniFile File;
-  IniStorage Storage(&File);
-  Storage.OpenSubKey(QStringLiteral("Sessions"), true);
-  Storage.OpenSubKey(QStringLiteral("RawSettings"), true);
   for (const QString & Setting : Settings)
   {
     qsizetype P = Setting.indexOf(QLatin1Char('='));
     QString Key = (P >= 0) ? Setting.left(P) : Setting;
-    QString Value = (P >= 0) ? Setting.mid(P + 1) : QString();
-    // Settings outside of the WinSCP.ini site format
     if ((Key.compare(QStringLiteral("Passphrase"), Qt::CaseInsensitive) == 0) ||
         (Key.compare(QStringLiteral("PassphrasePlain"), Qt::CaseInsensitive) == 0))
     {
-      Extras.Passphrase = Value;
+      Extras.Passphrase = (P >= 0) ? Setting.mid(P + 1) : QString();
     }
-    else if (Key.compare(QStringLiteral("KnownHostsFile"), Qt::CaseInsensitive) == 0)
-    {
-      // NixSCP specific: known_hosts file to verify/store host keys with
-      Data.KnownHostsFile = Value;
-    }
-    Storage.WriteString(Key, Value);
   }
-  QString Name = Data.Name;
-  QString KnownHosts = Data.KnownHostsFile;
-  Data.Load(Storage);
-  Data.Name = Name;
-  Data.KnownHostsFile = KnownHosts;
+}
+
+void ApplySessionRawSettings(SessionData & Data, SessionExtras & Extras, const QStringList & Settings)
+{
+  // TSessionData::ApplyRawSettings. Note that "HostKey" is the host key
+  // algorithm list (HostKeyList) and "SshHostKey" the expected fingerprint(s),
+  // exactly as in WinSCP.ini.
+  ReadRawExtras(Extras, Settings);
+  Data.ApplyRawSettings(Settings);
 }
 
 static QString ReadPasswordFromFile(const QString & FileName)
@@ -160,11 +149,12 @@ void ReadPasswordsFromFiles(SessionData & Data, SessionExtras & Extras)
   Extras.NewPassword = ReadPasswordFromFile(Extras.NewPassword);
   Data.ProxyPassword = ReadPasswordFromFile(Data.ProxyPassword);
   Data.TunnelPassword = ReadPasswordFromFile(Data.TunnelPassword);
+  Data.TunnelPassphrase = ReadPasswordFromFile(Data.TunnelPassphrase);
   Extras.Passphrase = ReadPasswordFromFile(Extras.Passphrase);
 }
 
 void ParseSessionUrl(const QString & AUrl, Options * Opts, const StoredSessionList * Stored,
-  SessionData & Data, SessionExtras & Extras, int & ParsedInfo, QString * MaskedUrl)
+  SessionData & Data, SessionExtras & Extras, int & ParsedInfo, QString * MaskedUrl, bool Unsafe)
 {
   QString Url = AUrl;
   ParsedInfo = 0;
@@ -291,6 +281,9 @@ void ParseSessionUrl(const QString & AUrl, Options * Opts, const StoredSessionLi
     {
       Data = (Stored != nullptr) ? const_cast<StoredSessionList *>(Stored)->DefaultSettings() : SessionData();
       Data.Name.clear();
+      // When ad-hoc URL is used, always display error when the directories are not valid,
+      // no matter if they are part of the URL or raw settings.
+      Data.RequireDirectories = true;
 
       qsizetype PSlash = Url.indexOf(QLatin1Char('/'));
       if (PSlash < 0)
@@ -339,6 +332,10 @@ void ParseSessionUrl(const QString & AUrl, Options * Opts, const StoredSessionLi
       }
       else if (ProtocolDefined)
       {
+        if ((AFSProtocol == fsWebDAV) && SessionData::IsS3HostName(Data.HostName))
+        {
+          AFSProtocol = fsS3;
+        }
         Data.PortNumber = DefaultProtocolPortNumber;
       }
 
@@ -358,17 +355,28 @@ void ParseSessionUrl(const QString & AUrl, Options * Opts, const StoredSessionLi
         QString ConnectionParamName = CutToChar(ConnectionParam, UrlParamValueSeparator, false);
         if (ConnectionParamName.compare(UrlHostKeyParamName, Qt::CaseInsensitive) == 0)
         {
-          Data.HostKey = DecodeUrlChars(ConnectionParam);
+          // pufUnsafe: whoever wrote a link can name the key of their own
+          // server, which must not spare the user the question about it
+          if (!Unsafe)
+          {
+            Data.HostKey = SessionData::UrlHostKeys(DecodeUrlChars(ConnectionParam));
+            Data.HostKeyFromUrl = true;
+          }
         }
         else if (ConnectionParamName.startsWith(UrlRawSettingsParamNamePrefix, Qt::CaseInsensitive))
         {
           QString AName = DecodeUrlChars(ConnectionParamName.mid(UrlRawSettingsParamNamePrefix.size()));
-          RawSettings.append(AName + QLatin1Char('=') + DecodeUrlChars(ConnectionParam));
+          // pufUnsafe: silent, as a warning would help the attacker
+          if (!Unsafe || SessionData::IsUrlSetting(AName))
+          {
+            RawSettings.append(AName + QLatin1Char('=') + DecodeUrlChars(ConnectionParam));
+          }
         }
       }
       if (!RawSettings.isEmpty())
       {
-        ApplySessionRawSettings(Data, Extras, RawSettings);
+        ReadRawExtras(Extras, RawSettings);
+        Data.ApplyUrlSettings(RawSettings);
       }
 
       bool HasPassword = UserInfo.contains(QLatin1Char(':'));
@@ -396,6 +404,8 @@ void ParseSessionUrl(const QString & AUrl, Options * Opts, const StoredSessionLi
     if (!ARemoteDirectory.isEmpty() && (ARemoteDirectory != QStringLiteral("/")))
     {
       Data.RemoteDirectory = DecodeUrlChars(ARemoteDirectory);
+      // Is already true for ad-hoc URL, but we want to error even for "storedsite/path/"-style URL.
+      Data.RequireDirectories = true;
     }
   }
   else
@@ -457,6 +467,7 @@ void ParseSessionUrl(const QString & AUrl, Options * Opts, const StoredSessionLi
     {
       // SSH host key or TLS certificate fingerprint(s), ';'-separated
       Data.HostKey = Value;
+      Data.HostKeyFromUrl = false;
     }
     QStringList FtpRawSettings;
     if (Opts->FindSwitch(QStringLiteral("passive")))

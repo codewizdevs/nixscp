@@ -25,6 +25,7 @@
 //   NIXSCP_TEST_SSH_PORT     an SSH server (SFTP server detection)
 #include "core/Configuration.h"
 #include "core/FtpFileSystem.h"
+#include "core/SessionLog.h"
 #include "core/IniStorage.h"
 #include "core/Terminal.h"
 
@@ -33,6 +34,7 @@
 #include <QDir>
 #include <QEventLoop>
 #include <QFile>
+#include <QScopeGuard>
 #include <QFileInfo>
 #include <QMutex>
 #include <QRandomGenerator>
@@ -727,6 +729,25 @@ static void TestFtpProxyLogonTypes(Env & E)
     "USER test@ftp.target.test fwuser|PASS ****|ACCT fwpass",
     "USER test@fwuser@ftp.target.test|PASS ****",
   };
+  // S12: the firewall password goes as ACCT in one of the sequences
+  QTemporaryDir LogDir;
+  SessionLogOptions LogOptions;
+  LogOptions.Logging = true;
+  LogOptions.FileName = LogDir.filePath(QStringLiteral("logon.log"));
+  LogOptions.Append = false;
+  auto LogonLog = std::make_shared<SessionLog>(LogOptions);
+  CHECK(LogonLog->Open());
+  SessionLog::SetProcessLog(LogonLog);
+  auto LogGuard = qScopeGuard([&]()
+  {
+    SessionLog::SetProcessLog(nullptr);
+    QFile File(LogOptions.FileName);
+    CHECK(File.open(QIODevice::ReadOnly));
+    QByteArray Text = File.readAll();
+    // (the test server echoes the logon back as "211-ACCT fwpass")
+    CHECK_MSG(Text.contains(" ACCT ******\n"), QString::fromUtf8(Text));
+    CHECK_MSG(!Text.contains(" ACCT fwpass"), QString::fromUtf8(Text));
+  });
   for (int Type = 1; Type <= 8; Type++)
   {
     std::printf("[FTP proxy logon type %d]\n", Type);

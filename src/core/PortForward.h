@@ -2,8 +2,10 @@
 // port> and forwards each connection through an SSH channel of the site to
 // <host>:<port> as seen from the server (ssh -L). One SSH connection per
 // tunnel, run on its own thread; the credentials stay in this process.
-// Saved forwards of a site: SessionData::PortForwards, one per line
-// "name|local port|host|port".
+// All sockets and the session are non-blocking in that thread: a client or
+// channel that does not move stalls only itself, Stop always works, and idle
+// tunnels send keepalives. Saved forwards of a site: SessionData::PortForwards, one per line
+// "name|local port|host|port" (with %, | and new lines of the name and host %-escaped).
 #pragma once
 
 #include "core/SessionData.h"

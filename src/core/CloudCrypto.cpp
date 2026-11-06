@@ -1,4 +1,5 @@
 #include "core/CloudCrypto.h"
+#include "core/Security.h"
 
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -10,10 +11,18 @@
 #include <openssl/kdf.h>
 #include <openssl/rand.h>
 
+#include <cmath>
+
 namespace CloudCrypto
 {
 
 static const QByteArray Magic("NXS1");
+// Packed plaintext: a block inflates to at most this, and its deflate data is
+// never larger than the block plus zlib's overhead (a stored block) and Qt's
+// length. So one hostile block inflates to about 1000 times MaxPackedBlock at
+// worst, and is refused right after, instead of the whole snapshot expanding.
+static constexpr int BlockLength = 64 * 1024;
+static constexpr int MaxPackedBlock = BlockLength + BlockLength / 100 + 64;
 static constexpr int NonceLength = 12;
 static constexpr int TagLength = 16;
 static constexpr int SaltLength = 16;
@@ -35,11 +44,7 @@ static void SetError(QString * Error, const QString & Message)
 
 static void Wipe(QByteArray & Data)
 {
-  if (!Data.isEmpty())
-  {
-    OPENSSL_cleanse(Data.data(), static_cast<size_t>(Data.size()));
-  }
-  Data.clear();
+  Security::WipeBytes(Data);
 }
 
 QByteArray RandomBytes(int Length)
@@ -109,7 +114,11 @@ QByteArray DeriveKey(const QString & Password, const KdfParams & Params, QString
 
 QByteArray Seal(const QByteArray & Key, const QByteArray & Plaintext, const QByteArray & Aad)
 {
-  Q_ASSERT(Key.size() == KeyLength);
+  // Never encrypt under whatever an empty key happens to point at
+  if (Key.size() != KeyLength)
+  {
+    qFatal("AES-256-GCM encryption without a key");
+  }
   QByteArray Nonce = RandomBytes(NonceLength);
   QByteArray Result = Nonce;
   Result.resize(NonceLength + Plaintext.size() + TagLength);
@@ -299,6 +308,13 @@ bool WrapDek(SnapshotHeader & Header, const QByteArray & Dek, const QString & Pa
   return true;
 }
 
+void WrapDekForRecovery(SnapshotHeader & Header, const QByteArray & Dek, const QByteArray & RecoveryKey)
+{
+  QByteArray RecoveryKek = RecoveryWrapKey(RecoveryKey);
+  Header.DekRecovery = Seal(RecoveryKek, Dek, WrapAad(Header));
+  Wipe(RecoveryKek);
+}
+
 QByteArray UnwrapDekWithPassword(const SnapshotHeader & Header, const QString & Password, QString * Error)
 {
   QByteArray Kek = DeriveKey(Password, Header.Kdf, Error);
@@ -328,6 +344,181 @@ QByteArray UnwrapDekWithRecoveryKey(const SnapshotHeader & Header, const QByteAr
   bool Ok = Open(RecoveryKek, Header.DekRecovery, WrapAad(Header), Dek);
   Wipe(RecoveryKek);
   return (Ok && (Dek.size() == KeyLength)) ? Dek : QByteArray();
+}
+
+static QByteArray RotationAad(const QString & User, qint64 KeyEpoch)
+{
+  return QByteArrayLiteral("NXS1-ROTATE|") + User.toUtf8() + '|' + QByteArray::number(KeyEpoch);
+}
+
+QByteArray RotationProof(const QByteArray & OldDek, const QString & User, qint64 NewKeyEpoch)
+{
+  return Seal(OldDek, QByteArrayLiteral("rotated"), RotationAad(User, NewKeyEpoch));
+}
+
+bool ProvesRotation(const SnapshotHeader & Header, const QByteArray & OldDek)
+{
+  QByteArray Plaintext;
+  return !Header.Rotated.isEmpty() && Open(OldDek, Header.Rotated, RotationAad(Header.User, Header.KeyEpoch), Plaintext);
+}
+
+QByteArray Ed25519Public(const QByteArray & Private)
+{
+  EVP_PKEY * Key = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nullptr,
+    reinterpret_cast<const unsigned char *>(Private.constData()), static_cast<size_t>(Private.size()));
+  QByteArray Result(KeyLength, '\0');
+  size_t Length = KeyLength;
+  bool Ok = (Key != nullptr) && (EVP_PKEY_get_raw_public_key(Key, reinterpret_cast<unsigned char *>(Result.data()), &Length) == 1);
+  EVP_PKEY_free(Key);
+  return (Ok && (Length == KeyLength)) ? Result : QByteArray();
+}
+
+QByteArray Ed25519Sign(const QByteArray & Private, const QByteArray & Message)
+{
+  EVP_PKEY * Key = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nullptr,
+    reinterpret_cast<const unsigned char *>(Private.constData()), static_cast<size_t>(Private.size()));
+  EVP_MD_CTX * Ctx = EVP_MD_CTX_new();
+  QByteArray Result(64, '\0');
+  size_t Length = 64;
+  bool Ok = (Key != nullptr) && (Ctx != nullptr) && (EVP_DigestSignInit(Ctx, nullptr, nullptr, nullptr, Key) == 1) &&
+    (EVP_DigestSign(Ctx, reinterpret_cast<unsigned char *>(Result.data()), &Length,
+      reinterpret_cast<const unsigned char *>(Message.constData()), static_cast<size_t>(Message.size())) == 1);
+  EVP_MD_CTX_free(Ctx);
+  EVP_PKEY_free(Key);
+  return (Ok && (Length == 64)) ? Result : QByteArray();
+}
+
+//---------------------------------------------------------------------------
+// Password strength
+
+// Tried first by anyone guessing, so each counts as a handful of guesses
+static const char * const CommonWords[] =
+{
+  "password", "passwort", "qwerty", "qwertz", "azerty", "letmein", "welcome", "admin", "login", "nixscp", "secret",
+  "monkey", "dragon", "master", "sunshine", "iloveyou", "football", "baseball", "shadow", "summer", "winter",
+  "spring", "autumn", "trustno", "changeme", "default",
+};
+static const int CommonWordBits = 10;
+// Neighbours here are as guessable as a repeated character
+static const char * const Runs[] =
+{
+  "abcdefghijklmnopqrstuvwxyz", "0123456789", "qwertyuiop", "asdfghjkl", "zxcvbnm",
+};
+
+static bool IsRunStep(QChar Previous, QChar Current)
+{
+  if (Previous == Current)
+  {
+    return true;
+  }
+  for (const char * Run : Runs)
+  {
+    QByteArray Row(Run);
+    qsizetype Index = (Previous.unicode() < 128) ? Row.indexOf(Previous.toLatin1()) : -1;
+    if ((Index >= 0) && (Current.unicode() < 128))
+    {
+      char C = Current.toLatin1();
+      if (((Index + 1 < Row.size()) && (Row[Index + 1] == C)) || ((Index > 0) && (Row[Index - 1] == C)))
+      {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static double PasswordBits(const QString & Password)
+{
+  QString Text = Password.normalized(QString::NormalizationForm_KC);
+  int Pool = 0;
+  bool Lower = false, Upper = false, Digit = false, Symbol = false, Other = false;
+  for (QChar C : Text)
+  {
+    Lower = Lower || ((C >= QLatin1Char('a')) && (C <= QLatin1Char('z')));
+    Upper = Upper || ((C >= QLatin1Char('A')) && (C <= QLatin1Char('Z')));
+    Digit = Digit || ((C >= QLatin1Char('0')) && (C <= QLatin1Char('9')));
+    Other = Other || (C.unicode() >= 128);
+    Symbol = Symbol || ((C.unicode() < 128) && !C.isLetterOrNumber());
+  }
+  Pool = (Lower ? 26 : 0) + (Upper ? 26 : 0) + (Digit ? 10 : 0) + (Symbol ? 33 : 0) + (Other ? 100 : 0);
+  if (Pool == 0)
+  {
+    return 0;
+  }
+  // Common words, also in their usual disguises (one character for one)
+  Text = Text.toLower();
+  QString Plain = Text;
+  static const char Disguises[][2] = {{'@', 'a'}, {'4', 'a'}, {'0', 'o'}, {'1', 'l'}, {'!', 'i'}, {'$', 's'}, {'5', 's'}, {'3', 'e'}, {'7', 't'}};
+  for (const auto & Pair : Disguises)
+  {
+    Plain.replace(QLatin1Char(Pair[0]), QLatin1Char(Pair[1]));
+  }
+  double Bits = 0;
+  for (const char * Word : CommonWords)
+  {
+    QString Find = QString::fromLatin1(Word);
+    qsizetype Index;
+    while ((Index = Plain.indexOf(Find)) >= 0)
+    {
+      Plain.remove(Index, Find.size());
+      Text.remove(Index, Find.size());
+      Bits += CommonWordBits;
+    }
+  }
+  // Repeats and runs add a quarter of a character each
+  double Length = 0;
+  for (qsizetype Index = 0; Index < Text.size(); Index++)
+  {
+    Length += ((Index > 0) && IsRunStep(Text[Index - 1], Text[Index])) ? 0.25 : 1.0;
+  }
+  return Bits + Length * std::log2(static_cast<double>(Pool));
+}
+
+int PasswordScore(const QString & Password)
+{
+  if (Password.size() < MinPasswordLength)
+  {
+    return 0;
+  }
+  double Bits = PasswordBits(Password);
+  return (Bits < 50) ? 0 : ((Bits < 65) ? 1 : ((Bits < 90) ? 2 : 3));
+}
+
+QString PasswordProblem(const QString & Password, const QString & Email)
+{
+  if (Password.size() < MinPasswordLength)
+  {
+    return QStringLiteral("Use at least %1 characters, or let NixSCP generate a passphrase.").arg(MinPasswordLength);
+  }
+  QString Name = Email.section(QLatin1Char('@'), 0, 0);
+  if ((Name.size() >= 4) && Password.contains(Name, Qt::CaseInsensitive))
+  {
+    return QStringLiteral("Do not build the password from your e-mail address.");
+  }
+  if (PasswordScore(Password) == 0)
+  {
+    return QStringLiteral("This password is too easy to guess: avoid common words, repeats and keyboard runs, "
+      "or let NixSCP generate a passphrase.");
+  }
+  return QString();
+}
+
+QString NewPassphrase()
+{
+  // 32 symbols without look-alikes: one byte gives 5 unbiased bits
+  static const char Alphabet[] = "abcdefghjkmnpqrstvwxyz0123456789";
+  QByteArray Random = RandomBytes(30);
+  QString Result;
+  for (qsizetype Index = 0; Index < Random.size(); Index++)
+  {
+    if ((Index > 0) && (Index % 5 == 0))
+    {
+      Result += QLatin1Char('-');
+    }
+    Result += QLatin1Char(Alphabet[static_cast<quint8>(Random[Index]) & 0x1F]);
+  }
+  Wipe(Random);
+  return Result;
 }
 
 static QByteArray HeaderJson(const SnapshotHeader & Header)
@@ -361,7 +552,82 @@ static QByteArray HeaderJson(const SnapshotHeader & Header)
   {
     Json.insert(QStringLiteral("dek_rec"), QString::fromLatin1(Header.DekRecovery.toBase64()));
   }
+  Json.insert(QStringLiteral("key_epoch"), Header.KeyEpoch);
+  Json.insert(QStringLiteral("wrap_epoch"), Header.WrapEpoch);
+  if (!Header.Rotated.isEmpty())
+  {
+    Json.insert(QStringLiteral("rotated"), QString::fromLatin1(Header.Rotated.toBase64()));
+  }
+  if (!Header.Role.isEmpty())
+  {
+    Json.insert(QStringLiteral("role"), Header.Role);
+  }
+  if (!Header.ConfigName.isEmpty())
+  {
+    Json.insert(QStringLiteral("config"), Header.ConfigName);
+  }
+  if (Header.PrevVersion > 0)
+  {
+    Json.insert(QStringLiteral("prev_version"), Header.PrevVersion);
+    Json.insert(QStringLiteral("prev_sha256"), Header.PrevHash);
+  }
   return QJsonDocument(Json).toJson(QJsonDocument::Compact);
+}
+
+QByteArray Pack(const QByteArray & Plaintext)
+{
+  char Number[4];
+  qToBigEndian<quint32>(static_cast<quint32>(Plaintext.size()), Number);
+  QByteArray Result(Number, 4);
+  for (qsizetype Offset = 0; Offset < Plaintext.size(); Offset += BlockLength)
+  {
+    qsizetype Length = qMin<qsizetype>(BlockLength, Plaintext.size() - Offset);
+    QByteArray Block = qCompress(reinterpret_cast<const uchar *>(Plaintext.constData()) + Offset, Length, 9);
+    qToBigEndian<quint32>(static_cast<quint32>(Block.size()), Number);
+    Result.append(Number, 4);
+    Result.append(Block);
+  }
+  return Result;
+}
+
+bool Unpack(const QByteArray & Packed, QByteArray & Plaintext)
+{
+  Plaintext.clear();
+  if (Packed.size() < 4)
+  {
+    return false;
+  }
+  quint32 Total = qFromBigEndian<quint32>(Packed.constData());
+  if (Total > static_cast<quint32>(MaxPlaintextLength))
+  {
+    return false;
+  }
+  Plaintext.reserve(Total);
+  qsizetype Offset = 4;
+  while (Offset < Packed.size())
+  {
+    if (Packed.size() - Offset < 8)
+    {
+      return false;
+    }
+    quint32 Size = qFromBigEndian<quint32>(Packed.constData() + Offset);
+    Offset += 4;
+    // qCompress starts a block with its length, which qUncompress sizes its
+    // buffer from: 4 GiB unless it is checked here
+    quint32 Length = qFromBigEndian<quint32>(Packed.constData() + Offset);
+    if ((Size < 4) || (Size > MaxPackedBlock) || (Size > Packed.size() - Offset) || (Length == 0) || (Length > BlockLength))
+    {
+      return false;
+    }
+    QByteArray Block = qUncompress(reinterpret_cast<const uchar *>(Packed.constData()) + Offset, Size);
+    if ((Block.size() != Length) || (Plaintext.size() + Block.size() > Total))
+    {
+      return false;
+    }
+    Plaintext.append(Block);
+    Offset += Size;
+  }
+  return Plaintext.size() == Total;
 }
 
 QByteArray EncodeSnapshot(const SnapshotHeader & Header, const QByteArray & Dek, const QByteArray & Plaintext)
@@ -372,7 +638,7 @@ QByteArray EncodeSnapshot(const SnapshotHeader & Header, const QByteArray & Dek,
   qToLittleEndian<quint32>(static_cast<quint32>(Json.size()), Length);
   Prefix.append(Length, 4);
   Prefix.append(Json);
-  return Prefix + Seal(Dek, qCompress(Plaintext, 9), Prefix);
+  return Prefix + Seal(Dek, Pack(Plaintext), Prefix);
 }
 
 // Splits the snapshot; Prefix = magic || length || header (the AAD)
@@ -405,13 +671,12 @@ bool ReadHeader(const QByteArray & Snapshot, SnapshotHeader & Header, QString * 
   QJsonObject Obj = QJsonDocument::fromJson(Json).object();
   QJsonObject Kdf = Obj.value(QStringLiteral("kdf")).toObject();
   bool Team = (Obj.value(QStringLiteral("slot")).toString() == QStringLiteral("team"));
-  if ((Obj.value(QStringLiteral("fmt")).toInt() != 1) || (!Team && (Kdf.value(QStringLiteral("alg")).toString() != QStringLiteral("argon2id"))))
+  if ((Obj.value(QStringLiteral("fmt")).toInt() != SnapshotFormat) || (!Team && (Kdf.value(QStringLiteral("alg")).toString() != QStringLiteral("argon2id"))))
   {
-    SetError(Error, QStringLiteral("The sync snapshot was made by a newer version of NixSCP."));
+    SetError(Error, QStringLiteral("The sync snapshot was made by another version of NixSCP."));
     return false;
   }
   Header = SnapshotHeader();
-  Header.Format = 1;
   Header.Slot = Obj.value(QStringLiteral("slot")).toString();
   Header.User = Obj.value(QStringLiteral("user")).toString();
   Header.Version = Obj.value(QStringLiteral("version")).toInteger();
@@ -423,8 +688,26 @@ bool ReadHeader(const QByteArray & Snapshot, SnapshotHeader & Header, QString * 
   Header.DekPassword = QByteArray::fromBase64(Obj.value(QStringLiteral("dek_pw")).toString().toLatin1());
   Header.DekRecovery = QByteArray::fromBase64(Obj.value(QStringLiteral("dek_rec")).toString().toLatin1());
   Header.Device = Obj.value(QStringLiteral("device")).toString();
+  Header.Role = Obj.value(QStringLiteral("role")).toString();
+  Header.ConfigName = Obj.value(QStringLiteral("config")).toString();
+  Header.KeyEpoch = Obj.value(QStringLiteral("key_epoch")).toInteger();
+  Header.WrapEpoch = Obj.value(QStringLiteral("wrap_epoch")).toInteger();
+  Header.Rotated = QByteArray::fromBase64(Obj.value(QStringLiteral("rotated")).toString().toLatin1());
+  Header.PrevVersion = Obj.value(QStringLiteral("prev_version")).toInteger();
+  Header.PrevHash = Obj.value(QStringLiteral("prev_sha256")).toString();
   Header.KeyVersion = Obj.value(QStringLiteral("key_version")).toInteger();
   return true;
+}
+
+bool IsOldFormat(const QByteArray & Snapshot)
+{
+  QByteArray Prefix, Json, Sealed;
+  if (!Split(Snapshot, Prefix, Json, Sealed, nullptr))
+  {
+    return false;
+  }
+  int Format = QJsonDocument::fromJson(Json).object().value(QStringLiteral("fmt")).toInt();
+  return (Format > 0) && (Format < SnapshotFormat);
 }
 
 bool DecodeSnapshot(const QByteArray & Snapshot, const QByteArray & Dek, SnapshotHeader & Header,
@@ -435,16 +718,16 @@ bool DecodeSnapshot(const QByteArray & Snapshot, const QByteArray & Dek, Snapsho
   {
     return false;
   }
-  QByteArray Compressed;
-  if (!Open(Dek, Sealed, Prefix, Compressed))
+  QByteArray Packed;
+  if (!Open(Dek, Sealed, Prefix, Packed))
   {
     SetError(Error, QStringLiteral("The sync snapshot cannot be decrypted: the data key does not match or the data was modified."));
     return false;
   }
-  Plaintext = qUncompress(Compressed);
-  if (Plaintext.isEmpty() && !Compressed.isEmpty() && (Compressed.size() > 4) && (qFromBigEndian<quint32>(Compressed.constData()) != 0))
+  if (!Unpack(Packed, Plaintext))
   {
-    SetError(Error, QStringLiteral("The sync snapshot is damaged."));
+    Plaintext.clear();
+    SetError(Error, QStringLiteral("The sync snapshot is damaged or too large."));
     return false;
   }
   return true;

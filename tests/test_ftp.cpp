@@ -17,6 +17,8 @@
 #include "core/Terminal.h"
 #include "core/Configuration.h"
 #include "core/FtpFileSystem.h"
+#include "core/SessionLog.h"
+#include "core/Synchronize.h"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -29,6 +31,7 @@
 #include <QPointer>
 #include <QRandomGenerator>
 #include <QStandardPaths>
+#include <QSslSocket>
 #include <QTemporaryDir>
 #include <QTimer>
 
@@ -756,6 +759,17 @@ int main(int argc, char ** argv)
     R = DoList(T, T.CurrentDirectory());
     CHECK_MSG(R.Ok, Describe(R));
   }
+  std::printf("[tunnel with a protocol that has none]\n");
+  {
+    // connecting directly, past the tunnel of the site, is no way out
+    UI.Reset();
+    SessionData Tunneled = Data;
+    Tunneled.Tunnel = true;
+    Tunneled.TunnelHostName = QStringLiteral("127.0.0.1");
+    Terminal T(Tunneled, &UI);
+    OperationResult R = DoOpen(T);
+    CHECK_MSG(!R.Ok && R.Message.contains(QStringLiteral("SSH tunnel")), Describe(R));
+  }
   std::printf("[connection refused]\n");
   {
     UI.Reset();
@@ -776,12 +790,99 @@ int main(int argc, char ** argv)
     RunSuite(Active, QStringLiteral("active"), C, false);
   }
 
+  std::printf("[ProtocolFeatures]\n");
+  {
+    auto Features = [&](const QString & Override)
+    {
+      SessionData D = Data;
+      D.ProtocolFeatures = Override;
+      UI.Reset();
+      Terminal T(D, &UI);
+      OperationResult R = DoOpen(T);
+      CHECK_MSG(R.Ok, Describe(R));
+      CHECK_MSG(DoList(T, T.CurrentDirectory()).Ok, Override);
+      return T.ServerInfo();
+    };
+    QString Plain = Features(QString());
+    CHECK_MSG(Plain.contains(QStringLiteral("MDTM")), Plain);
+    QString Removed = Features(QStringLiteral("-MDTM, +XFOO"));
+    CHECK_MSG(!Removed.contains(QStringLiteral("MDTM")) && Removed.contains(QStringLiteral("XFOO")), Removed);
+    QString Replaced = Features(QStringLiteral("*XFOO, \"XBAR a,b\""));
+    CHECK_MSG(!Replaced.contains(QStringLiteral("MDTM")) && Replaced.contains(QStringLiteral("XFOO, XBAR a,b")), Replaced);
+  }
+
   QByteArray ListPort = qgetenv("NIXSCP_TEST_FTP_LIST_PORT");
   if (!ListPort.isEmpty())
   {
     SessionData List = Data;
     List.PortNumber = ListPort.toInt();
     RunSuite(List, QStringLiteral("list"), C, true);
+
+    std::printf("[LIST: timestamp precision]\n");
+    if (!C.Root.isEmpty())
+    {
+      // an old server shows minutes at best: the seconds of the local file
+      // must not make it look newer, in a session that did not upload it
+      QString Local = Scratch.filePath(QStringLiteral("precision"));
+      QDir().mkpath(Local);
+      qint64 Stamp = QDateTime(QDate::currentDate().addDays(-20), QTime(12, 34, 56)).toSecsSinceEpoch();
+      QString File = Local + QStringLiteral("/same.txt");
+      WriteFile(File, "version 1", Stamp);
+      QString Base = QStringLiteral("/nixscp-precision-%1").arg(getpid());
+      QString Remote = QDir(C.Root).filePath(Base.mid(1));
+      QDir().mkpath(Remote);
+      {
+        UI.Reset();
+        Terminal T(List, &UI);
+        CHECK_MSG(DoOpen(T).Ok, QStringLiteral("open"));
+        Waiter W;
+        CopyParam Upload;
+        T.CopyToRemote({File}, Base, Upload, false, W.Cb());
+        CHECK_MSG(W.Wait().Ok, Describe(W.Result));
+      }
+      WriteFile(File, "version 2", Stamp);
+      UI.Reset();
+      Terminal T(List, &UI);
+      CHECK_MSG(DoOpen(T).Ok, QStringLiteral("open"));
+      RemoteFileList Files;
+      OperationResult R = DoList(T, Base, &Files);
+      CHECK_MSG(R.Ok, Describe(R));
+      const RemoteFile * Listed = Find(Files, QStringLiteral("same.txt"));
+      CHECK(Listed != nullptr);
+      CHECK((Listed != nullptr) && (Listed->ModificationFmt != mfFull));
+      Waiter W;
+      CopyParam Newer;
+      Newer.NewerOnly = true;
+      T.CopyToRemote({File}, Base, Newer, false, W.Cb());
+      R = W.Wait();
+      CHECK_MSG(R.Ok, Describe(R));
+      QFile Written(Remote + QStringLiteral("/same.txt"));
+      CHECK(Written.open(QIODevice::ReadOnly) && (Written.readAll() == "version 1"));
+      // a minute later it is newer, for real
+      WriteFile(File, "version 3", Stamp + 60);
+      Waiter W2;
+      T.CopyToRemote({File}, Base, Newer, false, W2.Cb());
+      R = W2.Wait();
+      CHECK_MSG(R.Ok, Describe(R));
+      Written.close();
+      CHECK(Written.open(QIODevice::ReadOnly) && (Written.readAll() == "version 3"));
+      // Synchronize: nothing to do for a file of the same minute
+      WriteFile(File, "version 4", Stamp + 60 - 30);
+      Waiter W3;
+      SynchronizeChecklistPtr Checklist;
+      auto Status = std::make_shared<SynchronizeStatus>();
+      SynchronizeCollect(&T, Local, Base, smRemote, CopyParam(), spDefault | spNoConfirmation, SynchronizeOptions(), Status,
+        [&](const OperationResult & Result, SynchronizeChecklistPtr List2)
+        {
+          Checklist = List2;
+          W3.Cb()(Result);
+        });
+      R = W3.Wait();
+      CHECK_MSG(R.Ok, Describe(R));
+      int Index = 0;
+      const SynchronizeChecklist::Item * Item = nullptr;
+      CHECK(Checklist && !Checklist->GetNextChecked(Index, Item));
+    }
   }
 
   QByteArray FtpsPort = qgetenv("NIXSCP_TEST_FTPS_PORT");
@@ -801,7 +902,9 @@ int main(int argc, char ** argv)
       QString Query = UI.Queries.value(0);
       CHECK(Query.contains(QStringLiteral("The server's certificate is not known")));
       CHECK(Query.contains(QStringLiteral("SHA-256: ")));
-      CHECK(Query.contains(QStringLiteral("Self-signed certificate.")));
+      // Secure Transport, what Qt takes on macOS without libssl (not in the app), tells less
+      CHECK(Query.contains((QSslSocket::activeBackend() == QStringLiteral("securetransport")) ?
+        QStringLiteral("Certificate not trusted.") : QStringLiteral("Self-signed certificate.")));
       CHECK(Query.contains(QStringLiteral("When connecting using an IP address")));
       CHECK((Query.contains(QStringLiteral("NixSCP Test")) || Query.contains(QStringLiteral("LinSCP Test"))));
     }
@@ -830,6 +933,41 @@ int main(int argc, char ** argv)
       CHECK(UI.Queries.isEmpty());
     }
     RunSuite(Ftps, QStringLiteral("explicit"), C, true);
+
+    std::printf("[CompleteTlsShutdown]\n");
+    {
+      QString LogFile = Scratch.filePath(QStringLiteral("tls.log"));
+      SessionLogOptions Options;
+      Options.Logging = true;
+      Options.FileName = LogFile;
+      Options.Append = false;
+      auto SessionLogFile = std::make_shared<SessionLog>(Options);
+      CHECK(SessionLogFile->Open());
+      SessionLog::SetProcessLog(SessionLogFile);
+      QString File = Scratch.filePath(QStringLiteral("tls.txt"));
+      WriteFile(File, QByteArray(10000, 't'), 1600000000);
+      for (TAutoSwitch Value : {asOff, asOn})
+      {
+        SessionData D = Ftps;
+        D.CompleteTlsShutdown = Value;
+        UI.Reset();
+        UI.QueryAnswers = {qaNo};
+        Terminal T(D, &UI);
+        CHECK_MSG(DoOpen(T).Ok, QStringLiteral("open"));
+        Waiter W;
+        CopyParam Param;
+        Param.ConfirmOverwriting = false;
+        T.CopyToRemote({File}, T.CurrentDirectory(), Param, false, W.Cb());
+        CHECK_MSG(W.Wait().Ok, Describe(W.Result));
+        Waiter W2;
+        T.DeleteFiles({UnixPath::Combine(T.CurrentDirectory(), QStringLiteral("tls.txt"))}, W2.Cb());
+        W2.Wait();
+        QFile Log(LogFile);
+        CHECK(Log.open(QIODevice::ReadOnly));
+        CHECK_MSG(Log.readAll().count("Not waiting for complete TLS shutdown") == 1, QStringLiteral("once, with the setting off"));
+      }
+      SessionLog::SetProcessLog(nullptr);
+    }
   }
 
   QByteArray ImplicitPort = qgetenv("NIXSCP_TEST_FTPS_IMPLICIT_PORT");

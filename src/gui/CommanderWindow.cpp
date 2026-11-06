@@ -68,6 +68,7 @@
 #include <QPainter>
 #include <QPointer>
 #include <QPushButton>
+#include <QScopedValueRollback>
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QStatusBar>
@@ -314,8 +315,8 @@ CommanderWindow::CommanderWindow(QWidget * Parent) :
       return S;
     }
     S.Term = Panel->IsRemote() ? Tab->Term : nullptr;
-    QList<RemoteFile> Files = Panel->SelectedFiles();
-    QStringList Paths = Panel->SelectedPaths();
+    QList<RemoteFile> Files = Panel->SelectedFiles(FOnFocused);
+    QStringList Paths = Panel->SelectedPaths(FOnFocused);
     for (int I = 0; (I < Files.size()) && (I < Paths.size()); I++)
     {
       if (!Files[I].IsDirectory)
@@ -331,6 +332,11 @@ CommanderWindow::CommanderWindow(QWidget * Parent) :
     return (Tab != nullptr) ? Tab->Queue : nullptr;
   };
   FEditorManager->SetHooks(H);
+
+  FBackgroundConnectTimer = new QTimer(this);
+  FBackgroundConnectTimer->setSingleShot(true);
+  FBackgroundConnectTimer->setInterval(3000);
+  connect(FBackgroundConnectTimer, &QTimer::timeout, this, &CommanderWindow::ConnectNextInBackground);
 
   CreateActions();
   ConnectActions();
@@ -512,16 +518,23 @@ SessionTab * CommanderWindow::CreateTab(int Index, bool LocalBrowser, const QStr
         return;
       }
       FilePanel * Other = (Panel == Tab->LocalPanel) ? Tab->RemotePanel : Tab->LocalPanel;
+      // TCustomScpExplorerForm::DoDirViewExecFile: OnFocused
       if (Tab->LocalBrowser)
       {
-        LocalLocalCopy(Panel == Tab->RemotePanel, false);
+        QScopedValueRollback<bool> OnFocused(FOnFocused, true);
+        LocalLocalCopy(Panel == Tab->RemotePanel, false, NoConfirmation);
       }
       else if (Connected(Tab))
       {
-        TransferFiles({FullPath}, Panel->IsRemote(), Other->CurrentDirectory(), false, !NoConfirmation);
+        TransferFiles(Panel->SelectedPaths(true), Panel->IsRemote(), Other->CurrentDirectory(), false, !NoConfirmation);
       }
     });
-    connect(Panel, &FilePanel::PropertiesRequested, this, [this, Panel]() { Properties(Panel); });
+    // RemoteDirViewDisplayProperties: Alt+Enter, Alt+double-click (CreateFileList(True, ...))
+    connect(Panel, &FilePanel::PropertiesRequested, this, [this, Panel]()
+    {
+      QScopedValueRollback<bool> OnFocused(FOnFocused, true);
+      Properties(Panel);
+    });
     connect(Panel, &FilePanel::RenameRequested, this, [this, Panel](const QString & OldPath, const QString & NewName)
     {
       RenameFile(Panel, OldPath, NewName);
@@ -545,6 +558,8 @@ SessionTab * CommanderWindow::CreateTab(int Index, bool LocalBrowser, const QStr
       ShowErrorMessage(this, Error, More);
     });
     connect(Panel, &FilePanel::NewSessionRequested, this, &CommanderWindow::NewSession);
+    connect(Panel, &FilePanel::ReconnectRequested, this, [this]() { FA->Get(QStringLiteral("ReconnectSessionAction"))->trigger(); });
+    connect(Panel, &FilePanel::CalculateDirectorySizesRequested, this, [this, Panel]() { CalculateDirectorySizes(Panel); });
     connect(Panel, &FilePanel::FilterRequested, this, [this, Panel]() { Filter(Panel); });
     connect(Panel, &FilePanel::ToggleHiddenFilesRequested, this, &CommanderWindow::ToggleShowHiddenFiles);
     connect(Panel, &FilePanel::ContextMenuRequested, this, [this, Panel](const QPoint & GlobalPos, bool OnItem)
@@ -565,7 +580,7 @@ SessionTab * CommanderWindow::CreateTab(int Index, bool LocalBrowser, const QStr
   {
     if (!Connected(Tab)) return nullptr;
     qint64 Size = 0;
-    for (const RemoteFile & F : Tab->RemotePanel->SelectedFiles())
+    for (const RemoteFile & F : Tab->RemotePanel->FilesOfPaths(Paths))
     {
       if (F.IsDirectory)
       {
@@ -750,10 +765,15 @@ void CommanderWindow::ActivateTab(SessionTab * Tab)
   {
     return;
   }
+  SessionTab * Previous = CurrentTab();
   FUpdatingTabs = true;
   Pages->setCurrentIndex(Index);
   SessionTabs->setCurrentIndex(Index);
   FUpdatingTabs = false;
+  if (Previous != Tab)
+  {
+    SessionChanged(Previous, Tab);
+  }
   Tab->LocalPanel->SetActive(Tab->LastActivePanel == Tab->LocalPanel);
   Tab->RemotePanel->SetActive(Tab->LastActivePanel == Tab->RemotePanel);
   Tab->LastActivePanel->FocusView();
@@ -763,6 +783,44 @@ void CommanderWindow::ActivateTab(SessionTab * Tab)
   UpdateStatusBar();
   UpdateActions();
   UpdateTitle();
+  // TTerminalManager::DoSetActiveSession: ConnectActiveTerminal
+  if (Tab->ConnectOnActivate && !Tab->Connecting && !Connected(Tab))
+  {
+    ConnectTab(Tab, Tab->Data);
+  }
+}
+
+void CommanderWindow::SessionChanged(SessionTab * Previous, SessionTab * Tab)
+{
+  const Configuration & Config = Configuration::Instance();
+  if (Previous->DisconnectedTemporarily)
+  {
+    Previous->DisconnectedTemporarily = false;
+    Previous->ConnectOnActivate = !Previous->Data.HostName.isEmpty();
+  }
+  // Each tab has panels of its own, so unlike in WinSCP they keep all their
+  // state by themselves. These options ask for the opposite.
+  if (!Config.PreservePanelState)
+  {
+    Tab->LocalPanel->ResetState(Previous->LocalPanel);
+    Tab->RemotePanel->ResetState(Tab->RemotePanel->IsRemote() == Previous->RemotePanel->IsRemote() ? Previous->RemotePanel : nullptr);
+  }
+  if (Config.PreserveLocalDirectory && !Tab->LocalBrowser)
+  {
+    QString Directory = Previous->LocalPanel->CurrentDirectory();
+    if (!Directory.isEmpty() && (Directory != Tab->LocalPanel->CurrentDirectory()))
+    {
+      Tab->LocalPanel->ChangeDirectory(Directory);
+    }
+  }
+}
+
+void CommanderWindow::UpdateDisconnectedPanel(SessionTab * Tab)
+{
+  if (!Tab->LocalBrowser)
+  {
+    Tab->RemotePanel->SetDisconnected(!Tab->Data.HostName.isEmpty() && !Tab->Connecting && !Connected(Tab), Tab->DisconnectMessage);
+  }
 }
 
 bool CommanderWindow::CanCloseQueue(SessionTab * Tab)
@@ -1156,6 +1214,13 @@ bool CommanderWindow::eventFilter(QObject * Object, QEvent * Event)
     FExecutedByShortcut = true;
     QTimer::singleShot(0, this, [this]() { FExecutedByShortcut = false; });
   }
+  else if ((Event->type() == QEvent::MouseButtonDblClick) &&
+    ((Object == StatusSecureLabel) || (Object == StatusProtocolLabel) || (Object == StatusDurationLabel)))
+  {
+    // StatusBarPanelDblClick: the session panels open Server/Protocol Information
+    ShowServerInfo();
+    return true;
+  }
   else if ((Event->type() == QEvent::MouseButtonDblClick) && (QueueSplitter->count() > 1) && (Object == QueueSplitter->handle(1)))
   {
     // Double click on the queue splitter: ToggleQueueVisibility
@@ -1202,6 +1267,10 @@ void CommanderWindow::CreateStatusBar()
   statusBar()->addPermanentWidget(StatusSecureLabel);
   statusBar()->addPermanentWidget(StatusProtocolLabel);
   statusBar()->addPermanentWidget(StatusDurationLabel);
+  for (QLabel * Label : {StatusSecureLabel, StatusProtocolLabel, StatusDurationLabel})
+  {
+    Label->installEventFilter(this);
+  }
   DurationTimer = new QTimer(this);
   DurationTimer->setInterval(1000);
   connect(DurationTimer, &QTimer::timeout, this, &CommanderWindow::UpdateStatusBar);
@@ -1415,6 +1484,11 @@ void CommanderWindow::NewSession()
 
 void CommanderWindow::OpenSession(const SessionData & Data)
 {
+  if (!Data.CanLogin() && Data.IsLocalBrowser())
+  {
+    NewLocalTab(Data.LocalDirectory, Data.OtherLocalDirectory);
+    return;
+  }
   // Reuse current tab if it has no session, otherwise open a new tab (as WinSCP)
   SessionTab * Tab = CurrentTab();
   // Reconnecting the session of this tab: reuse the password typed before
@@ -1436,24 +1510,37 @@ void CommanderWindow::OpenSession(const SessionData & Data)
       CloseTab(Implicit, false);
     }
   }
-  else if ((Tab->Term != nullptr) || Tab->Connecting)
+  else if ((Tab->Term != nullptr) || Tab->Connecting || (Tab->Permanent && !SameSessionTarget(Tab->Data, Data)))
   {
-    if (!Connected(Tab) && !Tab->Connecting)
+    if ((Tab->Term != nullptr) && !Connected(Tab) && !Tab->Connecting)
     {
       // Disconnected tab (e.g. reconnect): reuse it
       DisconnectTab(Tab);
     }
     else
     {
+      // (a tab of a workspace keeps its session, connected or not)
       Tab = CreateTab(TabIndex(CurrentTab()) + 1);
     }
   }
+  // ConnectTab follows, not the activating
+  Tab->ConnectOnActivate = false;
   ActivateTab(Tab);
+  ConnectTab(Tab, Data, RememberedPassword);
+}
 
+void CommanderWindow::ConnectTab(SessionTab * Tab, const SessionData & Data, const QString & RememberedPassword)
+{
+  Tab->ConnectOnActivate = false;
+  Tab->ConnectInBackground = false;
+  Tab->DisconnectedTemporarily = false;
+  Tab->DisconnectMessage.clear();
+  Tab->OperationLost = false;
   Tab->Data = Data;
   Tab->Color = Data.Color;
   Tab->SynchronizeBrowsing = Data.SynchronizeBrowsing;
   Tab->Connecting = true;
+  UpdateDisconnectedPanel(Tab);
   FUI->TakeLastPassword();
   Terminal * Term = new Terminal(Data, FUI, this);
   // Preferences: Endurance (automatic reconnect), Continue on error, remembering passwords
@@ -1494,8 +1581,35 @@ void CommanderWindow::OpenSession(const SessionData & Data)
     SessionTab * Tab = TabOfTerminal(Term);
     if (Tab == nullptr) return;
     bool Declined = Term->ReopenDeclined();
+    const Configuration & Config = Configuration::Instance();
+    // TerminalManager, WhileIdle: no running operation has reported the loss
+    bool Silent = Config.SessionSilentDisconnect && !Tab->OperationLost;
+    Tab->OperationLost = false;
+    if (Silent && (Tab == CurrentTab()))
+    {
+      Tab->DisconnectMessage = Message;
+    }
     SessionClosed(Tab);
-    if (Tab == CurrentTab())
+    if (Silent && (Tab == CurrentTab()))
+    {
+      // UserInterface.cpp ShowExtendedExceptionEx, SessionSilentDisconnect: no
+      // message box, the message stays in the panel with Reconnect, which counts
+      // down to reconnecting (InitiateReconnectTimeout)
+      qint64 ReopenStart = Tab->Page->property(ReopenStartProperty).toLongLong();
+      bool WithinTimeout = (Config.SessionReopenTimeout <= 0) || (ReopenStart == 0) ||
+        (QDateTime::currentMSecsSinceEpoch() - ReopenStart < Config.SessionReopenTimeout);
+      if (WithinTimeout && Config.SessionReopenAutoIdleOn && !Declined)
+      {
+        QTimer::singleShot(Config.SessionReopenAutoIdle, this, [this, Tab]()
+        {
+          if (FTabs.contains(Tab) && (Tab == CurrentTab()) && !Connected(Tab) && !Tab->Connecting && !Tab->DisconnectMessage.isEmpty())
+          {
+            OpenSession(BeginReconnect(*Tab));
+          }
+        });
+      }
+    }
+    else if (Tab == CurrentTab())
     {
       QueryReconnect(Tab, Message, More, Declined);
     }
@@ -1539,6 +1653,7 @@ void CommanderWindow::OpenSession(const SessionData & Data)
       Tab->Connecting = false;
       Term->Close();
       ShowStatusMessage(statusBar(), QStringLiteral("Aborted"), 3000);
+      UpdateDisconnectedPanel(Tab);
       UpdateTabCaption(Tab);
       UpdateActions();
       UpdateStatusBar();
@@ -1576,16 +1691,25 @@ void CommanderWindow::OpenSession(const SessionData & Data)
       {
         DesktopIntegration::FlashOnBackground(this);
         ShowErrorMessage(this, Result.Message, Result.MoreMessages);
-        if (!Tab->Page->property(EverConnectedProperty).toBool() && FTabs.contains(Tab))
+        // TTerminalManager::NewSessions: "When opening workspace/folder, keep
+        // the sessions open, even if they fail to connect"
+        if (FTabs.contains(Tab) && !Tab->Permanent)
         {
-          // The tab of a session that never opened is freed (and replaced by a
-          // local browser when it was the last one), as WinSCP
-          SessionData Failed = Tab->Data;
-          CloseTab(Tab);
-          Q_UNUSED(Failed);
+          if (!Tab->Page->property(EverConnectedProperty).toBool())
+          {
+            // The tab of a session that never opened is freed (and replaced by a
+            // local browser when it was the last one), as WinSCP
+            SessionData Failed = Tab->Data;
+            CloseTab(Tab);
+            Q_UNUSED(Failed);
+          }
+          // As WinSCP: return to Login dialog after failed connect
+          QTimer::singleShot(0, this, &CommanderWindow::NewSession);
         }
-        // As WinSCP: return to Login dialog after failed connect
-        QTimer::singleShot(0, this, &CommanderWindow::NewSession);
+      }
+      if (FTabs.contains(Tab))
+      {
+        UpdateDisconnectedPanel(Tab);
       }
       UpdateActions();
       UpdateStatusBar();
@@ -1657,10 +1781,17 @@ void CommanderWindow::OpenSession(const SessionData & Data)
     Tab->RemoteProvider->ShowHiddenFiles = Configuration::Instance().ShowHiddenFiles;
     Tab->RemotePanel->SetProvider(Tab->RemoteProvider.get());
     Tab->RemotePanel->ChangeDirectory(Term->CurrentDirectory());
-    if (!Tab->Data.LocalDirectory.isEmpty() && QFileInfo(Tab->Data.LocalDirectory).isDir())
+    // Remote paths of drags are valid in this session only
+    QString SessionId = QStringLiteral("%1/%2").arg(QCoreApplication::applicationPid()).arg(reinterpret_cast<quintptr>(Term));
+    Tab->LocalPanel->SetSessionId(SessionId);
+    Tab->RemotePanel->SetSessionId(SessionId);
+    // TScpCommanderForm::RestoreSessionLocalDirView
+    if (!Tab->Data.LocalDirectory.isEmpty() && QFileInfo(Tab->Data.LocalDirectory).isDir() &&
+        (FFirstTerminal || !Config.PreserveLocalDirectory))
     {
       Tab->LocalPanel->ChangeDirectory(Tab->Data.LocalDirectory);
     }
+    FFirstTerminal = false;
     Tab->SessionTimer.start();
     Tab->LastActivePanel = Tab->RemotePanel;
     UpdateTabCaption(Tab);
@@ -1676,6 +1807,38 @@ void CommanderWindow::OpenSession(const SessionData & Data)
   });
   UpdateActions();
   UpdateStatusBar();
+}
+
+void CommanderWindow::ConnectNextInBackground()
+{
+  // One at a time (FReconnectingInactiveTerminal), and never over a dialog
+  bool Pending = false;
+  bool Connecting = (QApplication::activeModalWidget() != nullptr);
+  for (SessionTab * Tab : std::as_const(FTabs))
+  {
+    Pending = Pending || Tab->ConnectInBackground;
+    Connecting = Connecting || Tab->Connecting;
+  }
+  if (Pending && !Connecting)
+  {
+    for (SessionTab * Tab : std::as_const(FTabs))
+    {
+      if (Tab->ConnectInBackground)
+      {
+        ConnectTab(Tab, Tab->Data);
+        break;
+      }
+    }
+    Pending = false;
+    for (SessionTab * Tab : std::as_const(FTabs))
+    {
+      Pending = Pending || Tab->ConnectInBackground;
+    }
+  }
+  if (Pending)
+  {
+    FBackgroundConnectTimer->start();
+  }
 }
 
 void CommanderWindow::SessionClosed(SessionTab * Tab)
@@ -1712,10 +1875,13 @@ void CommanderWindow::SessionClosed(SessionTab * Tab)
     Tab->Term = nullptr;
   }
   Tab->OperationRunning = false;
+  Tab->LocalPanel->SetSessionId(QString());
+  Tab->RemotePanel->SetSessionId(QString());
   if (Tab->LastActivePanel == Tab->RemotePanel)
   {
     Tab->LastActivePanel = Tab->LocalPanel;
   }
+  UpdateDisconnectedPanel(Tab);
   UpdateTabCaption(Tab);
   if (Tab == CurrentTab())
   {
@@ -1761,7 +1927,7 @@ void CommanderWindow::SaveCurrentSession()
   }
   auto Data = std::make_shared<SessionData>(Tab->Data);
   Data->Name = Name;
-  Data->Password.clear();
+  Workspaces::ClearSessionPasswords(*Data);
   Data->RemoteDirectory = Tab->RemotePanel->CurrentDirectory();
   // TScpCommanderForm::UpdateSessionData: the state of the Commander
   Data->LocalDirectory = Tab->LocalPanel->CurrentDirectory();
@@ -2011,6 +2177,7 @@ void CommanderWindow::RunWithProgress(const std::function<void(std::function<voi
       return;
     }
     Tab->OperationRunning = false;
+    Tab->OperationLost = Result.Fatal;
     UpdateTitle();
     if (MoveToQueueNow && Connected(Tab))
     {
@@ -2186,7 +2353,7 @@ void CommanderWindow::CopyFiles(bool Remote, bool Move, int QueueMode)
   }
   FilePanel * Source = SidePanel(Remote);
   FilePanel * Target = OtherPanel(Source);
-  QStringList Paths = Source->SelectedPaths();
+  QStringList Paths = Source->SelectedPaths(FOnFocused);
   if (Paths.isEmpty() || !Connected(Tab))
   {
     return;
@@ -2321,13 +2488,28 @@ static bool CopyLocalDialogExecute(QWidget * Parent, bool Move, int Count, const
   return true;
 }
 
-void CommanderWindow::LocalLocalCopy(bool Remote, bool Move)
+void CommanderWindow::RunLocalOperation(const LocalFileOperations::Params & Params,
+  const std::function<void(const LocalOperationResult &)> & Done)
+{
+  FLocalOperations++;
+  QPointer<CommanderWindow> Guard(this);
+  DesktopIntegration::RunLocalFileOperation(this, FUI, Params, [Guard, Done](const LocalOperationResult & Result)
+  {
+    if (Guard != nullptr)
+    {
+      Guard->FLocalOperations--;
+      Done(Result);
+    }
+  });
+}
+
+void CommanderWindow::LocalLocalCopy(bool Remote, bool Move, bool NoConfirmation)
 {
   // TCustomScpExplorerForm::LocalLocalCopyCommand / LocalLocalCopy
   SessionTab * Tab = CurrentTab();
   FilePanel * Source = SidePanel(Remote);
   FilePanel * Target = OtherPanel(Source);
-  QStringList Paths = Source->SelectedPaths();
+  QStringList Paths = Source->SelectedPaths(FOnFocused);
   if (Paths.isEmpty())
   {
     return;
@@ -2342,7 +2524,7 @@ void CommanderWindow::LocalLocalCopy(bool Remote, bool Move)
       FileMask = QStringLiteral("*.*");
     }
   }
-  if (Configuration::Instance().ConfirmTransferring &&
+  if (!NoConfirmation && Configuration::Instance().ConfirmTransferring &&
       !CopyLocalDialogExecute(this, Move, Paths.size(), QFileInfo(Paths.first()).fileName(), TargetDirectory, FileMask))
   {
     return;
@@ -2358,7 +2540,7 @@ void CommanderWindow::LocalLocalCopy(bool Remote, bool Move)
   Params.DuplicateIfSame = (QDir(TargetDirectory) == QDir(Source->CurrentDirectory()));
   Params.ConfirmOverwrite = Configuration::Instance().DefaultCopyParam().ConfirmOverwriting;
   Source->SaveSelectedNames();
-  DesktopIntegration::RunLocalFileOperation(this, FUI, Params, [this, Tab, Source](const LocalOperationResult &)
+  RunLocalOperation(Params, [this, Tab, Source](const LocalOperationResult &)
   {
     if (FTabs.contains(Tab))
     {
@@ -2465,7 +2647,7 @@ void CommanderWindow::HandleDrop(FilePanel * Target, const QStringList & Paths, 
           }
         }
         FileOperations::Runner Run = [this](const auto & Start, const auto & Done) { RunWithProgress(Start, Done); };
-        FileOperations::Duplicate(this, Term, Tab->RemotePanel->SelectedFiles(), Paths, TargetDirectory, Sessions, Run,
+        FileOperations::Duplicate(this, Term, Tab->RemotePanel->FilesOfPaths(Paths), Paths, TargetDirectory, Sessions, Run,
           [this](Terminal * TargetSession)
           {
             if (SessionTab * T = TabOfTerminal(TargetSession)) RefreshTab(T);
@@ -2523,7 +2705,7 @@ void CommanderWindow::HandleDrop(FilePanel * Target, const QStringList & Paths, 
     Params.TargetDirectory = TargetDirectory;
     Params.ConfirmOverwrite = Config.DefaultCopyParam().ConfirmOverwriting;
     Params.DuplicateIfSame = Paste;
-    DesktopIntegration::RunLocalFileOperation(this, FUI, Params, [this, Tab](const LocalOperationResult &)
+    RunLocalOperation(Params, [this, Tab](const LocalOperationResult &)
     {
       if (FTabs.contains(Tab))
       {
@@ -2537,7 +2719,7 @@ void CommanderWindow::HandleDrop(FilePanel * Target, const QStringList & Paths, 
 void CommanderWindow::DeleteFiles(FilePanel * Panel, bool Alternative)
 {
   SessionTab * Tab = CurrentTab();
-  QStringList Paths = Panel->SelectedPaths();
+  QStringList Paths = Panel->SelectedPaths(FOnFocused);
   if (Paths.isEmpty() || !PanelReady(Panel))
   {
     return;
@@ -2604,60 +2786,59 @@ void CommanderWindow::DeleteFiles(FilePanel * Panel, bool Alternative)
     Terminal * T = Tab->Term;
     int Params = Alternative ? dfAlternative : 0;
     RunWithProgress([T, Paths, Params](auto Done) { T->DeleteFiles(Paths, Done, Params); },
-      [this, Tab, Panel](const OperationResult & Result)
+      [this, Tab, Panel, Paths](const OperationResult & Result)
       {
-        if (FTabs.contains(Tab) && Result.Ok) Panel->ClearOperationSelection();
+        // VisualiseOperationFinished: what was deleted, a popup leaves the marks of other files
+        if (FTabs.contains(Tab) && Result.Ok)
+        {
+          for (const QString & Path : Paths)
+          {
+            Panel->UnmarkFile(Path);
+          }
+        }
       });
   }
   else
   {
-    for (const QString & Path : Paths)
+    // On a worker thread with progress and cancel, as the local copy and move
+    LocalFileOperations::Params Params;
+    Params.Op = LocalFileOperations::opDelete;
+    Params.Sources = Paths;
+    Params.ToTrash = !Permanently;
+    RunLocalOperation(Params, [this, Tab, Panel](const LocalOperationResult & Result)
     {
-      QFileInfo Info(Path);
-      bool Ok;
-      if (Permanently)
+      if (!FTabs.contains(Tab))
       {
-        Ok = (Info.isDir() && !Info.isSymLink()) ? QDir(Path).removeRecursively() : QFile::remove(Path);
+        return;
       }
-      else
+      for (const QString & Path : Result.Targets)
       {
-        QString TrashError;
-        Ok = LocalFileOperations::MoveToTrash(Path, &TrashError);
-        if (!Ok)
-        {
-          // as the Windows shell does for drives without a Recycle Bin
-          QString Message = QStringLiteral("Cannot move '%1' to Trash.").arg(Path);
-          if (!TrashError.isEmpty())
-          {
-            Message += QStringLiteral("\n\n") + TrashError;
-          }
-          Message += QStringLiteral("\n\nDo you want to delete it permanently?");
-          if (MessageDialog(this, Message, qtConfirmation, qaYes | qaNo, QStringLiteral("task_delete")) == qaYes)
-          {
-            Ok = (Info.isDir() && !Info.isSymLink()) ? QDir(Path).removeRecursively() : QFile::remove(Path);
-          }
-          else
-          {
-            break;
-          }
-        }
+        Panel->UnmarkFile(Path);
       }
-      if (!Ok)
+      Panel->Refresh();
+      if (Tab->LocalBrowser)
       {
-        ShowErrorMessage(this, QStringLiteral("Error deleting file '%1'.").arg(Path));
-        break;
+        ((Panel == Tab->LocalPanel) ? Tab->RemotePanel : Tab->LocalPanel)->Refresh();
       }
-      Panel->UnmarkFile(Path);
-    }
-    Panel->Refresh();
-    if (Tab->LocalBrowser) OtherPanel(Panel)->Refresh();
+    });
   }
 }
 
 void CommanderWindow::RenameFile(FilePanel * Panel, const QString & OldPath, const QString & NewName)
 {
-  if (NewName.isEmpty() || NewName.contains(QLatin1Char('/')))
+#ifdef Q_OS_WIN
+  const bool WindowsPath = !Panel->IsRemote();
+#else
+  const bool WindowsPath = false;
+#endif
+  if (NewName.isEmpty())
   {
+    return;
+  }
+  QString InvalidCharacter = FileOperations::InvalidNameCharacter(NewName, WindowsPath);
+  if (!InvalidCharacter.isEmpty())
+  {
+    ShowErrorMessage(this, QStringLiteral("Invalid name '%1'. Name cannot contain '%2'.").arg(NewName, InvalidCharacter));
     return;
   }
   SessionTab * Tab = CurrentTab();
@@ -2678,7 +2859,13 @@ void CommanderWindow::RenameFile(FilePanel * Panel, const QString & OldPath, con
   else
   {
     QString NewPath = QFileInfo(OldPath).dir().filePath(NewName);
-    if (QFileInfo::exists(NewPath) || !QFile::rename(OldPath, NewPath))
+    QFileInfo Target(NewPath);
+    bool Taken = FileOperations::LocalRenameTargetTaken(QFileInfo(OldPath).fileName(), NewName,
+      Target.exists() || Target.isSymLink(), [&OldPath]()
+      {
+        return QFileInfo(OldPath).dir().entryList(QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot);
+      });
+    if (Taken || !QFile::rename(OldPath, NewPath))
     {
       ShowErrorMessage(this, QStringLiteral("Error renaming file '%1' to '%2'.").arg(QFileInfo(OldPath).fileName(), NewName));
     }
@@ -2731,8 +2918,8 @@ void CommanderWindow::Properties(FilePanel * Panel)
   // F9 / Alt+Enter (TCustomScpExplorerForm::RemoteDirViewProperties / local properties)
   if (!PanelReady(Panel)) return;
   SessionTab * Tab = CurrentTab();
-  QList<RemoteFile> Files = Panel->SelectedFiles();
-  QStringList Paths = Panel->SelectedPaths();
+  QList<RemoteFile> Files = Panel->SelectedFiles(FOnFocused);
+  QStringList Paths = Panel->SelectedPaths(FOnFocused);
   if (Files.isEmpty())
   {
     return;
@@ -2789,7 +2976,7 @@ void CommanderWindow::DuplicateOrMove(bool Move)
     return;
   }
   if (!Connected(Tab) || !Panel->IsRemote() || !CheckReady()) return;
-  QStringList Paths = Panel->SelectedPaths();
+  QStringList Paths = Panel->SelectedPaths(FOnFocused);
   if (Paths.isEmpty()) return;
   FileOperations::Runner Run = MakeRunner(this, [this](const auto & Start, const auto & Done) { RunWithProgress(Start, Done); });
   if (Move)
@@ -2812,7 +2999,7 @@ void CommanderWindow::DuplicateOrMove(bool Move)
       Sessions.append(E);
     }
   }
-  FileOperations::Duplicate(this, Tab->Term, Panel->SelectedFiles(), Paths, Panel->CurrentDirectory(), Sessions, Run,
+  FileOperations::Duplicate(this, Tab->Term, Panel->SelectedFiles(FOnFocused), Paths, Panel->CurrentDirectory(), Sessions, Run,
     [this](Terminal * TargetSession)
     {
       if (SessionTab * T = TabOfTerminal(TargetSession)) RefreshTab(T);
@@ -2960,6 +3147,8 @@ void CommanderWindow::Filter(FilePanel * Panel)
   {
     Panel->SetFilterMask(Mask);
   }
+  // Checked while a mask is on, whatever the dialog did
+  UpdateActions();
 }
 
 void CommanderWindow::OpenDirectory(FilePanel * Panel, bool AddBookmark)
@@ -3091,14 +3280,15 @@ void CommanderWindow::FindFiles()
     }
     else
     {
-      QStringList Deleted;
-      bool Trash = Configuration::Instance().DeleteToRecycleBin;
-      for (const QString & Path : Paths)
+      LocalFileOperations::Params Params;
+      Params.Op = LocalFileOperations::opDelete;
+      Params.Sources = Paths;
+      Params.ToTrash = Configuration::Instance().DeleteToRecycleBin;
+      RunLocalOperation(Params, [this, Tab, DialogPtr](const LocalOperationResult & Result)
       {
-        if ((Trash && LocalFileOperations::MoveToTrash(Path)) || (!Trash && QFile::remove(Path))) Deleted.append(Path);
-      }
-      if (DialogPtr) DialogPtr->FilesDeleted(Deleted);
-      RefreshTab(Tab);
+        if (DialogPtr) DialogPtr->FilesDeleted(Result.Targets);
+        if (FTabs.contains(Tab)) RefreshTab(Tab);
+      });
     }
   });
   Dialog->show();
@@ -3123,7 +3313,7 @@ void CommanderWindow::CopyToClipboard()
   SessionTab * Tab = CurrentTab();
   FilePanel * Panel = ActivePanel();
   if (!PanelReady(Panel)) return;
-  QStringList Paths = Panel->SelectedPaths();
+  QStringList Paths = Panel->SelectedPaths(FOnFocused);
   if (Paths.isEmpty()) return;
   if (!Panel->IsRemote())
   {
@@ -3131,7 +3321,7 @@ void CommanderWindow::CopyToClipboard()
     return;
   }
   qint64 Size = 0;
-  for (const RemoteFile & F : Panel->SelectedFiles())
+  for (const RemoteFile & F : Panel->SelectedFiles(FOnFocused))
   {
     if (F.IsDirectory)
     {
@@ -3190,7 +3380,11 @@ void CommanderWindow::PasteFromClipboard()
         {
           SessionData Data;
           int Info = 0;
-          if (Data.ParseUrl(Value, Info))
+          // UNSAFE_SESSION, as when pasted to the Login dialog
+          if (Data.ParseUrl(Value, Info) &&
+              (((Info & SessionData::ParsedUnsafeSettings) == 0) ||
+               (MessageDialog(this, QStringLiteral("**Use potentially unsafe session settings?**\n\nThe provided session URL contains potentially "
+                  "unsafe settings. Proceed only if you trust its source."), qtConfirmation, qaOK | qaCancel) == qaOK)))
           {
             OpenSession(Data);
           }
@@ -3311,46 +3505,28 @@ void CommanderWindow::Synchronize(bool KeepUpToDate)
 
 void CommanderWindow::CompareDirectories()
 {
-  // Commands > Compare Directories (Shift+F2): marks files that differ in both panels
+  // Commands > Compare Directories (Shift+F2): marks files that differ in both
+  // panels. As TCustomDirView.CompareFiles, only what the panels show counts.
   SessionTab * Tab = CurrentTab();
-  QString LocalDir = Tab->LocalPanel->CurrentDirectory();
-  if (Tab->LocalBrowser)
-  {
-    // Local-local tab: the right panel's listing
-    QString Canonical;
-    RemoteFileList Files;
-    QString Error;
-    QString More;
-    if (!LocalDirectoryProvider::ReadDirectory(Tab->RemotePanel->CurrentDirectory(), Canonical, Files, Error, More))
-    {
-      ShowErrorMessage(this, Error, More);
-      return;
-    }
-    RunCompareDirectories(this, LocalDir, Files, [Tab](const QStringList & LocalNames, const QStringList & RemoteNames)
-    {
-      Tab->LocalPanel->SelectFiles(LocalNames);
-      Tab->RemotePanel->SelectFiles(RemoteNames);
-    });
-    return;
-  }
-  if (!Connected(Tab))
+  if (!Tab->LocalBrowser && !Connected(Tab))
   {
     return;
   }
-  Tab->Term->ReadDirectory(Tab->RemotePanel->CurrentDirectory(),
-    [this, Tab, LocalDir](const OperationResult & Result, const QString &, const RemoteFileList & Files)
+  QSet<QString> LocalNames;
+  for (const RemoteFile & File : Tab->LocalPanel->VisibleFiles())
+  {
+    LocalNames.insert(File.FileName);
+  }
+  RemoteFileList RemoteFiles;
+  for (const RemoteFile & File : Tab->RemotePanel->VisibleFiles())
+  {
+    RemoteFiles.append(File);
+  }
+  RunCompareDirectories(this, Tab->LocalPanel->CurrentDirectory(), RemoteFiles, LocalNames,
+    [Tab](const QStringList & LocalChanged, const QStringList & RemoteChanged)
     {
-      if (!FTabs.contains(Tab)) return;
-      if (!Result.Ok)
-      {
-        ShowResultError(Result);
-        return;
-      }
-      RunCompareDirectories(this, LocalDir, Files, [Tab](const QStringList & LocalNames, const QStringList & RemoteNames)
-      {
-        Tab->LocalPanel->SelectFiles(LocalNames);
-        Tab->RemotePanel->SelectFiles(RemoteNames);
-      });
+      Tab->LocalPanel->SelectFiles(LocalChanged);
+      Tab->RemotePanel->SelectFiles(RemoteChanged);
     });
 }
 
@@ -3496,16 +3672,18 @@ void CommanderWindow::SynchronizeBrowsingFailed(SessionTab * Tab, const QString 
 
 void CommanderWindow::closeEvent(QCloseEvent * Event)
 {
+  bool Busy = (FLocalOperations > 0);
   for (SessionTab * Tab : FTabs)
   {
-    if (Connected(Tab) && Tab->OperationRunning)
-    {
-      // NonVisualDataModule->Busy
-      ShowStatusMessage(statusBar(), QStringLiteral("Cannot close the application while an operation is in progress."), 3000);
-      QApplication::beep();
-      Event->ignore();
-      return;
-    }
+    Busy = Busy || (Connected(Tab) && Tab->OperationRunning);
+  }
+  if (Busy)
+  {
+    // NonVisualDataModule->Busy
+    ShowStatusMessage(statusBar(), QStringLiteral("Cannot close the application while an operation is in progress."), 3000);
+    QApplication::beep();
+    Event->ignore();
+    return;
   }
   Configuration & Config = Configuration::Instance();
   int ActiveSessions = 0;
@@ -3564,7 +3742,7 @@ void CommanderWindow::closeEvent(QCloseEvent * Event)
     else if (Result == qaNo)
     {
       // Save the workspace and enable its automatic saving
-      QList<SessionData> Tabs = WorkspaceTabs();
+      QList<SessionData> Tabs = CollectWorkspace();
       CanClose = Tabs.isEmpty() || SaveWorkspaceDialog::SaveWorkspace(this, Tabs, true);
     }
     else
@@ -3593,9 +3771,21 @@ void CommanderWindow::closeEvent(QCloseEvent * Event)
   }
   // Environment > Window > "Automatically save workspace on exit"
   QList<SessionData> Tabs = WorkspaceTabs();
-  if (Config.AutoSaveWorkspace && !Tabs.isEmpty())
+  if (Config.AutoSaveWorkspace)
   {
-    Workspaces::SaveWorkspace(Config.StoredSessions(), Workspaces::WorkspaceName(Config), Tabs, Config.AutoSaveWorkspacePasswords);
+    QList<SessionData> Workspace = CollectWorkspace();
+    if (!Workspace.isEmpty())
+    {
+      QString Name = Workspaces::WorkspaceName(Config);
+      Workspaces::SaveWorkspace(Config.StoredSessions(), Name, Workspace,
+        !Config.DisablePasswordStoring() && Config.AutoSaveWorkspacePasswords);
+      Config.SetLastStoredSession(Name);
+    }
+    else if (Config.LastStoredSession().compare(Config.AutoWorkspace, Qt::CaseInsensitive) == 0)
+    {
+      // Nothing was open: not the workspace to reopen on the next start
+      Config.SetLastStoredSession(QString());
+    }
   }
   FClosing = true;
   SaveToolbarSettings();
@@ -3623,6 +3813,49 @@ QString CommanderWindow::CurrentSiteName() const
   return (Configuration::Instance().StoredSessions().FindByName(Name) != nullptr) ? Name : QString();
 }
 
+QList<SessionData> CommanderWindow::CollectWorkspace() const
+{
+  Configuration & Config = Configuration::Instance();
+  QList<SessionData> Result;
+  for (SessionTab * Tab : FTabs)
+  {
+    SessionData Data;
+    if (Tab->LocalBrowser)
+    {
+      if (Tab->Implicit)
+      {
+        continue;
+      }
+      Data = Config.StoredSessions().DefaultSettings();
+      Data.Name.clear();
+      Data.HostName.clear();
+      Data.LocalDirectory = Tab->LocalPanel->CurrentDirectory();
+      Data.OtherLocalDirectory = Tab->RemotePanel->CurrentDirectory();
+      Result.append(Data);
+      continue;
+    }
+    if (Tab->Data.HostName.isEmpty())
+    {
+      continue;
+    }
+    // (a tab without session: its last directory)
+    Data = Connected(Tab) ? Tab->Data : ReconnectData(*Tab);
+    if (Connected(Tab))
+    {
+      Data.RemoteDirectory = Tab->RemotePanel->CurrentDirectory();
+    }
+    Data.LocalDirectory = Tab->LocalPanel->CurrentDirectory();
+    Data.SynchronizeBrowsing = Tab->SynchronizeBrowsing;
+    Data.Color = Tab->Color;
+    if (Data.Password.isEmpty())
+    {
+      Data.Password = Tab->SessionPassword;
+    }
+    Result.append(Data);
+  }
+  return Result;
+}
+
 QList<SessionData> CommanderWindow::WorkspaceTabs() const
 {
   QList<SessionData> Result;
@@ -3647,31 +3880,95 @@ QList<SessionData> CommanderWindow::WorkspaceTabs() const
 
 void CommanderWindow::SaveWorkspace()
 {
-  QList<SessionData> Tabs = WorkspaceTabs();
+  QList<SessionData> Tabs = CollectWorkspace();
   if (!Tabs.isEmpty())
   {
     SaveWorkspaceDialog::SaveWorkspace(this, Tabs);
   }
 }
 
-void CommanderWindow::OpenWorkspace(const QString & Name)
+void CommanderWindow::OpenWorkspace(const QString & Name, bool ConnectFirst)
 {
-  QList<SessionData> Sessions = Workspaces::FolderOrWorkspace(Configuration::Instance().StoredSessions(), Name);
+  Configuration & Config = Configuration::Instance();
+  QList<SessionData> Sessions = Workspaces::FolderOrWorkspace(Config.StoredSessions(), Name);
   if (Sessions.isEmpty())
   {
     ShowErrorMessage(this, QStringLiteral("Workspace '%1' does not contain any session.").arg(Name));
     return;
   }
+  // The implicit local browser gives way, as for the first session (OpenSession)
+  SessionTab * Implicit = nullptr;
+  for (SessionTab * Tab : std::as_const(FTabs))
+  {
+    if (Tab->Implicit)
+    {
+      Implicit = Tab;
+    }
+  }
+  // TTerminalManager::NewSessions
+  SessionTab * First = nullptr;
   for (const SessionData & Data : Sessions)
   {
     SessionData Copy = Data;
+    bool Permanent = Copy.IsWorkspace || (Sessions.size() > 1);
     Copy.IsWorkspace = false;
-    OpenSession(Copy);
+    SessionTab * Tab;
+    if (Copy.CanLogin())
+    {
+      Tab = CreateTab(static_cast<int>(FTabs.size()), false, Copy.LocalDirectory);
+      Tab->Data = Copy;
+      Tab->Color = Copy.Color;
+      Tab->SynchronizeBrowsing = Copy.SynchronizeBrowsing;
+      Tab->Permanent = Permanent;
+      Tab->ConnectOnActivate = true;
+      Tab->ConnectInBackground = (First != nullptr) && Config.WorkspaceConnectAll;
+      UpdateDisconnectedPanel(Tab);
+      UpdateTabCaption(Tab);
+    }
+    else
+    {
+      Tab = CreateTab(static_cast<int>(FTabs.size()), true, Copy.LocalDirectory, Copy.OtherLocalDirectory);
+    }
+    if (First == nullptr)
+    {
+      First = Tab;
+    }
   }
-  if (Configuration::Instance().StoredSessions().IsWorkspace(Name))
+  if (!ConnectFirst && First->ConnectOnActivate)
+  {
+    First->ConnectOnActivate = false;
+    First->DisconnectedTemporarily = true;
+  }
+  ActivateTab(First);
+  if (Implicit != nullptr)
+  {
+    CloseTab(Implicit, false);
+    ActivateTab(First);
+  }
+  if (Config.WorkspaceConnectAll)
+  {
+    FBackgroundConnectTimer->start();
+  }
+  if (Workspaces::IsWorkspace(Config.StoredSessions(), Name))
   {
     Workspaces::SetLastWorkspace(Name);
   }
+}
+
+bool CommanderWindow::OpenAutoWorkspace()
+{
+  // "This detects if workspace was saved the last time the main widow was closed"
+  Configuration & Config = Configuration::Instance();
+  bool Reopen =
+    !Config.ShowLoginOnStartup && Config.AutoSaveWorkspace && !Config.AutoWorkspace.isEmpty() &&
+    (Config.LastStoredSession().compare(Config.AutoWorkspace, Qt::CaseInsensitive) == 0) &&
+    !Workspaces::FolderOrWorkspace(Config.StoredSessions(), Config.AutoWorkspace).isEmpty();
+  if (Reopen)
+  {
+    // FConnectFirstTerminal
+    OpenWorkspace(Config.AutoWorkspace, Config.WorkspaceConnectAll);
+  }
+  return Reopen;
 }
 
 //---------------------------------------------------------------------------
@@ -3686,10 +3983,10 @@ CustomCommandContext CommanderWindow::CustomCommandsContext() const
     Context.Term = Tab->Term;
     Context.SessionPassword = Tab->SessionPassword;
     Context.CurrentRemoteDir = Tab->RemotePanel->CurrentDirectory();
-    Context.SelectedRemoteFiles = Tab->RemotePanel->SelectedPaths();
+    Context.SelectedRemoteFiles = Tab->RemotePanel->SelectedPaths(FOnFocused && (ActivePanel() == Tab->RemotePanel));
   }
   Context.CurrentLocalDir = Tab->LocalPanel->CurrentDirectory();
-  Context.SelectedLocalFiles = Tab->LocalPanel->SelectedPaths();
+  Context.SelectedLocalFiles = Tab->LocalPanel->SelectedPaths(FOnFocused && (ActivePanel() == Tab->LocalPanel));
   Context.LocalSide = (ActivePanel() == Tab->LocalPanel) || Tab->LocalBrowser;
   Context.RemotePanel = !Tab->LocalBrowser;
   return Context;

@@ -853,10 +853,10 @@ namespace
 // buffer (a truncated upload reported as complete). So the socket is kept
 // open (a duplicate descriptor) after QSslSocket sent close_notify and closed
 // its descriptor; it is then half-closed and read until the server closes it.
-void CloseUploadConnection(QSslSocket * Socket, int TimeoutMs, FileOperationProgress * Progress)
+void CloseUploadConnection(QSslSocket * Socket, int TimeoutMs, FileOperationProgress * Progress, bool CompleteShutdown)
 {
   qintptr Fd = Socket->socketDescriptor();
-  Net::Socket Dup = (Fd >= 0) ? Net::Duplicate(static_cast<Net::Socket>(Fd)) : Net::Invalid;
+  Net::Socket Dup = ((Fd >= 0) && CompleteShutdown) ? Net::Duplicate(static_cast<Net::Socket>(Fd)) : Net::Invalid;
   Socket->disconnectFromHost();
   if (Socket->state() != QAbstractSocket::UnconnectedState)
   {
@@ -957,7 +957,9 @@ void FtpFileSystem::SendCommand(const QString & Command, bool DrainStale)
     }
   }
   FLastCommand = Command.section(QLatin1Char(' '), 0, 0).toUpper();
-  LogLine(QStringLiteral("> %1").arg((FLastCommand == QStringLiteral("PASS")) ? SessionLog::MaskCommand(Command, Command.mid(5)) : Command));
+  // "ACCT": the firewall password of the logon sequences
+  bool HasPassword = (FLastCommand == QStringLiteral("PASS")) || (FLastCommand == QStringLiteral("ACCT"));
+  LogLine(QStringLiteral("> %1").arg(HasPassword ? SessionLog::MaskCommand(Command, Command.mid(5)) : Command));
   FLastActivity.start();
   try
   {
@@ -1607,7 +1609,7 @@ bool FtpFileSystem::VerifyCertificateAgainstSessionData() const
 {
   // TTerminal::VerifyCertificateAgainstSessionData: fingerprint(s) configured
   // for the site (SshHostKey, ";" separated, "*" = any certificate)
-  for (const QString & ExpectedKey : FData.HostKey.split(QLatin1Char(';'), Qt::SkipEmptyParts))
+  for (const QString & ExpectedKey : FData.TrustedHostKey().split(QLatin1Char(';'), Qt::SkipEmptyParts))
   {
     QString Expected = ExpectedKey.trimmed();
     if (Expected == QStringLiteral("*"))
@@ -1649,6 +1651,17 @@ bool FtpFileSystem::IsCertificateCached(const QString & SiteKey, const QString &
         Result = Storage.ValueExists(FingerprintSHA1) || Storage.ValueExists(FingerprintSHA256);
       }
     }
+  });
+  return Result;
+}
+
+bool FtpFileSystem::HasCachedCertificate(const QString & SiteKey)
+{
+  bool Result = false;
+  RunInMainThread([&]()
+  {
+    IniStorage Storage(&Configuration::Instance().Ini());
+    Result = Storage.OpenSubKey(FtpsCertificateStorageKey, false) && Storage.ValueExists(SiteKey);
   });
   return Result;
 }
@@ -1737,7 +1750,9 @@ void FtpFileSystem::VerifyCertificate(const QList<QSslError> & Errors)
       LogLine(QStringLiteral("Certificate matches cached fingerprint and failures"));
       Verified = true;
     }
-    else if (VerifyCertificateAgainstSessionData())
+    // As with an SSH host key: a fingerprint in a URL does not outrank the
+    // certificate accepted for this site before, a different one is a question
+    else if (!(FData.HostKeyFromUrl && HasCachedCertificate(SiteKey)) && VerifyCertificateAgainstSessionData())
     {
       Verified = true;
     }
@@ -2052,6 +2067,80 @@ void FtpFileSystem::Login(QString & Password)
   }
 }
 
+// CutFeature (core/Common.cpp): one comma separated feature, maybe in quotes
+static QString CutFeature(QString & Buf)
+{
+  QString Result;
+  if (Buf.startsWith(QLatin1Char('"')))
+  {
+    Buf.remove(0, 1);
+    qsizetype P = Buf.indexOf(QStringLiteral("\","));
+    if (P < 0)
+    {
+      Result = Buf;
+      Buf.clear();
+      // there should be the ending quote, but if not, just do nothing
+      if (Result.endsWith(QLatin1Char('"')))
+      {
+        Result.chop(1);
+      }
+    }
+    else
+    {
+      Result = Buf.left(P);
+      Buf.remove(0, P + 2);
+    }
+    Buf = Buf.trimmed();
+  }
+  else
+  {
+    qsizetype P = Buf.indexOf(QLatin1Char(','));
+    Result = Buf.left(P).trimmed();
+    Buf = (P >= 0) ? Buf.mid(P + 1).trimmed() : QString();
+  }
+  return Result;
+}
+
+QStringList FtpFileSystem::OverrideFeatures(const QStringList & Features, const QString & AOverride)
+{
+  // ProcessFeatures (core/Common.cpp): "*a,b" replaces the features of the
+  // server, "-a" removes one, "a" or "+a" adds one
+  QString Override = AOverride;
+  QStringList Result;
+  if (Override.startsWith(QLatin1Char('*')))
+  {
+    Override.remove(0, 1);
+    while (!Override.isEmpty())
+    {
+      Result.append(CutFeature(Override));
+    }
+    return Result;
+  }
+  QStringList Delete;
+  QStringList Add;
+  while (!Override.isEmpty())
+  {
+    QString Feature = CutFeature(Override);
+    if (Feature.startsWith(QLatin1Char('-')))
+    {
+      Delete.append(Feature.mid(1));
+    }
+    else
+    {
+      Add.append(Feature.startsWith(QLatin1Char('+')) ? Feature.mid(1) : Feature);
+    }
+  }
+  for (const QString & Feature : Features)
+  {
+    if (!Delete.contains(Feature, Qt::CaseInsensitive))
+    {
+      Result.append(Feature);
+    }
+  }
+  Result.append(Add);
+  return Result;
+}
+
 void FtpFileSystem::ProcessFeatures(const Reply & FeatReply)
 {
   // TFTPFileSystem::HandleFeatReply + ProcessFeatures
@@ -2066,11 +2155,17 @@ void FtpFileSystem::ProcessFeatures(const Reply & FeatReply)
     for (qsizetype Index = 1; Index < FeatReply.Lines.size() - 1; Index++)
     {
       QString Feature = FeatReply.Lines[Index].trimmed();
-      if (Feature.isEmpty())
+      if (!Feature.isEmpty())
       {
-        continue;
+        FFeatures << Feature;
       }
-      FFeatures << Feature;
+    }
+  }
+  // ProtocolFeatures of the site
+  FFeatures = OverrideFeatures(FFeatures, FData.ProtocolFeatures.trimmed());
+  {
+    for (const QString & Feature : std::as_const(FFeatures))
+    {
       QString Command = Feature.section(QLatin1Char(' '), 0, 0).toUpper();
       QString Args = Feature.section(QLatin1Char(' '), 1);
       FSupportedCommands.insert(Command);
@@ -2746,7 +2841,7 @@ QString FtpFileSystem::FormatPortCommand(const QHostAddress & Local, quint16 Por
 }
 
 std::unique_ptr<FtpFileSystem::DataConnection> FtpFileSystem::OpenDataConnection(
-  const QString & ACommand, qint64 * Rest, FileOperationProgress * Progress, const QString & Error)
+  const QString & ACommand, qint64 * Rest, FileOperationProgress * Progress, const QString & Error, int * RefusedCode)
 {
   auto Data = std::make_unique<DataConnection>();
   bool Passive = FData.FtpPasvMode;
@@ -2944,6 +3039,10 @@ std::unique_ptr<FtpFileSystem::DataConnection> FtpFileSystem::OpenDataConnection
         Data->Socket.reset();
         Data->Server.reset();
         ReplyConsumed = true;
+        if (RefusedCode != nullptr)
+        {
+          *RefusedCode = R.Code;
+        }
         ReplyError(R, Error);
       }
       continue;
@@ -3226,6 +3325,7 @@ void FtpFileSystem::ApplyTimeDifference(const QString & FullPath, const FtpListE
     if (Reduced == File.Modification)
     {
       File.Modification = It.value();
+      File.ModificationFmt = mfFull;
     }
     else
     {
@@ -4027,7 +4127,30 @@ void FtpFileSystem::Upload(const QString & LocalPath, const QString & RemotePath
     // Resume by appending (CFtpControlSocket bResumeAppend)
     // (Append: the whole file after the existing contents, omAppend)
     bool Append = (RemoteOffset > 0) || Params.Append;
-    Data = OpenDataConnection((Append ? QStringLiteral("APPE ") : QStringLiteral("STOR ")) + RemoteName, nullptr, &Progress, Error);
+    int RefusedCode = 0;
+    try
+    {
+      Data = OpenDataConnection((Append ? QStringLiteral("APPE ") : QStringLiteral("STOR ")) + RemoteName, nullptr, &Progress, Error, &RefusedCode);
+    }
+    catch (const FatalException &)
+    {
+      throw;
+    }
+    catch (const AbortException &)
+    {
+      throw;
+    }
+    catch (const ExtException & E)
+    {
+      // Only the server refusing the file for good says that it cannot be
+      // created: 425, a failed TLS handshake or a passive connection that
+      // did not open say nothing about the file, or the name
+      if ((RefusedCode >= 500) && (RefusedCode <= 599))
+      {
+        throw CannotCreateFileException(E.Message(), E.MoreMessages());
+      }
+      throw;
+    }
     Started = true;
     QSslSocket * Socket = Data->Socket.get();
     while ((Socket != nullptr) && (LocalPos < LocalEnd))
@@ -4097,7 +4220,14 @@ void FtpFileSystem::Upload(const QString & LocalPath, const QString & RemotePath
     {
       // flush and close (TLS close_notify) to signal the end of the file
       WriteAll(Socket, QByteArray(), nullptr);
-      CloseUploadConnection(Socket, TimeoutMs(), &Progress);
+      // OPTION_MPEXT_COMPLETE_TLS_SHUTDOWN; on auto as WinSCP for the FileZilla
+      // server, which does not answer, otherwise always (see CloseUploadConnection)
+      bool CompleteShutdown = (FData.CompleteTlsShutdown == asAuto) ? !FFileZilla : (FData.CompleteTlsShutdown == asOn);
+      if (!CompleteShutdown)
+      {
+        LogLine(QStringLiteral("Not waiting for complete TLS shutdown"));
+      }
+      CloseUploadConnection(Socket, TimeoutMs(), &Progress, CompleteShutdown);
     }
     FinishDataConnection(*Data, &Progress, Error);
   }

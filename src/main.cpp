@@ -17,6 +17,7 @@
 #include "core/Configuration.h"
 #include "core/FileSystem.h"
 #include "core/IniStorage.h"
+#include "core/Platform.h"
 #include "core/CloudSync.h"
 #include "core/RemoteFile.h"
 #include "core/Workspaces.h"
@@ -24,6 +25,7 @@
 #include "gui/AgentClient.h"
 #include "gui/CloudSyncUi.h"
 #include "gui/CommanderWindow.h"
+#include "gui/DesktopIntegration.h"
 #include "gui/GuiCommandLine.h"
 #include "gui/GuiUserInterface.h"
 #include "gui/Icons.h"
@@ -42,15 +44,49 @@
 #include <cstdlib>
 #include <cstring>
 #include <libssh/libssh.h>
+#ifdef Q_OS_WIN
+#include <shellapi.h>
+#endif
+
+#ifndef Q_OS_WIN
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 using namespace GuiCommandLine;
 
-// SSH_ASKPASS helper for "pass password to PuTTY": ssh runs this binary with the
-// prompt as argument; answer password/passphrase prompts from the one-time file
-static int AskPass(const char * FileName, const char * Prompt)
+#if !defined(Q_OS_WIN) && !defined(Q_OS_ANDROID)
+// What ssh itself would do without SSH_ASKPASS_REQUIRE=force. Not without a
+// terminal: getpass() then reads standard input, which is not meant for it
+static QByteArray AskInTerminal(const char * Prompt)
 {
+  QByteArray Result;
+  int Terminal = open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
+  if (Terminal >= 0)
+  {
+    close(Terminal);
+    if (char * Line = getpass(Prompt))
+    {
+      Result = Line;
+      memset(Line, 0, strlen(Line));
+    }
+  }
+  return Result;
+}
+#else
+static QByteArray AskInTerminal(const char *)
+{
+  return QByteArray();
+}
+#endif
+
+// SSH_ASKPASS helper for "pass password to PuTTY": ssh runs this binary with the
+// prompt as argument; password/passphrase prompts get the answer the running
+// NixSCP offers once on its private socket to who has the token of the offer
+static int AskPass(int & Argc, char ** Argv, const char * SocketName)
+{
+  const char * Prompt = (Argc > 1) ? Argv[1] : nullptr;
   QString Text = QString::fromLocal8Bit(Prompt ? Prompt : "").toLower();
-  QFile File(QString::fromLocal8Bit(FileName));
   if (!Text.contains(QStringLiteral("password")) && !Text.contains(QStringLiteral("passphrase")))
   {
     // e.g. host key confirmation: not ours to answer
@@ -63,13 +99,18 @@ static int AskPass(const char * FileName, const char * Prompt)
   {
     return 1;
   }
-  if (!File.open(QIODevice::ReadOnly))
+  QCoreApplication App(Argc, Argv);
+  QByteArray Password = DesktopIntegration::FetchAskPassPassword(QString::fromLocal8Bit(SocketName), qEnvironmentVariable("NIXSCP_ASKPASS_TOKEN"));
+  if (Password.isEmpty())
+  {
+    // the offer is used up (the server wants another try), or this terminal did
+    // not pass on the token: the user can still type it
+    Password = AskInTerminal(Prompt);
+  }
+  if (Password.isEmpty())
   {
     return 1;
   }
-  QByteArray Password = File.readAll();
-  File.close();
-  File.remove();
   fwrite(Password.constData(), 1, static_cast<size_t>(Password.size()), stdout);
   fputc('\n', stdout);
   return 0;
@@ -124,21 +165,44 @@ public:
 
 int main(int argc, char * argv[])
 {
+  Platform::HardenProcess();
 #ifdef Q_OS_MACOS
   // a closed connection is an error result, not a signal (no MSG_NOSIGNAL there)
   signal(SIGPIPE, SIG_IGN);
 #endif
-  if (const char * AskPassFile = getenv("NIXSCP_ASKPASS_FILE"))
+  if (const char * AskPassSocket = getenv("NIXSCP_ASKPASS_SOCKET"))
   {
     if (getenv("SSH_ASKPASS") != nullptr)
     {
-      return AskPass(AskPassFile, (argc > 1) ? argv[1] : nullptr);
+      return AskPass(argc, argv, AskPassSocket);
     }
   }
   QStringList RawArgs;
+#ifdef Q_OS_WIN
+  // argv is in the ANSI code page there, which "best fit" maps some characters to others
+  int WideCount = 0;
+  if (wchar_t ** Wide = CommandLineToArgvW(GetCommandLineW(), &WideCount))
+  {
+    for (int I = 1; I < WideCount; I++)
+    {
+      RawArgs.append(QString::fromWCharArray(Wide[I]));
+    }
+    LocalFree(Wide);
+  }
+#else
   for (int I = 1; I < argc; I++)
   {
     RawArgs.append(QString::fromLocal8Bit(argv[I]));
+  }
+#endif
+  // Started by a link: its URL, and no argument it may have added reaches
+  // anything, also not Qt, which has options of its own and loads plugins
+  const QStringList LinkArgs = LinkArguments(RawArgs);
+  bool Link = !LinkArgs.isEmpty();
+  if (Link)
+  {
+    RawArgs = LinkArgs;
+    argc = 1;
   }
   // Agent Access: nixscp --list / --connect / --get / --put / --help
   // (before --version, which may follow --cmd as part of a remote command)
@@ -177,8 +241,11 @@ int main(int argc, char * argv[])
   QApplication::setDesktopFileName(QStringLiteral("nixscp"));
   QApplication::setWindowIcon(Icons::Application());
 
+  // Left behind by a crash (also the password files of NixSCP 1.2)
+  DesktopIntegration::RemoveStaleAskPassFiles();
+
   // Qt has removed its own options (-platform...) by now
-  QStringList Args = App.arguments().mid(1);
+  QStringList Args = Link ? LinkArgs : App.arguments().mid(1);
   Options Params;
   for (const QString & Arg : Args)
   {
@@ -189,6 +256,13 @@ int main(int argc, char * argv[])
   Configuration & Config = Configuration::Instance();
   QString IniFileMissing;
   ApplyIniSwitch(Params, &IniFileMissing);
+  QString ConfigProblem = Config.IsNulStorage() ? QString() : ConfigVault::ConfigProblemText(Config.IniFileName());
+  if (!ConfigProblem.isEmpty())
+  {
+    ShowErrorMessage(nullptr, ConfigProblem);
+    ssh_finalize();
+    return 1;
+  }
   if (!Config.IsNulStorage() && ConfigVault::IsSealedFile(Config.IniFileName()))
   {
     // NixSCP Pro: the configuration is encrypted. A running NixSCP has it
@@ -201,7 +275,7 @@ int main(int argc, char * argv[])
     {
       HandOver = HandOver && !Probe.FindSwitch(Switch);
     }
-    if (HandOver &&
+    if (HandOver && CanForwardCommandLine(Probe) &&
         SingleInstance::SendCommandLine(SingleInstance::DefaultServerName(Config.IniFileName()), Args, QDir::currentPath()))
     {
       ssh_finalize();
@@ -332,7 +406,9 @@ int main(int argc, char * argv[])
       (Config.ExternalSessionInExistingInstance != OpenInNewWindow()) &&
       !NewInstance &&
       // the other instance would not have the same configuration
-      !Params.FindSwitch(QStringLiteral("rawconfig"));
+      !Params.FindSwitch(QStringLiteral("rawconfig")) &&
+      // and it ignores what would change the session
+      CanForwardCommandLine(Params);
     if (TrySendToAnotherInstance &&
         SingleInstance::SendCommandLine(ServerName, Args, QDir::currentPath()))
     {
@@ -479,11 +555,11 @@ int main(int argc, char * argv[])
     else if (!Screenshotting)
     {
       // NixSCP Pro: the tabs open when NixSCP was last closed, on any computer;
-      // otherwise NeedSession(Startup)
+      // otherwise the auto-saved workspace or NeedSession(Startup)
       CloudSyncUi::RestoreSessions(&Window, [&Window, &Config](bool Restored)
       {
         LoginData Login;
-        if (!Restored && Config.ShowLoginOnStartup && DoLoginDialog(&Window, nullptr, true, Login))
+        if (!Restored && !Window.OpenAutoWorkspace() && Config.ShowLoginOnStartup && DoLoginDialog(&Window, nullptr, true, Login))
         {
           OpenSessions(&Window, Login);
         }
