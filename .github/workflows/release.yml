@@ -55,7 +55,7 @@ jobs:
       - name: Install build dependencies (Fedora)
         if: matrix.family == 'fedora'
         run: |
-          dnf install -y gcc-c++ cmake pkgconf qt6-qtbase-devel libssh-devel \
+          dnf install -y shadow-utils util-linux gcc-c++ cmake pkgconf qt6-qtbase-devel libssh-devel \
             openssl-devel rpm-build file git qt6-qtsvg xdg-utils \
             dejavu-sans-fonts openssh-clients
 
@@ -74,7 +74,12 @@ jobs:
       - name: Test (offline suites; server suites skip themselves)
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ctest --test-dir build --output-on-failure --timeout 600
+        # As a normal user: root ignores the file permissions that the tests of a
+        # failed save rely on
+        run: |
+          useradd -m tester
+          chown -R tester build
+          su tester -c "ctest --test-dir build --output-on-failure --timeout 600"
 
       - name: Package
         run: |

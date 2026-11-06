@@ -32,5 +32,6 @@ Things worth knowing:
 - Live cloud tests (test_cloudlive, test_teamslive) need fresh accounts for each run, and the API's limit of 30 token
   requests a minute will fail them if it is on. test_agentaccess skips silently without its `NIXSCP_TEST_AGENT_*` variables.
 - `NIXSCP_TEST_SECURITY_STRICT=1` makes known weaknesses fail in test_verify_security.
+- Run the tests as a normal user. Root ignores file permissions, so the tests of a failed save fail under root.
 - On macOS: test programs get their own `HOME` (tests/MacTestHome.cpp), BSD tools differ from GNU ones, and Python's bundled
   LibreSSL cannot serve an EC certificate, so test certificates are RSA.

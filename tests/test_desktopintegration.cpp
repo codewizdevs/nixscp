@@ -295,13 +295,13 @@ static void TestAskPassWithRealSsh(const QString & Folder)
     CHECK(DesktopIntegration::OpenSessionInTerminal(nullptr, Data, Password, QStringLiteral("/tmp"), true));
     QElapsedTimer Timer;
     Timer.start();
-    while (!QFile::exists(Terminal + QStringLiteral(".done")) && (Timer.elapsed() < 30000))
+    // The shell creates the file before it writes to it, so wait for the content
+    QByteArray Done;
+    while ((Done = ReadFile(Terminal + QStringLiteral(".done")).trimmed()).isEmpty() && (Timer.elapsed() < 30000))
     {
       QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
     }
-    // (it may be written only just now)
-    QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
-    return ReadFile(Terminal + QStringLiteral(".done")).trimmed();
+    return Done;
   };
   QByteArray Code = Run(QStringLiteral("terminal"), QByteArray(), QStringLiteral("s3cret pw"));
   CHECK_MSG(Code == "0", QString::fromUtf8(Code + " " + ReadFile(Dir + QStringLiteral("/terminal.out"))));
