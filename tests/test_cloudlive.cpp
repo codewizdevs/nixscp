@@ -221,7 +221,13 @@ static bool UploadJunk(const QString & Slot)
     {{QStringLiteral("slot"), Slot}, {QStringLiteral("base_version"), Base}, {QStringLiteral("size"), Snapshot.size()}});
   if (!Up.Ok()) return false;
   auto PutDone = std::make_shared<int>(0);
-  Client.Transfer("PUT", QUrl(Up.Json.value(QStringLiteral("url")).toString()), Snapshot, {{"Content-Type", "application/octet-stream"}},
+  // The URL is signed with these headers: real R2 refuses the upload without them
+  CloudClient::Headers Headers{{"Content-Type", "application/octet-stream"}};
+  if (Up.Json.value(QStringLiteral("headers")).toObject().contains(QStringLiteral("If-None-Match")))
+  {
+    Headers.append(qMakePair(QByteArray("If-None-Match"), QByteArray("*")));
+  }
+  Client.Transfer("PUT", QUrl(Up.Json.value(QStringLiteral("url")).toString()), Snapshot, Headers,
     [PutDone](const CloudClient::Reply & R) { *PutDone = R.Ok() ? 1 : 2; });
   WaitFor([PutDone]() { return *PutDone != 0; });
   CloudClient::Reply Commit = Call("POST", QStringLiteral("/v1/sync/commit"),
