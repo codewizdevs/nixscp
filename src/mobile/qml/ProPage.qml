@@ -307,6 +307,16 @@ Page {
                     color: page.account.license && !page.account.license.active ? Material.color(Material.Red) : Material.foreground
                 }
                 Label {
+                    objectName: "storageLabel"
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    visible: !!page.account.storageText
+                    text: qsTr("Cloud storage: %1").arg(page.account.storageText || "")
+                          + (page.account.storageFull ? " · " + qsTr("remove what you no longer need: when it is full, nothing more is uploaded") : "")
+                    color: page.account.storageFull ? Material.color(Material.Red) : Material.foreground
+                    opacity: page.account.storageFull ? 1 : 0.75
+                }
+                Label {
                     Layout.fillWidth: true
                     wrapMode: Text.Wrap
                     opacity: 0.75

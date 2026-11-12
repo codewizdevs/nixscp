@@ -128,11 +128,50 @@ void CloudClient::Send(const QByteArray & Method, const QUrl & Url, const QByteA
     else if (!Result.Ok())
     {
       QString Code = Result.ErrorCode();
-      Result.Error = QStringLiteral("The NixSCP cloud returned an error (%1%2).")
-        .arg(Result.Status).arg(Code.isEmpty() ? QString() : QStringLiteral(", ") + Code);
+      if (Code == QStringLiteral("storage_full"))
+      {
+        // the limit of what an account stores (its sync data, its own teams' sites and notes)
+        QString Used = StorageText(Result.Json);
+        Result.Error = Result.Json.value(QStringLiteral("team")).toBool() && !Result.Json.value(QStringLiteral("owner")).toBool()
+          ? QStringLiteral("The cloud storage of this team's owner is full (%1). The team's data counts for its owner: ask them to make room.").arg(Used)
+          : QStringLiteral("Your NixSCP cloud storage is full (%1). It holds your synced settings and the sites and notes of the teams you own: "
+              "remove what you no longer need, then try again.").arg(Used);
+      }
+      else
+      {
+        Result.Error = QStringLiteral("The NixSCP cloud returned an error (%1%2).")
+          .arg(Result.Status).arg(Code.isEmpty() ? QString() : QStringLiteral(", ") + Code);
+      }
     }
     Done(Result);
   });
+}
+
+static QString StorageSize(double Bytes)
+{
+  bool Kb = (Bytes < 1024 * 1024);
+  QString Number = QString::number(Bytes / (Kb ? 1024 : 1024 * 1024), 'f', 1);
+  if (Number.endsWith(QStringLiteral(".0")))
+  {
+    Number.chop(2);
+  }
+  return Number + (Kb ? QStringLiteral(" KB") : QStringLiteral(" MB"));
+}
+
+QString CloudClient::StorageText(const QJsonObject & Storage)
+{
+  double Limit = Storage.value(QStringLiteral("limit")).toDouble();
+  if (Limit <= 0)
+  {
+    return QString();
+  }
+  return QStringLiteral("%1 of %2 used").arg(StorageSize(Storage.value(QStringLiteral("used")).toDouble()), StorageSize(Limit));
+}
+
+bool CloudClient::StorageNearlyFull(const QJsonObject & Storage)
+{
+  double Limit = Storage.value(QStringLiteral("limit")).toDouble();
+  return (Limit > 0) && (Storage.value(QStringLiteral("used")).toDouble() >= Limit * 0.9);
 }
 
 void CloudClient::SetTokens(const QJsonObject & Json)

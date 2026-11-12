@@ -1190,27 +1190,42 @@ static void TestTeamNotes(const QString & Folder)
   SitesModel Sites(&Settings);
   Sites.LoadState();
 
-  // a member: read-only
+  // a member: the team shares no note, so the note is the member's own (private)
   Joined Member = MemberOf(QStringLiteral("Ops"), {{"db", "db.internal", "S3cret-password"}});
   const QString Db = Member.Folder + QStringLiteral("/db");
   CHECK_MSG(Site(Db) != nullptr, Db);
   Sites.reload();
   CHECK(RowOf(Sites, Db) >= 0);
+  CHECK(Sites.canEditNote(Db));
+  CHECK(Sites.siteData(Db).value(QStringLiteral("noteStatus")).toString().contains(QStringLiteral("private")));
+  CHECK(Sites.saveNote(Db, QStringLiteral("My own reminder.")).isEmpty());
+  CHECK((Site(Db) != nullptr) && Site(Db)->Note.isEmpty() && (Site(Db)->PrivateNote == QStringLiteral("My own reminder.")));
+  CHECK(Sites.siteData(Db).value(QStringLiteral("note")).toString() == QStringLiteral("My own reminder."));
+  // the team's note (as a sync brings it): members read it, the private one is hidden
+  Site(Db)->Note = QStringLiteral("Restart with systemctl.");
+  Site(Db)->NoteBy = QStringLiteral("owner@nixscp.test");
+  Site(Db)->NoteAt = QStringLiteral("2026-11-12T08:00:00Z");
   CHECK(!Sites.canEditNote(Db));
-  CHECK(!Sites.siteData(Db).value(QStringLiteral("canEditNote")).toBool());
+  QVariantMap Data = Sites.siteData(Db);
+  CHECK(!Data.value(QStringLiteral("canEditNote")).toBool());
+  CHECK(Data.value(QStringLiteral("note")).toString() == QStringLiteral("Restart with systemctl."));
+  CHECK_MSG(Data.value(QStringLiteral("noteStatus")).toString().contains(QStringLiteral("Last edited by a former member")), Data.value(QStringLiteral("noteStatus")).toString());
   QString Reason = Sites.saveNote(Db, QStringLiteral("Restarted it at 3 am."));
   CHECK_MSG(Reason.contains(QStringLiteral("owners and admins")), Reason);
-  CHECK((Site(Db) != nullptr) && Site(Db)->Note.isEmpty());
-  // a member's note item of the team: read-only as well
-  CHECK(!Sites.canEditNote(Member.Folder + QStringLiteral("/Runbook")));
+  CHECK(Site(Db)->Note == QStringLiteral("Restart with systemctl."));
 
-  // an admin and an owner edit it; a personal site is the user's own
+  // an admin edits the team's note once it is shared; until then it is private
   Joined Admin = MemberOf(QStringLiteral("Dev"), {{"api", "api.internal", "S3cret-password"}}, QStringLiteral("admin"));
   const QString Api = Admin.Folder + QStringLiteral("/api");
   CHECK_MSG(Site(Api) != nullptr, Api);
   CHECK(Sites.canEditNote(Api));
   CHECK(Sites.saveNote(Api, QStringLiteral("Deploy with make deploy.")).isEmpty());
-  CHECK((Site(Api) != nullptr) && (Site(Api)->Note == QStringLiteral("Deploy with make deploy.")));
+  CHECK((Site(Api) != nullptr) && (Site(Api)->PrivateNote == QStringLiteral("Deploy with make deploy.")));
+  CHECK(Wait([&](const auto & D) { Teams().SetNoteShared(Api, true, D); }));
+  CHECK(Site(Api)->Note == QStringLiteral("Deploy with make deploy.") && Site(Api)->PrivateNote.isEmpty());
+  CHECK(Sites.saveNote(Api, QStringLiteral("Deploy with make release.")).isEmpty());
+  CHECK(Site(Api)->Note == QStringLiteral("Deploy with make release."));
+  CHECK(Sites.siteData(Api).value(QStringLiteral("noteStatus")).toString().contains(QStringLiteral("Last edited by")));
   QString Owned = CreateTeam(QStringLiteral("Mine"));
   const QString Web = FolderOf(Owned) + QStringLiteral("/web");
   AddSite(Web);
@@ -2315,6 +2330,9 @@ int main(int Argc, char ** Argv)
   Configuration::Instance().SetIniFileName(Home.path() + QStringLiteral("/nixscp.ini"));
   Configuration::Instance().Load();
   Configuration::Instance().Save();
+  // as the app (main.cpp): TeamSync decides whose a site's note is
+  CloudSync::Instance().Initialize(Configuration::Instance());
+  TeamSync::Instance().Initialize(Configuration::Instance(), CloudSync::Instance());
 
   TestTextFile();
   TestCopy();

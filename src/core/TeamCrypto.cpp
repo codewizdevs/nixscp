@@ -23,6 +23,8 @@ namespace
 const char Alphabet[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const QByteArray SnapshotMagic = QByteArrayLiteral("NXT2");
 const QByteArray SnapshotDomain = QByteArrayLiteral("NXT2-SNAPSHOT|");
+const QByteArray NoteMagic = QByteArrayLiteral("NXN1");
+const QByteArray NoteDomain = QByteArrayLiteral("NXN1-NOTE|");
 constexpr quint32 MaxSnapshotHeader = 4096;
 constexpr int NonceAndTag = 12 + 16;
 
@@ -503,6 +505,95 @@ bool DecodeSnapshot(const QByteArray & Data, const QByteArray & TeamKey, QByteAr
     return Fail(QStringLiteral("The team snapshot is damaged or too large."));
   }
   return true;
+}
+
+//---------------------------------------------------------------------------
+// Team notes
+
+static bool SplitNote(const QByteArray & Data, QByteArray & Prefix, QByteArray & Sealed)
+{
+  if ((Data.size() < 8) || (Data.size() > MaxNoteData) || !Data.startsWith(NoteMagic))
+  {
+    return false;
+  }
+  quint32 Length = qFromLittleEndian<quint32>(Data.constData() + 4);
+  if ((Length == 0) || (Length > 4096) || (Data.size() < 8 + static_cast<qsizetype>(Length) + NonceAndTag + SignatureLength))
+  {
+    return false;
+  }
+  Prefix = Data.left(8 + Length);
+  Sealed = Data.mid(8 + Length, Data.size() - 8 - Length - SignatureLength);
+  return true;
+}
+
+QByteArray EncodeNote(const Note & Header, const QByteArray & TeamKey, const SignKey & Author, const QString & Text)
+{
+  QJsonObject Json{
+    {QStringLiteral("fmt"), 1},
+    {QStringLiteral("team"), Header.Team},
+    {QStringLiteral("id"), Header.Id},
+    {QStringLiteral("version"), Header.Version},
+    {QStringLiteral("key_version"), Header.KeyVersion},
+    {QStringLiteral("author"), Header.Author},
+    {QStringLiteral("saved_at"), Header.SavedAt.toUTC().toString(Qt::ISODateWithMs)},
+  };
+  QByteArray Json8 = QJsonDocument(Json).toJson(QJsonDocument::Compact);
+  QByteArray Prefix = NoteMagic;
+  char Length[4];
+  qToLittleEndian<quint32>(static_cast<quint32>(Json8.size()), Length);
+  Prefix.append(Length, 4);
+  Prefix.append(Json8);
+  QByteArray Signed = Prefix + CloudCrypto::Seal(TeamKey, Text.toUtf8(), Prefix);
+  return Signed + Sign(Author, NoteDomain + Signed);
+}
+
+bool ReadNote(const QByteArray & Data, Note & Header)
+{
+  QByteArray Prefix, Sealed;
+  if (!SplitNote(Data, Prefix, Sealed))
+  {
+    return false;
+  }
+  QJsonObject Json = QJsonDocument::fromJson(Prefix.mid(8)).object();
+  if (Json.value(QStringLiteral("fmt")).toInt() != 1)
+  {
+    return false;
+  }
+  Header = Note();
+  Header.Team = Json.value(QStringLiteral("team")).toString();
+  Header.Id = Json.value(QStringLiteral("id")).toString();
+  Header.Version = Json.value(QStringLiteral("version")).toInteger();
+  Header.KeyVersion = Json.value(QStringLiteral("key_version")).toInteger();
+  Header.Author = Json.value(QStringLiteral("author")).toString();
+  Header.SavedAt = QDateTime::fromString(Json.value(QStringLiteral("saved_at")).toString(), Qt::ISODateWithMs).toUTC();
+  return !Header.Team.isEmpty() && !Header.Id.isEmpty() && (Header.Version > 0) && !Header.Author.isEmpty();
+}
+
+bool VerifyNote(const QByteArray & Data, const QByteArray & AuthorPublic)
+{
+  QByteArray Prefix, Sealed;
+  if (!SplitNote(Data, Prefix, Sealed))
+  {
+    return false;
+  }
+  return Verify(AuthorPublic, NoteDomain + Data.left(Data.size() - SignatureLength), Data.right(SignatureLength));
+}
+
+bool DecodeNote(const QByteArray & Data, const QByteArray & TeamKey, QString & Text)
+{
+  QByteArray Prefix, Sealed, Plain;
+  if (!SplitNote(Data, Prefix, Sealed) || !CloudCrypto::Open(TeamKey, Sealed, Prefix, Plain))
+  {
+    return false;
+  }
+  Text = QString::fromUtf8(Plain);
+  return true;
+}
+
+// 16 random bytes, base64url: names the note in the channel, nothing more
+QString NewNoteId()
+{
+  return QString::fromLatin1(CloudCrypto::RandomBytes(16).toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
 }
 
 }

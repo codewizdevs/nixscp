@@ -189,10 +189,11 @@ nixscp --connect web1                            # interactive shell (in a termi
 nixscp --get web1 /var/log/app.log ./app.log     # download a file
 nixscp --put web1 ./build.tar.gz /tmp/           # upload a file
 nixscp --tunnel db1 5433:localhost:5432          # port forwarding while it runs
+nixscp --note web1                               # the site's note, when you allow it
 nixscp --help                                    # instructions written for agents
 ```
 
-**MCP server:** `nixscp --mcp` serves the same through the Model Context Protocol (tools `list_sites`, `run_command`, `download_file`, `upload_file`), e.g. `claude mcp add nixscp -- nixscp --mcp`.
+**MCP server:** `nixscp --mcp` serves the same through the Model Context Protocol (tools `list_sites`, `run_command`, `download_file`, `upload_file`, `read_note`, `write_note`), e.g. `claude mcp add nixscp -- nixscp --mcp`.
 
 Everything is allowed by default; per site you can optionally:
 - choose what agents may do: commands, downloads, uploads, tunnels;
@@ -201,6 +202,10 @@ Everything is allowed by default; per site you can optionally:
 - keep **session recordings** (on by default): every command and its output, in Commands › Agent Sessions.
 
 Free for everyone. Requires NixSCP running, with your saved passwords encrypted: a **master password** (Preferences › Security) or, with NixSCP Pro, your **NixSCP password**, which encrypts the whole configuration. Every request is written to the agent access log (Commands › Agent Access Log). Private key files should have a passphrase: any program you run can read an unprotected key file directly.
+
+## Site notes
+
+Every site has a **note** in the Login dialog: where the logs are, what not to restart, who to call. **New Note** adds note items that need no server. Notes sync with your sites; on a team site an owner or admin can share the note with the team and let members edit it too, each edit encrypted and signed by its author. Agents read or change a note only when you tick **Allow Agent Access** / **Allow Agent Edit** above it. See [Agent Access](docs/agent-access.md#site-notes) and [Teams](docs/teams.md#notes).
 
 ## Tunnels
 
@@ -212,7 +217,7 @@ Share site folders with colleagues, end-to-end encrypted: **Pro › Teams...**. 
 
 ## Status
 
-**Version 1.3.0** for Linux, Windows, macOS and (new) Android. NixSCP ports WinSCP's features, captions, defaults and shortcuts one-to-one where they make sense on Linux and macOS. Windows-only features without a sane equivalent there (registry storage, drive letters, Windows file attributes, shell extensions) are replaced by native equivalents or removed. The macOS app is not signed by Apple yet; signing is in progress. Bug reports and feature requests are welcome in [Issues](../../issues).
+**Version 1.3.1** for Linux, Windows, macOS and (new) Android. NixSCP ports WinSCP's features, captions, defaults and shortcuts one-to-one where they make sense on Linux and macOS. Windows-only features without a sane equivalent there (registry storage, drive letters, Windows file attributes, shell extensions) are replaced by native equivalents or removed. The macOS app is not signed by Apple yet; signing is in progress. Bug reports and feature requests are welcome in [Issues](../../issues).
 
 ## FAQ
 

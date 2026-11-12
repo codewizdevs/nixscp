@@ -1,7 +1,8 @@
 // A site's note (SessionData::Note), on the site page and on the page of a
 // note item: read-only until Edit, then Save or Cancel. It is saved on its
 // own (sites.saveNote): the site's other settings stay as they are. A team's
-// note is edited by the team's owners and admins only (sites.canEditNote).
+// note is edited as TeamSync allows (sites.canEditNote): owners and admins,
+// and members too when the team's note has team edits on.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
@@ -19,6 +20,8 @@ ColumnLayout {
     property string saved: ""
     // why the last Save was refused
     property string error: ""
+    // who edited the team's note last, or whose note it is (empty: not a team's site)
+    property string status: ""
     // teams.teams: a team's roles may change while the page is open
     readonly property bool canEdit: site.length > 0 && teams.teams !== undefined && sites.canEditNote(site)
     readonly property bool changed: editing && noteText.text !== saved
@@ -29,6 +32,7 @@ ColumnLayout {
     function load() {
         var data = sites.siteData(site)
         saved = data.note || ""
+        status = data.noteStatus || ""
         // what is being written stays (a sync meanwhile)
         if (!editing)
             noteText.text = saved
@@ -130,11 +134,11 @@ ColumnLayout {
     }
     Label {
         Layout.fillWidth: true
-        visible: !section.canEdit
+        visible: text.length > 0
         wrapMode: Text.Wrap
         opacity: 0.7
         font.pixelSize: 13
-        text: qsTr("This note belongs to a team: only the team's owners and admins edit it.")
+        text: section.status
     }
     Label {
         Layout.fillWidth: true

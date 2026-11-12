@@ -145,6 +145,7 @@ void SessionData::Default()
   Ftps = ftpsNone;
   IsWorkspace = false;
   NoteOnly = false;
+  NoteTeamEdit = false;
   Link.clear();
   NameOverride.clear();
   Color = 0;
@@ -591,6 +592,11 @@ void SessionData::Load(IniStorage & Storage)
 
   IsWorkspace = Storage.ReadBool(QStringLiteral("IsWorkspace"), IsWorkspace);
   NoteOnly = Storage.ReadBool(QStringLiteral("NoteOnly"), NoteOnly);
+  NoteTeamEdit = Storage.ReadBool(QStringLiteral("NoteTeamEdit"), NoteTeamEdit);
+  NoteId = Storage.ReadString(QStringLiteral("NoteId"), NoteId);
+  NoteBy = Storage.ReadString(QStringLiteral("NoteBy"), NoteBy);
+  NoteAt = Storage.ReadString(QStringLiteral("NoteAt"), NoteAt);
+  PrivateNote = Storage.ReadString(QStringLiteral("PrivateNote"), PrivateNote);
   Link = Storage.ReadString(QStringLiteral("Link"), Link);
   NameOverride = Storage.ReadString(QStringLiteral("NameOverride"), NameOverride);
   // never written by Save (kept in FRawValues)
@@ -821,6 +827,11 @@ void SessionData::Save(IniStorage & Storage, const SessionData * Default) const
 
   WRITE_DATA(Bool, IsWorkspace);
   WRITE_DATA(Bool, NoteOnly);
+  WRITE_DATA(Bool, NoteTeamEdit);
+  WRITE_DATA(String, NoteId);
+  WRITE_DATA(String, NoteBy);
+  WRITE_DATA(String, NoteAt);
+  WRITE_DATA(String, PrivateNote);
   WRITE_DATA(String, Link);
   WRITE_DATA(String, NameOverride);
 
@@ -1513,6 +1524,13 @@ QStringList SessionData::RawSettingsForUrl() const
   Copy.Color = FactoryDefaults.Color;
   Copy.UpdateDirectories = FactoryDefaults.UpdateDirectories;
   Copy.Note = FactoryDefaults.Note;
+  // notes are no connection settings: never in a URL
+  Copy.NoteOnly = FactoryDefaults.NoteOnly;
+  Copy.NoteTeamEdit = FactoryDefaults.NoteTeamEdit;
+  Copy.NoteId = FactoryDefaults.NoteId;
+  Copy.NoteBy = FactoryDefaults.NoteBy;
+  Copy.NoteAt = FactoryDefaults.NoteAt;
+  Copy.PrivateNote = FactoryDefaults.PrivateNote;
   Copy.AgentAccess = FactoryDefaults.AgentAccess;
   Copy.AgentPermissions = FactoryDefaults.AgentPermissions;
   Copy.AgentName = FactoryDefaults.AgentName;
@@ -1943,6 +1961,11 @@ void StoredSessionList::SetDefaultSettings(const SessionData & Value)
   NewDefaults->Name = DefaultName;
   NewDefaults->IsWorkspace = false;
   NewDefaults->NoteOnly = false;
+  NewDefaults->NoteTeamEdit = false;
+  NewDefaults->NoteId.clear();
+  NewDefaults->NoteBy.clear();
+  NewDefaults->NoteAt.clear();
+  NewDefaults->PrivateNote.clear();
   NewDefaults->Link.clear();
   NewDefaults->NameOverride.clear();
   for (auto & Data : FSessions)

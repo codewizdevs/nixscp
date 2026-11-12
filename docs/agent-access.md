@@ -98,7 +98,8 @@ keep it; the site itself is not edited for this. A site with a note has a small 
 tooltip shows the start of the note. A note holds up to 64 KB of text. It travels with the site: in cloud sync, in
 exports, and in WinSCP's own **Note** field (**Advanced › Note**), so WinSCP shows it too.
 
-On a team site, the note is the team's: its owners and admins edit it, and everyone in the team sees it.
+On a team site, the note is private to you until an owner or admin shares it with the team; then everyone in the
+team sees it, and owners and admins (or everyone, with **Allow Team Edits**) edit it. See [Teams](teams.md#notes).
 
 A note does not need a server. **New Note** (in the Login dialog's **Manage** menu, or the context menu of the site
 list) adds a note item: a yellow page in the list, with only the note and no connection settings. Use it for what
@@ -112,8 +113,8 @@ The two checkboxes above the note decide what agents may do with it:
 - **Allow Agent Access**: agents may read the note (`nixscp --note <site>`, the MCP tool `read_note`). Give agents the
   facts they need before they work on the server, so they do not have to guess.
 - **Allow Agent Edit**: agents may replace the note (`nixscp --note-set <site>`, the MCP tool `write_note`), for
-  example to record what they found or changed. On a team site only owners and admins can tick it, because an agent
-  cannot do more than its user.
+  example to record what they found or changed. On a team site only someone who may edit the note can tick it,
+  because an agent cannot do more than its user.
 
 They are Agent Access permissions of the site, kept on this computer like the others. When Agent Access is off for the
 site, ticking one asks whether to turn it on, with **Ask me each time** and the note as the only permission: agents get

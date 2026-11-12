@@ -114,4 +114,26 @@ namespace TeamCrypto
   bool ReadSnapshot(const QByteArray & Data, Snapshot & Header, QString * Error = nullptr);
   bool VerifySnapshot(const QByteArray & Data, const QByteArray & AuthorPublic);
   bool DecodeSnapshot(const QByteArray & Data, const QByteArray & TeamKey, QByteArray & Plaintext, QString * Error = nullptr);
+
+  // Team note: the note of a team site whose members edit it, in the team's note
+  // channel (one per site, by its NoteId), apart from the snapshots:
+  //   magic "NXN1" | header_len (LE32) | header (JSON) | nonce (12) | ciphertext | tag (16) | signature (64)
+  // AES-256-GCM(team key, UTF-8 text) with the bytes up to the nonce as additional
+  // data; Ed25519 by the author over "NXN1-NOTE|" and all the bytes before it
+  struct Note
+  {
+    QString Team;
+    QString Id;              // the site's NoteId
+    qint64 Version = 0;      // the channel's version of this note: only ever up
+    qint64 KeyVersion = 0;
+    QString Author;          // user uuid, also who edited the note
+    QDateTime SavedAt;
+  };
+  constexpr int MaxNoteData = 100 * 1024;
+  QByteArray EncodeNote(const Note & Header, const QByteArray & TeamKey, const SignKey & Author, const QString & Text);
+  // The header, unauthenticated until VerifyNote and DecodeNote passed
+  bool ReadNote(const QByteArray & Data, Note & Header);
+  bool VerifyNote(const QByteArray & Data, const QByteArray & AuthorPublic);
+  bool DecodeNote(const QByteArray & Data, const QByteArray & TeamKey, QString & Text);
+  QString NewNoteId();
 }

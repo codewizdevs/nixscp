@@ -56,7 +56,7 @@ public:
   // Imports sites from a WinSCP.ini file; the number imported, -1 on error
   Q_INVOKABLE int importWinScpIni(const QString & FileName);
   // name, protocol, host, port (0 = default), user, hasPassword, directory,
-  // keyFile, note, noteItem, canEditNote
+  // keyFile, note, noteItem, canEditNote, noteStatus
   Q_INVOKABLE QVariantMap siteData(const QString & Name) const;
   // Saves a site: a new one (Original empty) or changes Original (renamed
   // when Name differs; its other settings, e.g. the key file, are kept).

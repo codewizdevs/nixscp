@@ -139,6 +139,8 @@ private:
   QPushButton * TeamButton;
   QGroupBox * NoteGroup;
   QPlainTextEdit * NoteMemo;
+  QCheckBox * NoteShareCheck;
+  QCheckBox * NoteTeamEditCheck;
   QCheckBox * NoteAgentReadCheck;
   QCheckBox * NoteAgentWriteCheck;
   QLabel * NoteInfo;
@@ -148,6 +150,7 @@ private:
   // the note of a stored site is edited and saved on its own (not with the site)
   bool FNoteEditing = false;
   bool FNoteMayEdit = false;
+  QString FNoteStatus;
   QString FNoteSite;
   void UpdateNotePanel(const SessionData & Data);
   void UpdateNoteInfo();
@@ -156,6 +159,8 @@ private:
   void CancelNoteEdit();
   bool EnsureNoteSaved();
   void NoteAgentChecked(bool Write, bool Checked);
+  void NoteShareChecked(bool Checked);
+  void NoteTeamEditChecked(bool Checked);
   static QString NoteTip(const SessionData & Data);
   QPushButton * LoginButton;
   QPushButton * CloseButton;

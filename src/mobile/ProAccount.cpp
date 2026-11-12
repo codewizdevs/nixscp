@@ -4,6 +4,7 @@
 #include "mobile/KeyStore.h"
 
 #include "core/CloudCrypto.h"
+#include "core/CloudClient.h"
 #include "core/CloudSync.h"
 #include "core/ConfigVault.h"
 #include "core/TeamSync.h"
@@ -358,7 +359,15 @@ void ProAccount::fetchAccount()
 {
   Sync().FetchAccount([this](bool Ok, const QJsonObject & Me)
   {
-    emit account(Ok ? Me.toVariantMap() : QVariantMap{{QStringLiteral("error"), true}});
+    QVariantMap Data = Ok ? Me.toVariantMap() : QVariantMap{{QStringLiteral("error"), true}};
+    if (Ok)
+    {
+      // what the account stores now, for the page: "6.3 MB of 20 MB used"
+      QJsonObject Storage = Me.value(QStringLiteral("storage")).toObject();
+      Data[QStringLiteral("storageText")] = CloudClient::StorageText(Storage);
+      Data[QStringLiteral("storageFull")] = CloudClient::StorageNearlyFull(Storage);
+    }
+    emit account(Data);
   });
 }
 

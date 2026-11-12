@@ -20,6 +20,7 @@
 #include "core/TeamCrypto.h"
 #include "core/TeamRoster.h"
 
+#include <QDateTime>
 #include <QHash>
 #include <QJsonArray>
 #include <QObject>
@@ -30,6 +31,7 @@
 class Configuration;
 class CloudSync;
 class IniFile;
+class SessionData;
 
 class TeamSync : public QObject
 {
@@ -123,6 +125,33 @@ public:
   // The team's sites on this computer (canonical, reduced to what is shared)
   QByteArray LocalContent(const Team & T) const;
 
+  // ---- Notes ----
+  // The note of a site as this person sees it. On a team site it is the team's
+  // note (Shared), or, when the team shares none, this person's private one. With
+  // team edits on, the team's note is in the team's note channel: written by
+  // admins and members alike, each one signed by its author.
+  struct NoteView
+  {
+    QString Text;
+    bool InTeam = false;      // a team's site (or note item)
+    bool Shared = false;      // the team's note, not this person's private one
+    bool TeamEdit = false;    // members edit it too
+    bool CanEdit = false;     // this person may change it
+    bool CanShare = false;    // owner or admin: sharing and team edits
+    QString EditedBy;         // e-mail of who wrote it last, empty when unknown
+    QDateTime EditedAt;
+  };
+  NoteView NoteOf(const SessionData & Site) const;
+  // Saves the note this person sees (NoteView): the site's own, the private one,
+  // the team's in the content (owners and admins; pushed) or in the note channel
+  void SaveNote(const QString & SiteName, const QString & Text, const Done & Callback);
+  // Owners and admins. Not shared: the team's note becomes this person's private
+  // one and is gone for the others; shared: the private note becomes the team's
+  void SetNoteShared(const QString & SiteName, bool Shared, const Done & Callback);
+  // Owners and admins: members may edit the note too (off: it goes back into the
+  // signed sites, with who wrote it last)
+  void SetNoteTeamEdit(const QString & SiteName, bool On, const Done & Callback);
+
 signals:
   void Changed();
   // Something the user should know (removed from a team, changes reverted, a
@@ -164,6 +193,11 @@ private:
     // a server answer must never let the team come back below them
     bool Detached = false;
     bool Ignored = false;      // given up here; an invite brings it back, the server does not
+    // The note channel: by NoteId, the note accepted last (encrypted and signed as
+    // it came; accepted when its author was in the team) and the highest version
+    // seen, below which the server cannot go back
+    QHash<QString, QByteArray> Notes;
+    QHash<QString, qint64> NotePins;
   };
 
   // A reply's entry of /v1/teams: nothing in it is believed but the wrap's bytes
@@ -248,6 +282,18 @@ private:
   void SyncTeam(const QString & Uuid, const Done & Callback, int Attempt = 0);
   void PullHead(const QString & Uuid, bool Revert, const Done & Callback, int Attempt);
   void Rotate(const QString & Uuid, const Done & Callback);
+  // Team notes
+  void FetchNotes(const QString & Uuid, const Done & Callback);
+  bool AcceptNote(const QString & Uuid, const QString & Id, qint64 Version, const QString & Author, const QByteArray & Data);
+  // A note accepted for the team's current key: its text and header
+  bool ChannelNote(const QString & Uuid, const QString & Id, QString & Text, TeamCrypto::Note & Header) const;
+  void PutNote(const QString & Uuid, const QString & Id, const QString & Text, const Done & Callback);
+  void DropNote(const QString & Uuid, const QString & Id);
+  // Owners and admins: the channel's notes into the team's sites here (before a
+  // removal or a new key: then the next push signs them in)
+  int FoldNotes(const QString & Uuid);
+  Configuration & NoteConfig() const;
+  QString EmailOf(const QString & Uuid, const QString & UserUuid) const;
   void Fetch(const QString & Uuid, qint64 Version, bool AsHead, const FetchDone & Callback);
   bool CheckSnapshot(const QString & Uuid, qint64 Version, const QByteArray & Data, bool AsHead, Verified & Result, QString & Why) const;
   void PinHead(const QString & Uuid, const Verified & Snapshot);

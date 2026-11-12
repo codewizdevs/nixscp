@@ -29,6 +29,7 @@
 #include <QDir>
 #include <QDirIterator>
 #include <QDrag>
+#include <QEventLoop>
 #include <QDragMoveEvent>
 #include <QDropEvent>
 #include <QFile>
@@ -775,8 +776,13 @@ void LoginDialog::CreateControls()
   NoteGroup = new QGroupBox(QStringLiteral("Note"));
   auto * NoteLayout = new QVBoxLayout(NoteGroup);
   auto * NoteChecks = new QHBoxLayout();
+  NoteShareCheck = new QCheckBox(QStringLiteral("Share with Team"));
+  NoteTeamEditCheck = new QCheckBox(QStringLiteral("Allow Team Edits"));
   NoteAgentReadCheck = new QCheckBox(QStringLiteral("Allow Agent Access"));
   NoteAgentWriteCheck = new QCheckBox(QStringLiteral("Allow Agent Edit"));
+  NoteChecks->addWidget(NoteShareCheck);
+  NoteChecks->addWidget(NoteTeamEditCheck);
+  NoteChecks->addSpacing(12);
   NoteChecks->addWidget(NoteAgentReadCheck);
   NoteChecks->addWidget(NoteAgentWriteCheck);
   NoteChecks->addStretch();
@@ -801,6 +807,8 @@ void LoginDialog::CreateControls()
   NoteEditButton->setObjectName(QStringLiteral("NoteEdit"));
   NoteSaveButton->setObjectName(QStringLiteral("NoteSave"));
   NoteCancelButton->setObjectName(QStringLiteral("NoteCancel"));
+  NoteShareCheck->setObjectName(QStringLiteral("NoteShare"));
+  NoteTeamEditCheck->setObjectName(QStringLiteral("NoteTeamEdit"));
   NoteAgentReadCheck->setObjectName(QStringLiteral("NoteAgentRead"));
   NoteAgentWriteCheck->setObjectName(QStringLiteral("NoteAgentWrite"));
   NoteInfo->setObjectName(QStringLiteral("NoteInfo"));
@@ -813,6 +821,8 @@ void LoginDialog::CreateControls()
   connect(NoteSaveButton, &QPushButton::clicked, this, [this]() { SaveNote(); });
   connect(NoteCancelButton, &QPushButton::clicked, this, [this]() { CancelNoteEdit(); });
   connect(NoteMemo, &QPlainTextEdit::textChanged, this, [this]() { if (FNoteEditing) UpdateNoteInfo(); });
+  connect(NoteShareCheck, &QCheckBox::clicked, this, [this](bool Checked) { NoteShareChecked(Checked); });
+  connect(NoteTeamEditCheck, &QCheckBox::clicked, this, [this](bool Checked) { NoteTeamEditChecked(Checked); });
   connect(NoteAgentReadCheck, &QCheckBox::clicked, this, [this](bool Checked) { NoteAgentChecked(false, Checked); });
   connect(NoteAgentWriteCheck, &QCheckBox::clicked, this, [this](bool Checked) { NoteAgentChecked(true, Checked); });
 
@@ -1122,7 +1132,7 @@ QIcon LoginDialog::SessionIcon(const SessionData & Data)
     return NoteItemIcon();
   }
   QIcon Base = SiteIcon(Data);
-  if (Data.Note.trimmed().isEmpty())
+  if (TeamSync::Instance().NoteOf(Data).Text.trimmed().isEmpty())
   {
     return Base;
   }
@@ -1190,7 +1200,7 @@ QIcon LoginDialog::NoteItemIcon()
 // The start of the note, in the site's tooltip
 QString LoginDialog::NoteTip(const SessionData & Data)
 {
-  QString Note = Data.Note.trimmed();
+  QString Note = TeamSync::Instance().NoteOf(Data).Text.trimmed();
   if (Note.isEmpty())
   {
     return QString();
@@ -1214,16 +1224,25 @@ void LoginDialog::UpdateNotePanel(const SessionData & Data)
   // Advanced > Note edits it with the site)
   std::shared_ptr<SessionData> Site = IsEditable() ? nullptr : SelectedSession();
   bool Stored = (Site != nullptr) && (Site->Name == Data.Name);
+  // what this person sees: the site's own note, the team's, or their private one
+  TeamSync::NoteView View;
+  if (Stored)
+  {
+    View = TeamSync::Instance().NoteOf(*Site);
+  }
+  else
+  {
+    View.Text = Data.Note;
+  }
   if (!FNoteEditing)
   {
-    NoteMemo->setPlainText(Data.Note);
+    NoteMemo->setPlainText(View.Text);
   }
-  NoteGroup->setVisible(Stored || !Data.Note.trimmed().isEmpty());
+  NoteGroup->setVisible(Stored || !View.Text.trimmed().isEmpty());
   // a note item has no server: the note is all there is
   BasicGroup->setVisible(!Data.NoteOnly);
   NoteGroup->setTitle(Data.NoteOnly ? QStringLiteral("Note: %1").arg(Data.LocalName()) : QStringLiteral("Note"));
-  const TeamSync::Team * Team = Stored ? TeamSync::Instance().TeamOfSite(Data.Name) : nullptr;
-  FNoteMayEdit = Stored && ((Team == nullptr) || Team->CanEdit());
+  FNoteMayEdit = Stored && View.CanEdit;
   NoteMemo->setReadOnly(!FNoteEditing);
   NoteEditButton->setVisible(Stored && !FNoteEditing);
   NoteEditButton->setEnabled(FNoteMayEdit && !FEditing);
@@ -1231,6 +1250,23 @@ void LoginDialog::UpdateNotePanel(const SessionData & Data)
     QStringLiteral("This site is shared by a team: only the team's owners and admins edit its note."));
   NoteSaveButton->setVisible(FNoteEditing);
   NoteCancelButton->setVisible(FNoteEditing);
+  // the team's settings of the note
+  {
+    QSignalBlocker BlockShare(NoteShareCheck);
+    QSignalBlocker BlockTeamEdit(NoteTeamEditCheck);
+    NoteShareCheck->setChecked(View.InTeam && View.Shared);
+    NoteTeamEditCheck->setChecked(View.InTeam && View.TeamEdit);
+  }
+  NoteShareCheck->setVisible(Stored);
+  NoteTeamEditCheck->setVisible(Stored);
+  NoteShareCheck->setEnabled(View.InTeam && View.CanShare && !FNoteEditing);
+  NoteTeamEditCheck->setEnabled(View.InTeam && View.CanShare && View.Shared && !FNoteEditing);
+  NoteShareCheck->setToolTip(!View.InTeam ? QStringLiteral("Share the site with a team first (Share with Team...): then its note can be the team's.") :
+    !View.CanShare ? QStringLiteral("The team's owners and admins decide whether the note is shared.") :
+    QStringLiteral("On: everyone in the team sees this note. Off: the note is yours only, and the others lose it at their next sync."));
+  NoteTeamEditCheck->setToolTip(!View.InTeam ? QStringLiteral("Only notes shared with a team can be edited by its members.") :
+    !View.CanShare ? QStringLiteral("The team's owners and admins decide whether members edit the note.") :
+    QStringLiteral("Members edit this note too, not only owners and admins. Every change shows who made it."));
   // agents reach SFTP and SCP sites only (AgentAccess::UsableByAgents)
   bool AgentSite = (Data.IsSsh() && !Data.IsWorkspace) || Data.NoteOnly;
   bool On = AgentAccess::UsableByAgents(Data);
@@ -1248,9 +1284,24 @@ void LoginDialog::UpdateNotePanel(const SessionData & Data)
   NoteAgentReadCheck->setToolTip(AgentSite ? QStringLiteral("Let AI agents read this note through NixSCP "
     "(nixscp --note, the MCP tool read_note). It tells them what to know about the server; they never see its password.") : NotForAgents);
   NoteAgentWriteCheck->setToolTip(!AgentSite ? NotForAgents : !FNoteMayEdit ?
-    QStringLiteral("Only the team's owners and admins edit this note, so their agents only.") :
+    QStringLiteral("Only those who may edit this note give their agents that right.") :
     QStringLiteral("Let AI agents replace this note (nixscp --note-set, the MCP tool write_note), "
       "for example to record what they found or changed on the server."));
+  // who wrote it last, for team notes
+  FNoteStatus.clear();
+  if (View.InTeam && View.Shared && !View.EditedBy.isEmpty())
+  {
+    FNoteStatus = QStringLiteral("Last edited by %1%2").arg(View.EditedBy,
+      View.EditedAt.isValid() ? QStringLiteral(", ") + QLocale().toString(View.EditedAt.toLocalTime(), QLocale::ShortFormat) : QString());
+  }
+  else if (View.InTeam && !View.Shared)
+  {
+    FNoteStatus = QStringLiteral("Your private note: the team shares no note for this site");
+  }
+  else if (View.InTeam && !View.CanEdit)
+  {
+    FNoteStatus = QStringLiteral("Only the team's owners and admins edit this note");
+  }
   UpdateNoteInfo();
 }
 
@@ -1259,9 +1310,9 @@ void LoginDialog::UpdateNoteInfo()
   qsizetype Bytes = NoteMemo->toPlainText().toUtf8().size();
   QString Size = (Bytes < 1024) ? QStringLiteral("%1 bytes").arg(Bytes) : QStringLiteral("%1 KB").arg(Bytes / 1024.0, 0, 'f', 1);
   QString Text = QStringLiteral("%1 of %2 KB").arg(Size).arg(AgentAccess::MaxNoteBytes / 1024);
-  if (!FNoteMayEdit && NoteEditButton->isVisible())
+  if (!FNoteStatus.isEmpty())
   {
-    Text += QStringLiteral(" · Shared by a team: only its owners and admins edit this note.");
+    Text += QStringLiteral(" · ") + FNoteStatus;
   }
   NoteInfo->setText(Text);
   NoteInfo->setStyleSheet((Bytes > AgentAccess::MaxNoteBytes) ? QStringLiteral("color: #c0392b;") : QString());
@@ -1299,8 +1350,33 @@ bool LoginDialog::SaveNote()
     QMessageBox::warning(this, QStringLiteral("Note"), Why);
     return false;
   }
-  Site->Note = Text;
-  Configuration::Instance().Save();
+  // The site's own note, a private one, or the team's (signed sites or the note
+  // channel, which answers over the network): wait for the answer here, the text
+  // stays in the editor until it is saved
+  bool Finished = false;
+  bool Ok = false;
+  QString Error;
+  QEventLoop Loop;
+  NoteSaveButton->setEnabled(false);
+  TeamSync::Instance().SaveNote(Site->Name, Text, [&Finished, &Ok, &Error, &Loop](bool Saved, const QString & Message)
+  {
+    Finished = true;
+    Ok = Saved;
+    Error = Message;
+    Loop.quit();
+  });
+  if (!Finished)
+  {
+    QTimer::singleShot(30000, &Loop, &QEventLoop::quit);
+    Loop.exec();
+  }
+  NoteSaveButton->setEnabled(true);
+  if (!Finished || !Ok)
+  {
+    QMessageBox::warning(this, QStringLiteral("Note"), Finished ? Error :
+      QStringLiteral("The team's server did not answer in time. Your text is still in the editor; try again."));
+    return false;
+  }
   FNoteEditing = false;
   for (QTreeWidgetItem * Node : AllNodes())
   {
@@ -1312,6 +1388,47 @@ bool LoginDialog::SaveNote()
   UpdateNotePanel(*Site);
   UpdateControls();
   return true;
+}
+
+void LoginDialog::NoteShareChecked(bool Checked)
+{
+  std::shared_ptr<SessionData> Site = SelectedSession();
+  if (Site == nullptr)
+  {
+    return;
+  }
+  if (!Checked && (QMessageBox::question(this, QStringLiteral("Note"),
+    QStringLiteral("Stop sharing the note of \"%1\" with the team?\n\nThe others lose it at their next sync. You keep it as your "
+      "private note on this computer.").arg(Site->Name), QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes))
+  {
+    UpdateNotePanel(*Site);
+    return;
+  }
+  TeamSync::Instance().SetNoteShared(Site->Name, Checked, [this, Site](bool Ok, const QString & Error)
+  {
+    if (!Ok)
+    {
+      QMessageBox::warning(this, QStringLiteral("Note"), Error);
+    }
+    UpdateNotePanel(*Site);
+  });
+}
+
+void LoginDialog::NoteTeamEditChecked(bool Checked)
+{
+  std::shared_ptr<SessionData> Site = SelectedSession();
+  if (Site == nullptr)
+  {
+    return;
+  }
+  TeamSync::Instance().SetNoteTeamEdit(Site->Name, Checked, [this, Site](bool Ok, const QString & Error)
+  {
+    if (!Ok)
+    {
+      QMessageBox::warning(this, QStringLiteral("Note"), Error);
+    }
+    UpdateNotePanel(*Site);
+  });
 }
 
 void LoginDialog::CancelNoteEdit()
@@ -1332,7 +1449,7 @@ bool LoginDialog::EnsureNoteSaved()
     return true;
   }
   std::shared_ptr<SessionData> Site = FSessions.FindByName(FNoteSite);
-  if ((Site == nullptr) || (NoteMemo->toPlainText() == Site->Note))
+  if ((Site == nullptr) || (NoteMemo->toPlainText() == TeamSync::Instance().NoteOf(*Site).Text))
   {
     CancelNoteEdit();
     return true;

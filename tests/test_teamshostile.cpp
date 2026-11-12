@@ -2214,6 +2214,229 @@ static void ScenarioRosterScale()
 
 //---------------------------------------------------------------------------
 
+// ---- Site notes in a team ----
+
+// A team's sites: one site "db" with a note, members editing it or not
+static QByteArray NoteContent(const QString & TeamName, const QString & Note, bool TeamEdit, const QString & Id, const QString & By)
+{
+  IniFile Ini;
+  SessionData S;
+  S.HostName = QStringLiteral("db.internal");
+  S.UserName = QStringLiteral("deploy");
+  S.Password = QStringLiteral("pw1");
+  S.FSProtocol = fsSFTP;
+  S.Note = Note;
+  S.NoteTeamEdit = TeamEdit;
+  S.NoteId = Id;
+  S.NoteBy = By;
+  CHECK(TeamContent::AddSite(Ini, QStringLiteral("db"), S));
+  return TeamContent::Encode(TeamName, Ini);
+}
+
+// A site of the team's head as the server has it, read with the team's key
+static std::shared_ptr<SessionData> Pushed(const QString & Uuid, const QString & Name)
+{
+  FakeTeam & T = Srv->Teams[Uuid];
+  QByteArray Key = Teams().Find(Uuid)->Key.Copy();
+  QByteArray Plain;
+  QString TeamName;
+  IniFile Ini;
+  if (!TeamCrypto::DecodeSnapshot(T.Snapshots.value(T.Head), Key, Plain) || !TeamContent::Decode(Plain, TeamName, Ini))
+  {
+    return nullptr;
+  }
+  QString Section = TeamContent::SiteSection(Name);
+  return Ini.Sections().contains(Section) ? TeamContent::Merge(Ini, Section, nullptr, Name) : nullptr;
+}
+
+static TeamSync::NoteView NoteIn(const QString & Folder)
+{
+  std::shared_ptr<SessionData> Db = Site(Folder + QStringLiteral("/db"));
+  CHECK(Db != nullptr);
+  return (Db != nullptr) ? Teams().NoteOf(*Db) : TeamSync::NoteView();
+}
+
+static bool SaveNoteIn(const QString & Folder, const QString & Text, QString * Error = nullptr)
+{
+  return Wait([&](const auto & D) { Teams().SaveNote(Folder + QStringLiteral("/db"), Text, D); }, Error);
+}
+
+// A member: the team's note, edits in the channel, who wrote it, and a race
+static void ScenarioNotesMember()
+{
+  Boot();
+  Joined J = MemberOf(QStringLiteral("Shared"), {{"db", "db.internal", "pw1"}});
+  FakeTeam & T = Srv->Teams[J.Uuid];
+  QString Id = TeamCrypto::NewNoteId();
+  Srv->PeerPush(J.Owner, J.Uuid, NoteContent(QStringLiteral("Shared"), QStringLiteral("first"), true, Id, J.Owner.Uuid));
+  CHECK(SyncAll());
+  TeamSync::NoteView V = NoteIn(J.Folder);
+  CHECK(V.InTeam && V.Shared && V.TeamEdit && V.CanEdit && !V.CanShare);
+  CHECK(V.Text == QStringLiteral("first"));
+  CHECK_MSG(V.EditedBy == J.Owner.Email, V.EditedBy);
+  // the owner writes in the channel
+  Srv->PeerNote(J.Owner, J.Uuid, Id, QStringLiteral("second"));
+  CHECK(SyncAll());
+  V = NoteIn(J.Folder);
+  CHECK((V.Text == QStringLiteral("second")) && (V.EditedBy == J.Owner.Email));
+  // this member writes: signed as them, the next version
+  QString Error;
+  CHECK_MSG(SaveNoteIn(J.Folder, QStringLiteral("third"), &Error), Error);
+  CHECK((T.Notes.value(Id).Version == 2) && (T.Notes.value(Id).Author == VictimUuid));
+  V = NoteIn(J.Folder);
+  CHECK((V.Text == QStringLiteral("third")) && (V.EditedBy == VictimEmail));
+  // someone saved first: refused, and theirs arrives
+  Srv->PeerNote(J.Owner, J.Uuid, Id, QStringLiteral("fourth"));
+  CHECK(!SaveNoteIn(J.Folder, QStringLiteral("mine"), &Error));
+  CHECK_MSG(Error.contains(QStringLiteral("changed this note meanwhile")), Error);
+  CHECK(NoteIn(J.Folder).Text == QStringLiteral("fourth"));
+  // the owner's storage is full: refused with a reason, the note as it was
+  T.StorageFull = true;
+  CHECK(!SaveNoteIn(J.Folder, QStringLiteral("too much"), &Error));
+  CHECK_MSG(Error.contains(QStringLiteral("storage of this team's owner is full (19.5 MB of 20 MB used)")), Error);
+  CHECK(NoteIn(J.Folder).Text == QStringLiteral("fourth"));
+  T.StorageFull = false;
+  // notes do not touch the signed sites: nothing to push or revert
+  int Commits = Srv->Commits;
+  CHECK(SyncAll());
+  CHECK(Srv->Commits == Commits);
+  CHECK(Site(J.Folder + QStringLiteral("/db"))->HostName == QStringLiteral("db.internal"));
+}
+
+// A hostile server cannot put words in the team's mouth
+static void ScenarioNotesForged()
+{
+  Boot();
+  Joined J = MemberOf(QStringLiteral("Shared"), {{"db", "db.internal", "pw1"}});
+  FakeTeam & T = Srv->Teams[J.Uuid];
+  QString Id = TeamCrypto::NewNoteId();
+  Srv->PeerPush(J.Owner, J.Uuid, NoteContent(QStringLiteral("Shared"), QStringLiteral("content"), true, Id, J.Owner.Uuid));
+  Peer Mallory = NewPeer(QStringLiteral("mallory"));
+  Srv->PeerJoin(Mallory, Srv->PeerInvite(J.Owner, J.Uuid, QStringLiteral("member"), QStringLiteral("Shared")));
+  CHECK(SyncAll());
+  Srv->PeerNote(J.Owner, J.Uuid, Id, QStringLiteral("good one"));
+  Srv->PeerNote(J.Owner, J.Uuid, Id, QStringLiteral("good two"));
+  CHECK(SyncAll());
+  CHECK(NoteIn(J.Folder).Text == QStringLiteral("good two"));
+  QByteArray First = Srv->PeerNoteData(J.Owner, J.Uuid, Id, 1, QStringLiteral("good one"));
+  auto Serve = [&](const QByteArray & Data, qint64 Version, const QString & Author, const QString & ListedId = QString())
+  {
+    T.HasServeNotes = true;
+    T.ServeNotes = QJsonArray{QJsonObject{{"id", ListedId.isEmpty() ? Id : ListedId}, {"version", Version},
+      {"data", QString::fromLatin1(Data.toBase64())}, {"author", Author}}};
+    CHECK(SyncAll());
+    TeamSync::NoteView V = NoteIn(J.Folder);
+    CHECK_MSG(V.Text == QStringLiteral("good two"), V.Text);
+    CHECK(V.EditedBy == J.Owner.Email);
+  };
+  // a stranger to the roster
+  Peer Eve = NewPeer(QStringLiteral("eve"));
+  Serve(Srv->PeerNoteData(Eve, J.Uuid, Id, 3, QStringLiteral("evil")), 3, Eve.Uuid);
+  // a member signing as the owner
+  Peer Fake = Mallory;
+  Fake.Uuid = J.Owner.Uuid;
+  Serve(Srv->PeerNoteData(Fake, J.Uuid, Id, 3, QStringLiteral("evil")), 3, J.Owner.Uuid);
+  // one changed byte
+  QByteArray Flipped = Srv->PeerNoteData(J.Owner, J.Uuid, Id, 3, QStringLiteral("evil"));
+  Flipped[Flipped.size() - 80] = static_cast<char>(Flipped.at(Flipped.size() - 80) ^ 1);
+  Serve(Flipped, 3, J.Owner.Uuid);
+  // the version or the author the server says differs from the signed one
+  Serve(Srv->PeerNoteData(J.Owner, J.Uuid, Id, 4, QStringLiteral("evil")), 3, J.Owner.Uuid);
+  Serve(Srv->PeerNoteData(J.Owner, J.Uuid, Id, 3, QStringLiteral("evil")), 3, Mallory.Uuid);
+  // another note's text under this id
+  Serve(Srv->PeerNoteData(J.Owner, J.Uuid, TeamCrypto::NewNoteId(), 3, QStringLiteral("evil")), 3, J.Owner.Uuid);
+  // an older version again
+  Serve(First, 1, J.Owner.Uuid);
+  // under another key
+  Serve(Srv->PeerNoteData(J.Owner, J.Uuid, Id, 3, QStringLiteral("evil"), QByteArray(32, 'k')), 3, J.Owner.Uuid);
+  T.HasServeNotes = false;
+  // a site without team edits does not take notes from the channel
+  Srv->PeerPush(J.Owner, J.Uuid, NoteContent(QStringLiteral("Shared"), QStringLiteral("signed only"), false, Id, J.Owner.Uuid));
+  Srv->PeerNote(Mallory, J.Uuid, Id, QStringLiteral("evil"));
+  CHECK(SyncAll());
+  TeamSync::NoteView V = NoteIn(J.Folder);
+  CHECK_MSG(V.Text == QStringLiteral("signed only"), V.Text);
+  // and a member cannot change it
+  CHECK(!V.CanEdit);
+  QString Error;
+  CHECK(!SaveNoteIn(J.Folder, QStringLiteral("mine"), &Error));
+}
+
+// An owner: the note in the signed sites, team edits on and off, not shared,
+// and a removed member's last note kept
+static void ScenarioNotesAdmin()
+{
+  Boot();
+  Setup S = OwnedTeam();
+  QString Db = S.Folder + QStringLiteral("/db");
+  QString Error;
+  // no team note yet: what the owner writes is private until shared
+  CHECK_MSG(SaveNoteIn(S.Folder, QStringLiteral("owner's note"), &Error), Error);
+  CHECK(SyncAll());
+  auto P = Pushed(S.Uuid, QStringLiteral("db"));
+  CHECK((P != nullptr) && P->Note.isEmpty());
+  CHECK(!NoteIn(S.Folder).Shared && (Site(Db)->PrivateNote == QStringLiteral("owner's note")));
+  CHECK(Wait([&](const auto & D) { Teams().SetNoteShared(Db, true, D); }));
+  CHECK(SyncAll());
+  P = Pushed(S.Uuid, QStringLiteral("db"));
+  CHECK((P != nullptr) && (P->Note == QStringLiteral("owner's note")) && (P->NoteBy == VictimUuid));
+  // the team's note now: an edit goes into the signed sites
+  CHECK_MSG(SaveNoteIn(S.Folder, QStringLiteral("owner's note, edited"), &Error), Error);
+  CHECK(SyncAll());
+  P = Pushed(S.Uuid, QStringLiteral("db"));
+  CHECK((P != nullptr) && (P->Note == QStringLiteral("owner's note, edited")));
+  // team edits on: an id for the channel, in the signed sites
+  CHECK(Wait([&](const auto & D) { Teams().SetNoteTeamEdit(Db, true, D); }));
+  CHECK(SyncAll());
+  P = Pushed(S.Uuid, QStringLiteral("db"));
+  CHECK((P != nullptr) && P->NoteTeamEdit && !P->NoteId.isEmpty());
+  QString Id = (P != nullptr) ? P->NoteId : QString();
+  // a member edits; the owner sees who
+  Srv->PeerNote(S.Bob, S.Uuid, Id, QStringLiteral("bob's note"));
+  CHECK(SyncAll());
+  TeamSync::NoteView V = NoteIn(S.Folder);
+  CHECK((V.Text == QStringLiteral("bob's note")) && (V.EditedBy == S.Bob.Email) && V.CanShare);
+  // team edits off: back into the signed sites, still by Bob; the channel is empty
+  CHECK(Wait([&](const auto & D) { Teams().SetNoteTeamEdit(Db, false, D); }));
+  CHECK(SyncAll());
+  P = Pushed(S.Uuid, QStringLiteral("db"));
+  CHECK((P != nullptr) && (P->Note == QStringLiteral("bob's note")) && (P->NoteBy == S.Bob.Uuid) && !P->NoteTeamEdit);
+  CHECK(Srv->Teams[S.Uuid].Notes.isEmpty());
+  // not shared: gone for the team, kept here as a private note
+  CHECK(Wait([&](const auto & D) { Teams().SetNoteShared(Db, false, D); }));
+  CHECK(SyncAll());
+  P = Pushed(S.Uuid, QStringLiteral("db"));
+  CHECK((P != nullptr) && P->Note.isEmpty());
+  CHECK(Site(Db)->PrivateNote == QStringLiteral("bob's note"));
+  V = NoteIn(S.Folder);
+  CHECK(!V.Shared && (V.Text == QStringLiteral("bob's note")) && V.CanEdit);
+  // the private note never reaches the team
+  CHECK_MSG(SaveNoteIn(S.Folder, QStringLiteral("only mine"), &Error), Error);
+  CHECK(SyncAll());
+  P = Pushed(S.Uuid, QStringLiteral("db"));
+  CHECK((P != nullptr) && P->Note.isEmpty() && P->PrivateNote.isEmpty());
+  // shared again: the private note becomes the team's
+  CHECK(Wait([&](const auto & D) { Teams().SetNoteShared(Db, true, D); }));
+  CHECK(SyncAll());
+  P = Pushed(S.Uuid, QStringLiteral("db"));
+  CHECK((P != nullptr) && (P->Note == QStringLiteral("only mine")));
+  // a member's last note survives their removal (and the new key)
+  CHECK(Wait([&](const auto & D) { Teams().SetNoteTeamEdit(Db, true, D); }));
+  CHECK(SyncAll());
+  P = Pushed(S.Uuid, QStringLiteral("db"));
+  Id = (P != nullptr) ? P->NoteId : QString();
+  Srv->PeerNote(S.Bob, S.Uuid, Id, QStringLiteral("bob before leaving"));
+  CHECK(SyncAll());
+  CHECK_MSG(Wait([&](const auto & D) { Teams().RemoveMember(S.Uuid, S.Bob.Uuid, D); }, &Error), Error);
+  CHECK(SyncAll());
+  P = Pushed(S.Uuid, QStringLiteral("db"));
+  CHECK_MSG((P != nullptr) && (P->Note == QStringLiteral("bob before leaving")) && (P->NoteBy == S.Bob.Uuid),
+    (P != nullptr) ? P->Note : QStringLiteral("(none)"));
+  V = NoteIn(S.Folder);
+  CHECK_MSG(V.Text == QStringLiteral("bob before leaving"), V.Text);
+  CHECK(V.EditedBy == QStringLiteral("a former member"));
+}
+
 struct Scenario
 {
   const char * Name;
@@ -2284,6 +2507,9 @@ static const Scenario Scenarios[] = {
   {"low-order-box", ScenarioLowOrderBox},
   {"changes-are-told", ScenarioChangesAreTold},
   {"roster-scale", ScenarioRosterScale},
+  {"notes-member", ScenarioNotesMember},
+  {"notes-forged", ScenarioNotesForged},
+  {"notes-admin", ScenarioNotesAdmin},
 };
 
 int main(int argc, char ** argv)

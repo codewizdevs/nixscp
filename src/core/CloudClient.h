@@ -42,6 +42,11 @@ public:
   // $NIXSCP_CLOUD_URL (FromEnvironment) and a server on this computer; a debug
   // build allows any host for it
   static bool AcceptableUrl(const QString & Url, bool FromEnvironment);
+  // The account's storage ({used, limit} of /v1/me or a storage_full answer):
+  // "6.3 MB of 20 MB used", empty without a limit
+  static QString StorageText(const QJsonObject & Storage);
+  // Whether it is nearly or quite full (90 %)
+  static bool StorageNearlyFull(const QJsonObject & Storage);
   QString BaseUrl() const { return FBaseUrl; }
   // A URL that is not acceptable gives the default
   void SetBaseUrl(const QString & Url);

@@ -65,6 +65,12 @@ public:
   TFtps Ftps;                       // Ftps
   bool IsWorkspace;                 // IsWorkspace
   bool NoteOnly;                    // NoteOnly: a note in the site list, with no server behind it (NixSCP)
+  // Notes of team sites (NixSCP, core/TeamSync): signed with the team's content
+  bool NoteTeamEdit;                // NoteTeamEdit: members edit the note too (in the team's note channel)
+  QString NoteId;                   // NoteId: the note's channel id, random
+  QString NoteBy;                   // NoteBy: user id of who wrote the note last
+  QString NoteAt;                   // NoteAt: when (ISO 8601, UTC)
+  QString PrivateNote;              // PrivateNote: this person's own note of a team site whose note is not shared (never shared)
   QString Link;                     // Link: workspace entry referring to a stored site (core/Workspaces.h)
   QString NameOverride;             // NameOverride: name of an ad-hoc session saved in a workspace
   int Color;                        // Color (BGR TColor, 0 = none)

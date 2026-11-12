@@ -82,6 +82,12 @@ struct FakeTeam
   bool Hidden = false;
   bool SayNeedsRotation = false;
   QJsonArray ServeMembers;
+  // the note channel: id -> version, data and author, as the server keeps them
+  struct Note { qint64 Version = 0; QByteArray Data; QString Author; };
+  QHash<QString, Note> Notes;
+  QJsonArray ServeNotes;         // replaces the answer of GET notes
+  bool HasServeNotes = false;
+  bool StorageFull = false;      // note writes are refused: the owner's storage is full
 };
 
 struct Fake : QObject
@@ -368,6 +374,31 @@ struct Fake : QObject
         Code = 201;
         return J({{"id", In["id"]}, {"roster", RosterHead(T)}});
       }
+      if (Rest == "notes")
+      {
+        if (T.HasServeNotes) return QJsonDocument(T.ServeNotes).toJson(QJsonDocument::Compact);
+        QJsonArray List;
+        for (auto N = T.Notes.cbegin(); N != T.Notes.cend(); ++N)
+        {
+          List.append(QJsonObject{{"id", N.key()}, {"version", N->Version}, {"data", QString::fromLatin1(N->Data.toBase64())}, {"author", N->Author}});
+        }
+        return QJsonDocument(List).toJson(QJsonDocument::Compact);
+      }
+      if (Rest.startsWith("notes/"))
+      {
+        QString Id = Rest.mid(6);
+        if (Method == "DELETE")
+        {
+          if (!T.Roster.CanEdit(User)) return Error(Code, 403, "role_required");
+          T.Notes.remove(Id);
+          return J({{"ok", true}});
+        }
+        qint64 Now = T.Notes.value(Id).Version;
+        if (In["base_version"].toInteger() != Now) return Error(Code, 409, "version_conflict", {{"version", Now}});
+        if (T.StorageFull) return Error(Code, 413, "storage_full", {{"used", 20447232}, {"limit", 20971520}, {"team", true}, {"owner", false}});
+        T.Notes.insert(Id, FakeTeam::Note{Now + 1, UnB64(In["data"]), User});
+        return J({{"version", Now + 1}});
+      }
       if (Rest == "sync/head") return J({{"version", T.Head}, {"sha256", Sha(T.Snapshots.value(T.Head))}});
       if (Rest == "sync/history")
       {
@@ -482,6 +513,27 @@ struct Fake : QObject
   {
     FakeTeam & T = Teams[Uuid];
     Publish(T, T.Head + 1, PeerSnapshot(Author, T, T.Head + 1, Content), T.Roster.KeyVersion);
+  }
+
+  // A note by a peer in the team's channel (Version 0: the next one)
+  QByteArray PeerNoteData(const Peer & Author, const QString & Uuid, const QString & Id, qint64 Version, const QString & Text,
+    const QByteArray & Key = QByteArray(), qint64 KeyVersion = 0)
+  {
+    FakeTeam & T = Teams[Uuid];
+    TeamCrypto::Note Header;
+    Header.Team = Uuid;
+    Header.Id = Id;
+    Header.Version = Version;
+    Header.KeyVersion = (KeyVersion > 0) ? KeyVersion : T.Roster.KeyVersion;
+    Header.Author = Author.Uuid;
+    Header.SavedAt = QDateTime::currentDateTimeUtc();
+    return TeamCrypto::EncodeNote(Header, Key.isEmpty() ? T.Key : Key, Author.Identity, Text);
+  }
+  void PeerNote(const Peer & Author, const QString & Uuid, const QString & Id, const QString & Text)
+  {
+    FakeTeam & T = Teams[Uuid];
+    qint64 Version = T.Notes.value(Id).Version + 1;
+    T.Notes.insert(Id, FakeTeam::Note{Version, PeerNoteData(Author, Uuid, Id, Version, Text), Author.Uuid});
   }
 
   void PeerRemove(const Peer & Admin, const QString & Uuid, const QString & User)

@@ -45,6 +45,19 @@ are never uploaded: transfers always go directly between your computer and your 
 Private key **files** are not synced, only their paths. Copy key files to the same location on each computer, or
 use paths that exist on every computer.
 
+## Storage
+
+Each account stores up to **20 MB** in the cloud. Only what is stored now counts, not the older versions kept for
+restoring:
+
+- your synced settings and open tabs;
+- the sites and notes of the [teams](teams.md) you own (a team counts for its owner only).
+
+Settings with a few thousand sites take well under 1 MB, so most accounts never come near the limit. **Cloud Sync
+Settings** (and the NixSCP Pro page on Android) and the account page on the website show how much is used. When an
+upload would go over the limit, it is refused with a message that says so, and nothing already stored is lost.
+Smaller uploads always work, so removing sites, notes or teams makes room again.
+
 ## When it syncs
 
 - At startup, every 5 minutes, when the NixSCP window gets focus (if the last check is older than a minute),

@@ -10,6 +10,7 @@
 //
 // Skipped unless NIXSCP_TEST_CLOUD_COOKIE and NIXSCP_TEST_CLOUD_COOKIE2 are
 // website session cookies of two fresh test accounts (beta or a license).
+#include "core/CloudClient.h"
 #include "core/CloudSync.h"
 #include "core/ConfigVault.h"
 #include "core/Configuration.h"
@@ -131,6 +132,16 @@ static QByteArray Read(const QString & File)
 {
   QFile F(File);
   return F.open(QIODevice::ReadOnly) ? F.readAll().trimmed() : QByteArray();
+}
+
+// The account's storage as /v1/me reports it
+static QJsonObject StorageOf()
+{
+  auto Me = std::make_shared<QJsonObject>();
+  auto Fetched = std::make_shared<int>(0);
+  CloudSync::Instance().FetchAccount([Me, Fetched](bool Ok, const QJsonObject & J) { *Me = J; *Fetched = Ok ? 1 : 2; });
+  WaitFor([Fetched]() { return *Fetched != 0; });
+  return Me->value(QStringLiteral("storage")).toObject();
 }
 
 static int RunStep(const QString & Dir, const QString & Step, const QString & Shared)
@@ -293,6 +304,100 @@ static int RunStep(const QString & Dir, const QString & Step, const QString & Sh
     CHECK(Site(TeamFolder + QStringLiteral("/Ops/mine")) == nullptr);
     CHECK(Site(QStringLiteral("gone")) == nullptr);
     CHECK(Site(TeamFolder + QStringLiteral("/Shared/web1")) != nullptr);
+  }
+  else if (Step == QStringLiteral("alice-notes"))
+  {
+    // notes: private until shared; shared in the signed sites; team edits in the note channel
+    CHECK(Wait([&](const auto & D) { Teams.SyncAll(D); }));
+    const QString Web1 = TeamFolder + QStringLiteral("/Shared/web1");
+    const QString Db1 = TeamFolder + QStringLiteral("/Shared/db1");
+    CHECK(Wait([&](const auto & D) { Teams.SaveNote(Web1, QStringLiteral("Alice's own reminder."), D); }));
+    TeamSync::NoteView View = Teams.NoteOf(*Site(Web1));
+    CHECK(View.InTeam && !View.Shared && View.CanEdit && View.CanShare && (View.Text == QStringLiteral("Alice's own reminder.")));
+    CHECK(Wait([&](const auto & D) { Teams.SetNoteShared(Web1, true, D); }));
+    CHECK(Wait([&](const auto & D) { Teams.SaveNote(Web1, QStringLiteral("Web1: restart with systemctl."), D); }));
+    CHECK(Wait([&](const auto & D) { Teams.SyncAll(D); }));
+    View = Teams.NoteOf(*Site(Web1));
+    CHECK(View.Shared && !View.TeamEdit && (View.Text == QStringLiteral("Web1: restart with systemctl.")) && !View.EditedBy.isEmpty());
+    Write(Shared + QStringLiteral("/alice-email"), View.EditedBy.toUtf8());
+    // db1: shared, and members edit it too
+    CHECK(Wait([&](const auto & D) { Teams.SaveNote(Db1, QStringLiteral("Db1: backups at 02:00."), D); }));
+    CHECK(Wait([&](const auto & D) { Teams.SetNoteShared(Db1, true, D); }));
+    CHECK(Wait([&](const auto & D) { Teams.SetNoteTeamEdit(Db1, true, D); }));
+    CHECK(Wait([&](const auto & D) { Teams.SyncAll(D); }));
+    View = Teams.NoteOf(*Site(Db1));
+    CHECK(View.Shared && View.TeamEdit && (View.Text == QStringLiteral("Db1: backups at 02:00.")));
+    // the note is not in the personal sync, and agent rights stay off
+    CHECK(Site(Db1)->PrivateNote.isEmpty());
+  }
+  else if (Step == QStringLiteral("bob-notes"))
+  {
+    CHECK(Wait([&](const auto & D) { Teams.SyncAll(D); }));
+    const QString Web1 = TeamFolder + QStringLiteral("/Shared/web1");
+    const QString Db1 = TeamFolder + QStringLiteral("/Shared/db1");
+    const QString AliceEmail = QString::fromUtf8(Read(Shared + QStringLiteral("/alice-email")));
+    TeamSync::NoteView View = Teams.NoteOf(*Site(Web1));
+    CHECK_MSG(View.Shared && !View.CanEdit && !View.CanShare && (View.Text == QStringLiteral("Web1: restart with systemctl.")), View.Text);
+    CHECK_MSG(View.EditedBy == AliceEmail, View.EditedBy);
+    // Alice's private note never came
+    CHECK(!Site(Web1)->PrivateNote.contains(QStringLiteral("Alice")));
+    QString Error;
+    CHECK(!Wait([&](const auto & D) { Teams.SaveNote(Web1, QStringLiteral("Bob was here."), D); }, &Error));
+    CHECK(Error.contains(QStringLiteral("owners and admins")));
+    // a member does not decide about sharing
+    CHECK(!Wait([&](const auto & D) { Teams.SetNoteShared(Web1, false, D); }));
+    // db1 has team edits: Bob writes it through the note channel
+    View = Teams.NoteOf(*Site(Db1));
+    CHECK_MSG(View.Shared && View.TeamEdit && View.CanEdit && (View.Text == QStringLiteral("Db1: backups at 02:00.")), View.Text);
+    CHECK(Wait([&](const auto & D) { Teams.SaveNote(Db1, QStringLiteral("Db1: backups at 03:00 now."), D); }));
+    View = Teams.NoteOf(*Site(Db1));
+    CHECK((View.Text == QStringLiteral("Db1: backups at 03:00 now.")) && !View.EditedBy.isEmpty() && (View.EditedBy != AliceEmail));
+    Write(Shared + QStringLiteral("/bob-email"), View.EditedBy.toUtf8());
+    // a second save (version 2) and a fresh sync see the same note
+    CHECK(Wait([&](const auto & D) { Teams.SaveNote(Db1, QStringLiteral("Db1: backups at 03:00 now. Checked."), D); }));
+    CHECK(Wait([&](const auto & D) { Teams.SyncAll(D); }));
+    CHECK(Teams.NoteOf(*Site(Db1)).Text == QStringLiteral("Db1: backups at 03:00 now. Checked."));
+  }
+  else if (Step == QStringLiteral("alice-notes2"))
+  {
+    CHECK(Wait([&](const auto & D) { Teams.SyncAll(D); }));
+    const QString Web1 = TeamFolder + QStringLiteral("/Shared/web1");
+    const QString Db1 = TeamFolder + QStringLiteral("/Shared/db1");
+    const QString BobEmail = QString::fromUtf8(Read(Shared + QStringLiteral("/bob-email")));
+    TeamSync::NoteView View = Teams.NoteOf(*Site(Db1));
+    CHECK_MSG(View.TeamEdit && (View.Text == QStringLiteral("Db1: backups at 03:00 now. Checked.")), View.Text);
+    CHECK_MSG(View.EditedBy == BobEmail, View.EditedBy);
+    // the owner's storage counts the team's sites and Bob's note in the channel
+    QJsonObject Storage = StorageOf();
+    QString Json = QString::fromUtf8(QJsonDocument(Storage).toJson(QJsonDocument::Compact));
+    CHECK_MSG((Storage.value(QStringLiteral("teams")).toDouble() > 0) && (Storage.value(QStringLiteral("notes")).toDouble() > 0) &&
+      (Storage.value(QStringLiteral("limit")).toDouble() == 20 * 1024 * 1024), Json);
+    CHECK_MSG(CloudClient::StorageText(Storage).endsWith(QStringLiteral("of 20 MB used")), CloudClient::StorageText(Storage));
+    // team edits off: the note goes back into the signed sites, with who wrote it
+    CHECK(Wait([&](const auto & D) { Teams.SetNoteTeamEdit(Db1, false, D); }));
+    CHECK(Wait([&](const auto & D) { Teams.SyncAll(D); }));
+    // folded back: nothing left in the channel
+    CHECK(StorageOf().value(QStringLiteral("notes")).toDouble() == 0);
+    View = Teams.NoteOf(*Site(Db1));
+    CHECK_MSG(!View.TeamEdit && (View.Text == QStringLiteral("Db1: backups at 03:00 now. Checked.")) && (View.EditedBy == BobEmail), View.EditedBy);
+    // web1 not shared any more: it is Alice's private note again
+    CHECK(Wait([&](const auto & D) { Teams.SetNoteShared(Web1, false, D); }));
+    CHECK(Wait([&](const auto & D) { Teams.SyncAll(D); }));
+    View = Teams.NoteOf(*Site(Web1));
+    CHECK(!View.Shared && (View.Text == QStringLiteral("Web1: restart with systemctl.")));
+  }
+  else if (Step == QStringLiteral("bob-notes2"))
+  {
+    CHECK(Wait([&](const auto & D) { Teams.SyncAll(D); }));
+    const QString Web1 = TeamFolder + QStringLiteral("/Shared/web1");
+    const QString Db1 = TeamFolder + QStringLiteral("/Shared/db1");
+    TeamSync::NoteView View = Teams.NoteOf(*Site(Db1));
+    CHECK_MSG(!View.TeamEdit && !View.CanEdit && (View.Text == QStringLiteral("Db1: backups at 03:00 now. Checked.")), View.Text);
+    QString Error;
+    CHECK(!Wait([&](const auto & D) { Teams.SaveNote(Db1, QStringLiteral("Late edit."), D); }, &Error));
+    // web1's note is gone for Bob; his own private note is his again
+    View = Teams.NoteOf(*Site(Web1));
+    CHECK_MSG(!View.Shared && View.CanEdit && !View.Text.contains(QStringLiteral("systemctl")), View.Text);
   }
   else if (Step == QStringLiteral("alice-promote"))
   {
@@ -589,6 +694,8 @@ int main(int argc, char ** argv)
     {Alice.path(), QStringLiteral("alice-add")}, {Bob.path(), QStringLiteral("bob-pull")},
     {Alice2.path(), QStringLiteral("alice2-setup")},
     {Alice.path(), QStringLiteral("alice-unshare")}, {Bob.path(), QStringLiteral("bob-unshared")},
+    {Alice.path(), QStringLiteral("alice-notes")}, {Bob.path(), QStringLiteral("bob-notes")},
+    {Alice.path(), QStringLiteral("alice-notes2")}, {Bob.path(), QStringLiteral("bob-notes2")},
     {Alice.path(), QStringLiteral("alice-promote")}, {Bob.path(), QStringLiteral("bob-renamed")},
     {Alice.path(), QStringLiteral("alice-conflict")}, {Bob.path(), QStringLiteral("bob-late-push")},
     {Alice.path(), QStringLiteral("alice-demote")}, {Bob.path(), QStringLiteral("bob-hostile")},

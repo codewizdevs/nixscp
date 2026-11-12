@@ -7,10 +7,15 @@
 #include "mobile/KeyStore.h"
 #include "mobile/MobileSettings.h"
 
+#include <QEventLoop>
 #include <QFileInfo>
+#include <QLocale>
+#include <QTimer>
 #include <QUrl>
 
 #include <algorithm>
+
+static QString NoteStatus(const TeamSync::NoteView & Note);
 
 namespace
 {
@@ -61,11 +66,11 @@ void SitesModel::reload()
     // a note item has no server: no host, user or protocol to show or search
     if (Data->NoteOnly)
     {
-      Sites.append(Site{Data->Name, Data->LocalName(), Data->FolderName(), QString(), QString(), QString(), true, Data->Note});
+      Sites.append(Site{Data->Name, Data->LocalName(), Data->FolderName(), QString(), QString(), QString(), true, TeamSync::Instance().NoteOf(*Data).Text});
       continue;
     }
     Sites.append(Site{Data->Name, Data->LocalName(), Data->FolderName(), Data->HostNameExpanded(),
-      Data->UserNameExpanded(), Data->ProtocolStr(), false, Data->Note});
+      Data->UserNameExpanded(), Data->ProtocolStr(), false, TeamSync::Instance().NoteOf(*Data).Text});
   }
   // folders in natural order (the sites without a folder first), then the site names
   std::sort(Sites.begin(), Sites.end(), [](const Site & A, const Site & B)
@@ -274,9 +279,11 @@ QVariantMap SitesModel::siteData(const QString & Name) const
     : (Data->PublicKeyFile.startsWith(KeyStore::Folder() + QLatin1Char('/')) ? Data->PublicKeyFile : QString());
   // a key that was deleted is no longer the site's
   Result[QStringLiteral("keyFile")] = QFileInfo::exists(KeyFile) ? KeyFile : QString();
-  Result[QStringLiteral("note")] = Data->Note;
+  TeamSync::NoteView Note = TeamSync::Instance().NoteOf(*Data);
+  Result[QStringLiteral("note")] = Note.Text;
   Result[QStringLiteral("noteItem")] = Data->NoteOnly;
-  Result[QStringLiteral("canEditNote")] = canEditNote(Name);
+  Result[QStringLiteral("canEditNote")] = Note.CanEdit;
+  Result[QStringLiteral("noteStatus")] = NoteStatus(Note);
   return Result;
 }
 
@@ -459,9 +466,40 @@ bool SitesModel::isNote(const QString & Name) const
 
 bool SitesModel::canEditNote(const QString & Name) const
 {
-  // as on the desktop (LoginDialog): a member of a team reads its notes
-  const TeamSync::Team * Team = TeamSync::Instance().TeamOfSite(Name);
-  return (Team == nullptr) || Team->CanEdit();
+  // as on the desktop (LoginDialog): TeamSync decides whose note it is
+  std::shared_ptr<SessionData> Data = Configuration::Instance().StoredSessions().FindByName(Name);
+  return (Data != nullptr) && TeamSync::Instance().NoteOf(*Data).CanEdit;
+}
+
+static QString NoteStatus(const TeamSync::NoteView & Note)
+{
+  if (!Note.InTeam)
+  {
+    return QString();
+  }
+  if (!Note.Shared)
+  {
+    return QStringLiteral("Your private note: the team shares no note for this site.");
+  }
+  QString Line;
+  if (!Note.EditedBy.isEmpty())
+  {
+    Line = QStringLiteral("Last edited by %1").arg(Note.EditedBy);
+    if (Note.EditedAt.isValid())
+    {
+      Line += QStringLiteral(", ") + QLocale().toString(Note.EditedAt.toLocalTime(), QLocale::ShortFormat);
+    }
+    Line += QStringLiteral(". ");
+  }
+  if (!Note.CanEdit)
+  {
+    Line += QStringLiteral("Only the team's owners and admins edit this note.");
+  }
+  else if (Note.TeamEdit)
+  {
+    Line += QStringLiteral("Everyone in the team edits this note.");
+  }
+  return Line.trimmed();
 }
 
 QString SitesModel::saveNote(const QString & Name, const QString & Text)
@@ -472,26 +510,38 @@ QString SitesModel::saveNote(const QString & Name, const QString & Text)
   {
     return QStringLiteral("\"%1\" no longer exists, so the note cannot be saved.").arg(Name);
   }
-  if (!canEditNote(Name))
-  {
-    return QStringLiteral("Only the team's owners and admins edit this note.");
-  }
   QString Reason;
   if (!AgentAccess::NoteAcceptable(Text, &Reason))
   {
     return Reason;
   }
-  if (Data->Note == Text)
+  if (TeamSync::Instance().NoteOf(*Data).Text == Text)
   {
     return QString();
   }
-  // the note only: the site's other settings stay as they are stored
-  QString Before = Data->Note;
-  Data->Note = Text;
-  if (!Config.Save())
+  // a team note with team edits goes to the cloud: wait for it (as the desktop does)
+  bool Finished = false;
+  bool Ok = false;
+  QEventLoop Loop;
+  QTimer::singleShot(30000, &Loop, &QEventLoop::quit);
+  TeamSync::Instance().SaveNote(Name, Text, [&](bool Success, const QString & Error)
   {
-    Data->Note = Before;
-    return QStringLiteral("The note could not be saved.");
+    Finished = true;
+    Ok = Success;
+    Reason = Error;
+    Loop.quit();
+  });
+  if (!Finished)
+  {
+    Loop.exec();
+  }
+  if (!Finished)
+  {
+    return QStringLiteral("The cloud did not answer in time. Try again.");
+  }
+  if (!Ok)
+  {
+    return Reason.isEmpty() ? QStringLiteral("The note could not be saved.") : Reason;
   }
   reload();
   return QString();

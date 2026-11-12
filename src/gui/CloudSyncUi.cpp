@@ -347,6 +347,7 @@ private:
   // Ready
   QLabel * FAccount;
   QLabel * FLicense;
+  QLabel * FStorage;
   QLabel * FStatus;
   QCheckBox * FSyncSessions;
   QCheckBox * FRestoreSessions;
@@ -477,8 +478,11 @@ private:
     auto * AccountLayout = new QVBoxLayout(AccountBox);
     FAccount = Text(QString(), AccountBox);
     FLicense = Text(QString(), AccountBox);
+    FStorage = Text(QString(), AccountBox);
+    FStorage->setObjectName(QStringLiteral("Storage"));
     AccountLayout->addWidget(FAccount);
     AccountLayout->addWidget(FLicense);
+    AccountLayout->addWidget(FStorage);
     Layout->addWidget(AccountBox);
     auto * StatusBox = new QGroupBox(QStringLiteral("Status"), Page);
     auto * StatusLayout = new QVBoxLayout(StatusBox);
@@ -606,6 +610,14 @@ private:
   {
     QJsonObject License = Me.value(QStringLiteral("license")).toObject();
     QString Link = QStringLiteral("<a href=\"%1/account\">Get NixSCP Pro</a>").arg(CloudSync::Instance().Client().BaseUrl());
+    // what the account stores now: its sync data and its own teams' sites and notes
+    QJsonObject Storage = Me.value(QStringLiteral("storage")).toObject();
+    QString Used = Ok ? CloudClient::StorageText(Storage) : QString();
+    FStorage->setVisible(!Used.isEmpty());
+    FStorage->setText(Used.isEmpty() ? QString() : (CloudClient::StorageNearlyFull(Storage)
+      ? QStringLiteral("<span style=\"color:#c62828\">Cloud storage: <b>%1</b>. Remove what you no longer need: "
+          "when it is full, nothing more is uploaded.</span>").arg(Used.toHtmlEscaped())
+      : QStringLiteral("Cloud storage: %1 (your synced settings and the sites and notes of the teams you own).").arg(Used.toHtmlEscaped())));
     if (!Ok)
     {
       FLicense->setText(QStringLiteral("License status is not available right now."));

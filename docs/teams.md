@@ -106,7 +106,7 @@ the server.
 ## What a team shares
 
 A team shares only a fixed list of plain site settings: host name, port, user name, stored password, protocol and
-FTPS mode, start folders, note and color, an exact host key fingerprint, and plain connection and transfer options
+FTPS mode, start folders, color, the [note](#notes) when it is shared, an exact host key fingerprint, and plain connection and transfer options
 (timeouts, keepalive, directory caching, time zone handling, FTP and S3 modes and the like). A setting that is not on
 the list is not shared.
 
@@ -122,6 +122,25 @@ These stay on each computer, and each person's own values survive team updates:
 So a site that uses a key file or a proxy reaches the others without it, and each person sets that up for themselves.
 Only host key fingerprints can travel with a site, never `*` or `acceptnew`. Host and user names that would expand a
 variable or start with `-` are refused.
+
+## Notes
+
+Every site and note item has a note (the **Note** panel in the Login dialog). On a team site, the note is either the
+team's or your own:
+
+- **Private** (the default): nobody else sees it. It stays on this computer, and team updates leave it alone. A
+  member's note on a team site is always private until the team shares one.
+- **Share with Team** (owners and admins): the note becomes the team's. Everyone in the team reads it, and it travels
+  with the team's signed sites. Only owners and admins edit it. The status line shows who edited it last and when.
+  Unticking it takes the note back: it becomes your private note again, and the others no longer see it after
+  their next sync.
+- **Allow Team Edits** (owners and admins, on a shared note): members edit it too. Each save is encrypted with the
+  team key and signed by its author, so the server cannot change a note or claim someone else wrote it. If two people
+  save at once, the second is told and keeps their text to try again. Unticking it puts the latest note back into
+  the team's signed sites, with who wrote it.
+
+A note is at most 64 KB of text. Agents read or change a note only with the site's
+[Agent Access](agent-access.md#site-notes) note rights, and only as far as the person running them may.
 
 ## Invites
 
@@ -151,6 +170,9 @@ variable or start with `-` are refused.
 - The team's sites and its name are uploaded as one snapshot encrypted with **AES-256-GCM** under the team key and
   **signed** by the owner or admin who made it. NixSCP accepts it only from someone the member list shows as owner or
   admin at that point.
+- A note with **Allow Team Edits** is kept apart from the snapshot, so members can write it: each version is encrypted
+  under the team key and signed by its author. NixSCP accepts it only from a current member, for that team and that
+  note, under the current team key, and never older than a version it has already seen.
 
 ## What the server can and cannot do
 
@@ -159,6 +181,8 @@ The server still enforces membership and roles, but your NixSCP does not depend 
 - **cannot read** the team's sites, their passwords or the team's name;
 - **cannot add members, change roles or forge changes**: those need signatures it does not have. Clients detect
   tampering and refuse it.
+- **cannot read or forge notes**, or say that someone else wrote one. It can withhold the latest version of a note
+  that members edit, or hand a computer that never saw it an older one, like any data it stores.
 
 The server **still sees** who is in which team, roles, e-mail addresses, sizes, times and device names.
 
@@ -249,6 +273,8 @@ write to the address on [nixscp.com/security](https://nixscp.com/security).
 ## Limits
 
 - At most 20 teams owned per account, 50 members per team and 50 pending invites per team.
+- A team's sites and notes count toward its owner's [storage](cloud-sync.md#storage) (20 MB per account), never
+  toward the members'. When the owner's storage is full, the team's changes are not uploaded until there is room.
 - Teams need an active NixSCP Pro license for everyone, also for reading (during the beta every account has one).
 - Teams share sites (with their stored passwords and the settings listed [above](#what-a-team-shares)), not
   preferences, workspaces or bookmarks.

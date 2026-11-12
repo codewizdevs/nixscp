@@ -1072,10 +1072,9 @@ bool Connection::CheckAccess(std::shared_ptr<SessionData> & Data, QString & Erro
       Error = Why;
       return false;
     }
-    // a team site's note is the team's: only its owners and admins change it
-    // (a member's change would be reverted at the next sync anyway)
-    const TeamSync::Team * Team = TeamSync::Instance().TeamOfSite(Data->Name);
-    if ((Team != nullptr) && !Team->CanEdit())
+    // an agent may do what its user may: a team's note needs an owner or admin,
+    // or team edits on
+    if (!TeamSync::Instance().NoteOf(*Data).CanEdit)
     {
       Error = QStringLiteral("Site \"%1\" is shared by a team, and only the team's owners and admins can edit its note.").arg(FRequest.Site);
       return false;
@@ -1396,7 +1395,8 @@ void Connection::AnswerNote(const QString & SiteName)
   }
   if (FRequest.Op == QStringLiteral("note-get"))
   {
-    QByteArray Note = Site->Note.toUtf8();
+    // the note as the user sees it (a team's, from its note channel, or their own)
+    QByteArray Note = TeamSync::Instance().NoteOf(*Site).Text.toUtf8();
     if (!Note.isEmpty() && !Note.endsWith('\n'))
     {
       Note += '\n';
@@ -1405,10 +1405,22 @@ void Connection::AnswerNote(const QString & SiteName)
     Finish(0);
     return;
   }
-  Site->Note = FRequest.Text;
-  Configuration::Instance().Save();
-  emit Configuration::Instance().StoredSessionsChanged();
-  Finish(0);
+  // saved where the user would save it; a team's note channel answers later
+  QPointer<Connection> Self(this);
+  TeamSync::Instance().SaveNote(SiteName, FRequest.Text, [Self](bool Ok, const QString & Error)
+  {
+    if (Self == nullptr)
+    {
+      return;
+    }
+    if (!Ok)
+    {
+      Self->Fail(Error, QStringLiteral("failed: ") + Error);
+      return;
+    }
+    emit Configuration::Instance().StoredSessionsChanged();
+    Self->Finish(0);
+  });
 }
 
 void Connection::StartTunnel(const SessionData & Data)

@@ -7,6 +7,7 @@
 #include "core/Configuration.h"
 #include "core/IniStorage.h"
 #include "core/SessionData.h"
+#include "core/AgentAccess.h"
 #include "core/TeamContent.h"
 
 #include <QCryptographicHash>
@@ -55,6 +56,7 @@ QString ApiError(const CloudClient::Reply & Reply, const QString & What)
   if (Code == QStringLiteral("rotation_required")) return QStringLiteral("The team key must be renewed first; this happens at the next sync.");
   if (Code == QStringLiteral("roster_full")) return QStringLiteral("The team's member list is full; create a new team.");
   if (Code == QStringLiteral("invalid_public_key")) return QStringLiteral("This account's team key is not usable.");
+  if (Code == QStringLiteral("storage_full")) return Reply.Error;
   return QStringLiteral("%1: %2").arg(What, Reply.Error.isEmpty() ? QStringLiteral("error %1").arg(Reply.Status) : Reply.Error);
 }
 
@@ -208,6 +210,16 @@ void TeamSync::LoadStates()
     S.PinKeyVersion = File.ReadRaw(Section, QStringLiteral("PinKeyVersion")).toLongLong();
     S.RosterSeq = File.ReadRaw(Section, QStringLiteral("RosterSeq")).toLongLong();
     S.RosterHash = File.ReadRaw(Section, QStringLiteral("RosterHash"));
+    const QHash<QString, QString> Notes = MapOfJson(File.ReadRaw(Section, QStringLiteral("Notes")));
+    for (auto Note = Notes.cbegin(); Note != Notes.cend(); ++Note)
+    {
+      S.Notes.insert(Note.key(), QByteArray::fromBase64(Note.value().toLatin1()));
+    }
+    const QHash<QString, QString> Pins = MapOfJson(File.ReadRaw(Section, QStringLiteral("NotePins")));
+    for (auto Pin = Pins.cbegin(); Pin != Pins.cend(); ++Pin)
+    {
+      S.NotePins.insert(Pin.key(), Pin.value().toLongLong());
+    }
     for (const QString & Key : File.Keys(Section))
     {
       if (Key.startsWith(QStringLiteral("OldKey")))
@@ -254,6 +266,18 @@ void TeamSync::SaveStates()
     File.WriteRaw(Section, QStringLiteral("PinKeyVersion"), QString::number(It->PinKeyVersion));
     File.WriteRaw(Section, QStringLiteral("RosterSeq"), QString::number(It->RosterSeq));
     File.WriteRaw(Section, QStringLiteral("RosterHash"), It->RosterHash);
+    // channel notes as they came: encrypted with the team key
+    QHash<QString, QString> Notes, Pins;
+    for (auto Note = It->Notes.cbegin(); Note != It->Notes.cend(); ++Note)
+    {
+      Notes.insert(Note.key(), B64(Note.value()));
+    }
+    for (auto Pin = It->NotePins.cbegin(); Pin != It->NotePins.cend(); ++Pin)
+    {
+      Pins.insert(Pin.key(), QString::number(Pin.value()));
+    }
+    File.WriteRaw(Section, QStringLiteral("Notes"), JsonOfMap(Notes));
+    File.WriteRaw(Section, QStringLiteral("NotePins"), JsonOfMap(Pins));
     for (auto Key = It->OldKeys.cbegin(); Key != It->OldKeys.cend(); ++Key)
     {
       File.WriteRaw(Section, QStringLiteral("OldKey%1").arg(Key.key()), B64(Key.value()));
@@ -1350,6 +1374,17 @@ void TeamSync::SyncTeams(QStringList Pending, QStringList Errors, const Done & C
   QString Uuid = Pending.takeFirst();
   SyncTeam(Uuid, [this, Uuid, Pending, Errors, Callback](bool Ok, const QString & Error) mutable
   {
+    if (Ok && FTeams.contains(Uuid))
+    {
+      // then the note channel; a failure there leaves the sites synced
+      FetchNotes(Uuid, [this, Uuid, Pending, Errors, Callback](bool, const QString &) mutable
+      {
+        FResults.insert(Uuid, QString());
+        FWarned.remove(Uuid);
+        SyncTeams(Pending, Errors, Callback);
+      });
+      return;
+    }
     FResults.insert(Uuid, Ok ? QString() : Error);
     if (Ok)
     {
@@ -1414,6 +1449,8 @@ void TeamSync::SyncTeam(const QString & Uuid, const Done & Callback, int Attempt
   }
   if (T.NeedsRotation && T.CanEdit())
   {
+    // the channel's notes cannot follow a new key: into the sites, pushed after it
+    FoldNotes(Uuid);
     Rotate(Uuid, [this, Uuid, Callback, Attempt](bool Ok, const QString & Error)
     {
       if (!Ok)
@@ -2711,6 +2748,8 @@ void TeamSync::SetRole(const QString & Uuid, const QString & UserUuid, const QSt
 
 void TeamSync::RemoveMember(const QString & Uuid, const QString & UserUuid, const Done & Callback)
 {
+  // their notes in the channel stop counting once they are gone: keep them in the sites
+  FoldNotes(Uuid);
   AppendAtHead(Uuid, QStringLiteral("remove"), QJsonObject{{QStringLiteral("user"), UserUuid}},
     [this, Uuid, Callback](bool Ok, const QString & Error)
   {
@@ -2804,3 +2843,379 @@ void TeamSync::Restore(const QString & Uuid, qint64 Version, const Done & Callba
     SyncFor(Uuid, Callback);
   });
 }
+
+//---------------------------------------------------------------------------
+// Notes
+
+QString TeamSync::EmailOf(const QString & Uuid, const QString & UserUuid) const
+{
+  auto Roster = FRosters.constFind(Uuid);
+  if ((Roster == FRosters.cend()) || UserUuid.isEmpty())
+  {
+    return QString();
+  }
+  const TeamRoster::Member * M = Roster->Find(UserUuid);
+  return (M != nullptr) ? M->Email : QStringLiteral("a former member");
+}
+
+bool TeamSync::ChannelNote(const QString & Uuid, const QString & Id, QString & Text, TeamCrypto::Note & Header) const
+{
+  const Team * T = Find(Uuid);
+  const State * S = FindState(Uuid);
+  if ((T == nullptr) || (S == nullptr) || Id.isEmpty() || T->Key.IsEmpty())
+  {
+    return false;
+  }
+  QByteArray Data = S->Notes.value(Id);
+  if (Data.isEmpty() || !TeamCrypto::ReadNote(Data, Header) || (Header.KeyVersion != T->KeyVersion))
+  {
+    return false;
+  }
+  QByteArray Key = T->Key.Copy();
+  auto WipeKey = qScopeGuard([&Key]() { Security::WipeBytes(Key); });
+  return TeamCrypto::DecodeNote(Data, Key, Text);
+}
+
+// A note from the channel, checked against the roster as it is now: by a member,
+// signed by them, for this team and note, under the current key, never older
+bool TeamSync::AcceptNote(const QString & Uuid, const QString & Id, qint64 Version, const QString & Author, const QByteArray & Data)
+{
+  const Team * T = Find(Uuid);
+  auto Roster = FRosters.constFind(Uuid);
+  if ((T == nullptr) || (Roster == FRosters.cend()) || T->Key.IsEmpty())
+  {
+    return false;
+  }
+  State & S = StateOf(Uuid);
+  TeamCrypto::Note Header;
+  if (!TeamCrypto::ReadNote(Data, Header) || (Header.Team != Uuid) || (Header.Id != Id) || (Header.Version != Version) ||
+      (Header.Author != Author) || (Header.KeyVersion != T->KeyVersion) || (Version < S.NotePins.value(Id)))
+  {
+    return false;
+  }
+  const TeamRoster::Member * M = Roster->Find(Header.Author);
+  if ((M == nullptr) || !TeamCrypto::VerifyNote(Data, M->Identity))
+  {
+    return false;
+  }
+  QByteArray Key = T->Key.Copy();
+  auto WipeKey = qScopeGuard([&Key]() { Security::WipeBytes(Key); });
+  QString Text;
+  if (!TeamCrypto::DecodeNote(Data, Key, Text) || !AgentAccess::NoteAcceptable(Text))
+  {
+    return false;
+  }
+  S.Notes.insert(Id, Data);
+  S.NotePins.insert(Id, Version);
+  return true;
+}
+
+void TeamSync::FetchNotes(const QString & Uuid, const Done & Callback)
+{
+  FSync->Client().Api("GET", QStringLiteral("/v1/teams/%1/notes").arg(Uuid), QJsonObject(),
+    [this, Uuid, Callback](const CloudClient::Reply & Reply)
+  {
+    const Team * T = Find(Uuid);
+    if ((T == nullptr) || !Reply.Ok())
+    {
+      Callback(false, (T == nullptr) ? QString() : ApiError(Reply, QStringLiteral("Cannot read the team's notes")));
+      return;
+    }
+    State & S = StateOf(Uuid);
+    QHash<QString, QByteArray> Before = S.Notes;
+    QSet<QString> Listed;
+    QStringList Stale;
+    for (const QJsonValue & V : QJsonDocument::fromJson(Reply.Data).array())
+    {
+      QJsonObject O = V.toObject();
+      QString Id = O.value(QStringLiteral("id")).toString();
+      qint64 Version = O.value(QStringLiteral("version")).toInteger();
+      QByteArray Data = QByteArray::fromBase64(O.value(QStringLiteral("data")).toString().toLatin1());
+      Listed.insert(Id);
+      if (Version == S.NotePins.value(Id) && S.Notes.contains(Id))
+      {
+        continue;   // nothing new
+      }
+      TeamCrypto::Note Header;
+      if (TeamCrypto::ReadNote(Data, Header) && (Header.KeyVersion < T->KeyVersion))
+      {
+        // under an old key: folded into the sites with the new key
+        Stale.append(Id);
+        continue;
+      }
+      AcceptNote(Uuid, Id, Version, O.value(QStringLiteral("author")).toString(), Data);
+    }
+    // gone from the channel: folded into the sites by an owner or admin
+    for (auto It = S.Notes.begin(); It != S.Notes.end(); )
+    {
+      It = Listed.contains(It.key()) ? std::next(It) : S.Notes.erase(It);
+    }
+    if (T->CanEdit())
+    {
+      for (const QString & Id : Stale)
+      {
+        DropNote(Uuid, Id);
+      }
+    }
+    if (S.Notes != Before)
+    {
+      SaveStates();
+      emit FConfig->StoredSessionsChanged();
+    }
+    Callback(true, QString());
+  });
+}
+
+void TeamSync::PutNote(const QString & Uuid, const QString & Id, const QString & Text, const Done & Callback)
+{
+  const Team * T = Find(Uuid);
+  if ((T == nullptr) || T->Key.IsEmpty() || !FIdentity.IsValid())
+  {
+    Callback(false, QStringLiteral("The team's notes cannot be written now; try again after the next sync."));
+    return;
+  }
+  State & S = StateOf(Uuid);
+  qint64 Base = S.Notes.contains(Id) ? S.NotePins.value(Id) : 0;
+  TeamCrypto::Note Header;
+  Header.Team = Uuid;
+  Header.Id = Id;
+  Header.Version = Base + 1;
+  Header.KeyVersion = T->KeyVersion;
+  Header.Author = FAccount;
+  Header.SavedAt = QDateTime::currentDateTimeUtc();
+  QByteArray Key = T->Key.Copy();
+  QByteArray Data = TeamCrypto::EncodeNote(Header, Key, FIdentity, Text);
+  Security::WipeBytes(Key);
+  FSync->Client().Api("PUT", QStringLiteral("/v1/teams/%1/notes/%2").arg(Uuid, Id),
+    QJsonObject{{QStringLiteral("base_version"), Base}, {QStringLiteral("data"), B64(Data)}},
+    [this, Uuid, Id, Data, Callback](const CloudClient::Reply & Reply)
+  {
+    if (!Reply.Ok())
+    {
+      if (Reply.ErrorCode() == QStringLiteral("version_conflict"))
+      {
+        // someone saved first: fetch theirs; the text being edited stays in the editor
+        FetchNotes(Uuid, [Callback](bool, const QString &)
+        {
+          Callback(false, QStringLiteral("Someone else changed this note meanwhile. Your text was not saved: copy it, "
+            "look at their version, then edit and save again."));
+        });
+        return;
+      }
+      Callback(false, ApiError(Reply, QStringLiteral("Saving the team's note failed")));
+      return;
+    }
+    State & S = StateOf(Uuid);
+    S.Notes.insert(Id, Data);
+    S.NotePins.insert(Id, Reply.Json.value(QStringLiteral("version")).toInteger());
+    SaveStates();
+    emit FConfig->StoredSessionsChanged();
+    Callback(true, QString());
+  });
+}
+
+void TeamSync::DropNote(const QString & Uuid, const QString & Id)
+{
+  StateOf(Uuid).Notes.remove(Id);
+  FSync->Client().Api("DELETE", QStringLiteral("/v1/teams/%1/notes/%2").arg(Uuid, Id), QJsonObject(), [](const CloudClient::Reply &) {});
+}
+
+int TeamSync::FoldNotes(const QString & Uuid)
+{
+  const Team * T = Find(Uuid);
+  const State * S = FindState(Uuid);
+  if ((T == nullptr) || (S == nullptr) || !T->CanEdit() || S->Folder.isEmpty())
+  {
+    return 0;
+  }
+  int Folded = 0;
+  for (const auto & Site : FConfig->StoredSessions().Sessions())
+  {
+    if (!Belongs(Site->Name, S->Folder) || !Site->NoteTeamEdit || Site->NoteId.isEmpty())
+    {
+      continue;
+    }
+    QString Text;
+    TeamCrypto::Note Header;
+    if (ChannelNote(Uuid, Site->NoteId, Text, Header) && (Text != Site->Note))
+    {
+      Site->Note = Text;
+      Site->NoteBy = Header.Author;
+      Site->NoteAt = Header.SavedAt.toString(Qt::ISODate);
+      Folded++;
+    }
+  }
+  if (Folded > 0)
+  {
+    SaveSites();
+  }
+  return Folded;
+}
+
+TeamSync::NoteView TeamSync::NoteOf(const SessionData & Site) const
+{
+  NoteView View;
+  const Team * T = TeamOfSite(Site.Name);
+  if (T == nullptr)
+  {
+    View.Text = Site.Note;
+    View.CanEdit = true;
+    return View;
+  }
+  View.InTeam = true;
+  View.CanShare = T->CanEdit();
+  QString Team = Site.Note;
+  QString By = Site.NoteBy;
+  QDateTime At = QDateTime::fromString(Site.NoteAt, Qt::ISODate);
+  if (Site.NoteTeamEdit)
+  {
+    QString Text;
+    TeamCrypto::Note Header;
+    if (ChannelNote(T->Uuid, Site.NoteId, Text, Header))
+    {
+      Team = Text;
+      By = Header.Author;
+      At = Header.SavedAt;
+    }
+  }
+  View.Shared = !Team.isEmpty() || Site.NoteTeamEdit;
+  if (View.Shared)
+  {
+    View.Text = Team;
+    View.TeamEdit = Site.NoteTeamEdit;
+    View.CanEdit = T->CanEdit() || Site.NoteTeamEdit;
+    View.EditedBy = EmailOf(T->Uuid, By);
+    View.EditedAt = At;
+  }
+  else
+  {
+    View.Text = Site.PrivateNote;
+    View.CanEdit = true;
+  }
+  return View;
+}
+
+// the notes work before Initialize too (no teams then: every note is the site's own)
+Configuration & TeamSync::NoteConfig() const
+{
+  return (FConfig != nullptr) ? *FConfig : Configuration::Instance();
+}
+
+void TeamSync::SaveNote(const QString & SiteName, const QString & Text, const Done & Callback)
+{
+  std::shared_ptr<SessionData> Site = NoteConfig().StoredSessions().FindByName(SiteName);
+  QString Why;
+  if (Site == nullptr)
+  {
+    Callback(false, QStringLiteral("The site is no longer there."));
+    return;
+  }
+  if (!AgentAccess::NoteAcceptable(Text, &Why))
+  {
+    Callback(false, Why);
+    return;
+  }
+  NoteView View = NoteOf(*Site);
+  const Team * T = TeamOfSite(SiteName);
+  if (!View.CanEdit)
+  {
+    Callback(false, QStringLiteral("Only the team's owners and admins edit this note."));
+    return;
+  }
+  if (!View.InTeam || !View.Shared)
+  {
+    (View.InTeam ? Site->PrivateNote : Site->Note) = Text;
+    NoteConfig().Save();
+    Callback(true, QString());
+    return;
+  }
+  if (View.TeamEdit)
+  {
+    PutNote(T->Uuid, Site->NoteId, Text, Callback);
+    return;
+  }
+  // the team's note in its signed sites: pushed by the next sync
+  Site->Note = Text;
+  Site->NoteBy = FAccount;
+  Site->NoteAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+  NoteConfig().Save();
+  SyncFor(T->Uuid, [](bool, const QString &) {});
+  Callback(true, QString());
+}
+
+void TeamSync::SetNoteShared(const QString & SiteName, bool Shared, const Done & Callback)
+{
+  std::shared_ptr<SessionData> Site = NoteConfig().StoredSessions().FindByName(SiteName);
+  const Team * T = TeamOfSite(SiteName);
+  if ((Site == nullptr) || (T == nullptr) || !T->CanEdit())
+  {
+    Callback(false, QStringLiteral("Only the team's owners and admins decide whether a note is shared."));
+    return;
+  }
+  QString Uuid = T->Uuid;
+  if (Shared)
+  {
+    Site->Note = Site->PrivateNote;
+    Site->PrivateNote.clear();
+    Site->NoteBy = FAccount;
+    Site->NoteAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+  }
+  else
+  {
+    // what the team had becomes this person's own: the others lose it
+    Site->PrivateNote = NoteOf(*Site).Text;
+    Site->Note.clear();
+    Site->NoteBy.clear();
+    Site->NoteAt.clear();
+    Site->NoteTeamEdit = false;
+    if (!Site->NoteId.isEmpty())
+    {
+      DropNote(Uuid, Site->NoteId);
+      Site->NoteId.clear();
+    }
+  }
+  NoteConfig().Save();
+  SyncFor(Uuid, [](bool, const QString &) {});
+  Callback(true, QString());
+}
+
+void TeamSync::SetNoteTeamEdit(const QString & SiteName, bool On, const Done & Callback)
+{
+  std::shared_ptr<SessionData> Site = NoteConfig().StoredSessions().FindByName(SiteName);
+  const Team * T = TeamOfSite(SiteName);
+  if ((Site == nullptr) || (T == nullptr) || !T->CanEdit())
+  {
+    Callback(false, QStringLiteral("Only the team's owners and admins decide who edits a note."));
+    return;
+  }
+  QString Uuid = T->Uuid;
+  if (On)
+  {
+    Site->NoteTeamEdit = true;
+    if (Site->NoteId.isEmpty())
+    {
+      Site->NoteId = TeamCrypto::NewNoteId();
+    }
+  }
+  else
+  {
+    // back into the signed sites, with who wrote it last
+    QString Text;
+    TeamCrypto::Note Header;
+    if (ChannelNote(Uuid, Site->NoteId, Text, Header))
+    {
+      Site->Note = Text;
+      Site->NoteBy = Header.Author;
+      Site->NoteAt = Header.SavedAt.toString(Qt::ISODate);
+    }
+    Site->NoteTeamEdit = false;
+    if (!Site->NoteId.isEmpty())
+    {
+      DropNote(Uuid, Site->NoteId);
+    }
+  }
+  NoteConfig().Save();
+  SyncFor(Uuid, [](bool, const QString &) {});
+  Callback(true, QString());
+}
+

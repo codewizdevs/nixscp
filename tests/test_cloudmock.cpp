@@ -2141,6 +2141,15 @@ int main(int argc, char ** argv)
     }
     return RunStep(Args[1], Args[2], Args.value(3));
   }
+  // the account's storage, as Cloud Sync Settings and the phone show it
+  auto Storage = [](double Used, double Limit) { return QJsonObject{{QStringLiteral("used"), Used}, {QStringLiteral("limit"), Limit}}; };
+  CHECK(CloudClient::StorageText(Storage(6.3 * 1024 * 1024, 20 * 1024 * 1024)) == QStringLiteral("6.3 MB of 20 MB used"));
+  CHECK(CloudClient::StorageText(Storage(0, 20 * 1024 * 1024)) == QStringLiteral("0 KB of 20 MB used"));
+  CHECK(CloudClient::StorageText(Storage(300 * 1024, 20 * 1024 * 1024)) == QStringLiteral("300 KB of 20 MB used"));
+  CHECK(CloudClient::StorageText(Storage(1536, 20 * 1024 * 1024)) == QStringLiteral("1.5 KB of 20 MB used"));
+  CHECK(CloudClient::StorageText(QJsonObject()).isEmpty());
+  CHECK(!CloudClient::StorageNearlyFull(Storage(17 * 1024 * 1024, 20 * 1024 * 1024)));
+  CHECK(CloudClient::StorageNearlyFull(Storage(18 * 1024 * 1024, 20 * 1024 * 1024)));
   MockCloud Mock;
   CHECK(Mock.Listen());
   qputenv("NIXSCP_CLOUD_URL", Mock.Url().toLatin1());
