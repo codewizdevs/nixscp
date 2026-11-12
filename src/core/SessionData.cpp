@@ -144,6 +144,7 @@ void SessionData::Default()
   FSProtocol = fsSFTP;
   Ftps = ftpsNone;
   IsWorkspace = false;
+  NoteOnly = false;
   Link.clear();
   NameOverride.clear();
   Color = 0;
@@ -589,6 +590,7 @@ void SessionData::Load(IniStorage & Storage)
   WebDavAuthLegacy = Storage.ReadBool(QStringLiteral("WebDavAuthLegacy"), WebDavAuthLegacy);
 
   IsWorkspace = Storage.ReadBool(QStringLiteral("IsWorkspace"), IsWorkspace);
+  NoteOnly = Storage.ReadBool(QStringLiteral("NoteOnly"), NoteOnly);
   Link = Storage.ReadString(QStringLiteral("Link"), Link);
   NameOverride = Storage.ReadString(QStringLiteral("NameOverride"), NameOverride);
   // never written by Save (kept in FRawValues)
@@ -818,6 +820,7 @@ void SessionData::Save(IniStorage & Storage, const SessionData * Default) const
   WRITE_DATA(Bool, WebDavAuthLegacy);
 
   WRITE_DATA(Bool, IsWorkspace);
+  WRITE_DATA(Bool, NoteOnly);
   WRITE_DATA(String, Link);
   WRITE_DATA(String, NameOverride);
 
@@ -947,6 +950,10 @@ int SessionData::DefaultPort(TFSProtocol Protocol, TFtps Ftps)
 
 QString SessionData::InfoTip() const
 {
+  if (NoteOnly)
+  {
+    return QStringLiteral("Note");
+  }
   // TSessionData::GetInfoTip; FSProtocolNames
   QString ProtocolName;
   switch (FSProtocol)
@@ -1935,6 +1942,7 @@ void StoredSessionList::SetDefaultSettings(const SessionData & Value)
   auto NewDefaults = std::make_shared<SessionData>(Value);
   NewDefaults->Name = DefaultName;
   NewDefaults->IsWorkspace = false;
+  NewDefaults->NoteOnly = false;
   NewDefaults->Link.clear();
   NewDefaults->NameOverride.clear();
   for (auto & Data : FSessions)

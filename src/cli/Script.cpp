@@ -3110,6 +3110,10 @@ void Script::Connect(const QString & SessionName, Options & Opts, bool CheckPara
     PrintLine(Command);
   }
 
+  if (Data.NoteOnly)
+  {
+    throw ExtException(QStringLiteral("\"%1\" is a note in NixSCP, not a site: it cannot be opened.").arg(Data.Name));
+  }
   if (!Data.CanLogin() || DefaultsOnly)
   {
     if (Data.HostName.isEmpty())

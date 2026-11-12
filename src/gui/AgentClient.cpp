@@ -362,7 +362,11 @@ private:
       QString Host = S.value(QStringLiteral("user")).toString();
       Host = (Host.isEmpty() ? QString() : Host + QLatin1Char('@')) + S.value(QStringLiteral("host")).toString();
       int Port = S.value(QStringLiteral("port")).toInt(22);
-      if (Port != 22)
+      if (S.value(QStringLiteral("kind")).toString() == QStringLiteral("note"))
+      {
+        Host = QStringLiteral("(note)");
+      }
+      else if (Port != 22)
       {
         Host += QStringLiteral(":%1").arg(Port);
       }
@@ -400,7 +404,8 @@ namespace AgentClient
 int Run(int argc, char * argv[], const QStringList & Arguments)
 {
   static const QStringList Commands{QStringLiteral("--list"), QStringLiteral("--connect"), QStringLiteral("--get"),
-    QStringLiteral("--put"), QStringLiteral("--tunnel"), QStringLiteral("--help"), QStringLiteral("--mcp")};
+    QStringLiteral("--put"), QStringLiteral("--tunnel"), QStringLiteral("--help"), QStringLiteral("--mcp"),
+    QStringLiteral("--note"), QStringLiteral("--note-set")};
   if (Arguments.isEmpty() || !Commands.contains(Arguments.first()))
   {
     return -1;
@@ -515,6 +520,57 @@ int Run(int argc, char * argv[], const QStringList & Arguments)
       RawTerminal();
 #endif
     }
+  }
+  else if (Command == QStringLiteral("--note"))
+  {
+    if (Positional.size() != 1)
+    {
+      return Usage(QStringLiteral("Usage: nixscp --note <site>"));
+    }
+    Request.insert(QStringLiteral("op"), QStringLiteral("note-get"));
+    Request.insert(QStringLiteral("site"), Positional.at(0));
+  }
+  else if (Command == QStringLiteral("--note-set"))
+  {
+    if ((Positional.size() < 1) || (Positional.size() > 2))
+    {
+      return Usage(QStringLiteral("Usage: nixscp --note-set <site> [<file>]  (without a file: the note from standard input)"));
+    }
+    // the whole note goes in the request: read at most one byte over the limit
+    QByteArray Text;
+    if (Positional.size() == 2)
+    {
+      QFile In(Positional.at(1));
+      if (!In.open(QIODevice::ReadOnly))
+      {
+        return Usage(QStringLiteral("Cannot read \"%1\": %2").arg(Positional.at(1), In.errorString()));
+      }
+      Text = In.read(MaxNoteBytes + 1);
+    }
+    else
+    {
+      if (StdinIsTerminal())
+      {
+        return Usage(QStringLiteral("Give the note on standard input or as a file: nixscp --note-set <site> <file>"));
+      }
+      char Buffer[16384];
+      while (Text.size() <= MaxNoteBytes)
+      {
+        size_t Got = std::fread(Buffer, 1, sizeof(Buffer), stdin);
+        if (Got == 0)
+        {
+          break;
+        }
+        Text.append(Buffer, static_cast<qsizetype>(Got));
+      }
+    }
+    if (Text.size() > MaxNoteBytes)
+    {
+      return Usage(QStringLiteral("The note is too long: at most %1 KB.").arg(MaxNoteBytes / 1024));
+    }
+    Request.insert(QStringLiteral("op"), QStringLiteral("note-set"));
+    Request.insert(QStringLiteral("site"), Positional.at(0));
+    Request.insert(QStringLiteral("text"), QString::fromUtf8(Text));
   }
   else if (Command == QStringLiteral("--tunnel"))
   {

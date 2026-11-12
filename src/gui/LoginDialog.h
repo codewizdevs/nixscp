@@ -139,6 +139,24 @@ private:
   QPushButton * TeamButton;
   QGroupBox * NoteGroup;
   QPlainTextEdit * NoteMemo;
+  QCheckBox * NoteAgentReadCheck;
+  QCheckBox * NoteAgentWriteCheck;
+  QLabel * NoteInfo;
+  QPushButton * NoteEditButton;
+  QPushButton * NoteSaveButton;
+  QPushButton * NoteCancelButton;
+  // the note of a stored site is edited and saved on its own (not with the site)
+  bool FNoteEditing = false;
+  bool FNoteMayEdit = false;
+  QString FNoteSite;
+  void UpdateNotePanel(const SessionData & Data);
+  void UpdateNoteInfo();
+  void StartNoteEdit();
+  bool SaveNote();
+  void CancelNoteEdit();
+  bool EnsureNoteSaved();
+  void NoteAgentChecked(bool Write, bool Checked);
+  static QString NoteTip(const SessionData & Data);
   QPushButton * LoginButton;
   QPushButton * CloseButton;
   QWidget * ShowAgainPanel;
@@ -158,6 +176,7 @@ private:
   QAction * DesktopIconAction;
   QAction * RenameSessionAction;
   QAction * NewSessionFolderAction;
+  QAction * NewNoteAction;
   QAction * RunPageantAction;
   QAction * RunPuttygenAction;
   QAction * ImportAction;
@@ -271,6 +290,8 @@ private:
   void RenameSessionActionExecute();
   void SessionTreeEdited(QTreeWidgetItem * Node);
   void NewSessionFolderActionExecute();
+  void NewNoteActionExecute();
+  static QIcon NoteItemIcon();
   void CloneToNewSite();
   void ResetNewSessionActionExecute();
   void SetDefaultSessionActionExecute();

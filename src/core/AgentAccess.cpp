@@ -282,7 +282,30 @@ QString PermissionsText(int Permissions)
   if (Permissions & apCommands) Parts.append(QStringLiteral("commands"));
   if (Permissions & apTransfer) Parts.append((Permissions & apDownloadOnly) ? QStringLiteral("downloads") : QStringLiteral("files"));
   if (Permissions & apTunnels) Parts.append(QStringLiteral("tunnels"));
+  if (Permissions & apNoteWrite) Parts.append(QStringLiteral("note-edit"));
+  else if (Permissions & apNoteRead) Parts.append(QStringLiteral("note"));
   return Parts.isEmpty() ? QStringLiteral("none") : Parts.join(QLatin1Char(','));
+}
+
+bool NoteAcceptable(const QString & Text, QString * Reason)
+{
+  auto Refuse = [Reason](const QString & Why) { if (Reason != nullptr) *Reason = Why; return false; };
+  if (!ExactUtf8(Text))
+  {
+    return Refuse(QStringLiteral("The note must be valid Unicode text."));
+  }
+  if (Text.toUtf8().size() > MaxNoteBytes)
+  {
+    return Refuse(QStringLiteral("The note is too long: at most %1 KB.").arg(MaxNoteBytes / 1024));
+  }
+  for (QChar C : Text)
+  {
+    if (((C.unicode() < 0x20) && (C != QLatin1Char('\n')) && (C != QLatin1Char('\r')) && (C != QLatin1Char('\t'))) || (C.unicode() == 0x7F))
+    {
+      return Refuse(QStringLiteral("The note cannot contain control characters other than line breaks and tabs."));
+    }
+  }
+  return true;
 }
 
 bool PasswordsProtected()
@@ -1345,7 +1368,8 @@ QString AgentSiteName(const SessionData & Data)
 bool UsableByAgents(const SessionData & Data)
 {
   // not "!= amOff": a mode this version does not know must not run unasked
-  return ((Data.AgentAccess == amAllow) || (Data.AgentAccess == amAsk)) && Data.IsSsh() && !Data.IsWorkspace;
+  // a note item has no server, but its note can be for agents
+  return ((Data.AgentAccess == amAllow) || (Data.AgentAccess == amAsk)) && (Data.IsSsh() || Data.NoteOnly) && !Data.IsWorkspace;
 }
 
 std::shared_ptr<SessionData> FindAgentSite(const StoredSessionList & Sites, const QString & Name, bool * Ambiguous)
@@ -1409,7 +1433,8 @@ never printed, written to files or passed to other programs.
 USAGE
   nixscp --list [--json]
       Lists the sites you may use: name, host and what is permitted
-      (commands, files). Use the exact site name with the commands below.
+      (commands, files, tunnels, note). Use the exact site name with the
+      commands below.
 
   nixscp --connect <site> --cmd "<command>"
       Runs <command> on the server through the remote shell and prints its
@@ -1434,9 +1459,20 @@ USAGE
       background while you use the port. A saved tunnel of the site can be
       given by its name instead.
 
+  nixscp --note <site>
+      Prints the site's note: what the user wrote down about the server, for
+      example where its logs are or what not to restart. Only for sites whose
+      note the user shares with agents (permission "note" or "note-edit").
+
+  nixscp --note-set <site> [<file>]
+      Replaces the site's note with the text of <file>, or with standard input
+      (at most 64 KB). Only with permission "note-edit". Read the note first
+      and keep what is still true: this replaces the whole note.
+
   nixscp --mcp
       Runs as a Model Context Protocol (MCP) server on standard input/output,
-      with the tools list_sites, run_command, download_file and upload_file.
+      with the tools list_sites, run_command, download_file, upload_file,
+      read_note and write_note.
       Claude Code:  claude mcp add nixscp -- nixscp --mcp
       Other tools:  {"command": "nixscp", "args": ["--mcp"]}
 

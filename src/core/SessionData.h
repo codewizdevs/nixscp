@@ -64,6 +64,7 @@ public:
   TFSProtocol FSProtocol;           // FSProtocol
   TFtps Ftps;                       // Ftps
   bool IsWorkspace;                 // IsWorkspace
+  bool NoteOnly;                    // NoteOnly: a note in the site list, with no server behind it (NixSCP)
   QString Link;                     // Link: workspace entry referring to a stored site (core/Workspaces.h)
   QString NameOverride;             // NameOverride: name of an ad-hoc session saved in a workspace
   int Color;                        // Color (BGR TColor, 0 = none)
@@ -259,7 +260,7 @@ public:
   QString ProxyCommand() const { return (ProxyMethod == pmCmd) ? ProxyLocalCommand : ProxyTelnetCommand; }
   static const char * const SshBugNames[sbCount];
 
-  bool CanLogin() const { return !HostName.isEmpty(); }
+  bool CanLogin() const { return !NoteOnly && !HostName.isEmpty(); }
   QString FolderName() const;    // "folder/sub" part of Name
   QString LocalName() const;     // last part of Name
   QString SessionName() const;   // Name, or user@host when unnamed
@@ -284,7 +285,7 @@ public:
       !TunnelPassphrase.isEmpty();
   }
   // TSessionData::GetIsLocalBrowser / GetCanOpen: a workspace entry of a local tab
-  bool IsLocalBrowser() const { return !LocalDirectory.isEmpty() && !OtherLocalDirectory.isEmpty(); }
+  bool IsLocalBrowser() const { return !NoteOnly && !LocalDirectory.isEmpty() && !OtherLocalDirectory.isEmpty(); }
   bool CanOpen() const { return CanLogin() || IsLocalBrowser(); }
   // TSessionData::GetInfoTip (SESSION_INFO_TIP2 / SESSION_INFO_TIP_NO_SSH)
   QString InfoTip() const;

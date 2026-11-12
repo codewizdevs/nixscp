@@ -669,6 +669,13 @@ static void TestCli()
   CHECK_MSG((R.ExitCode == 1) && R.Output.contains(QStringLiteral("In scripting you should not rely on saved sites")) &&
     R.Output.contains(QStringLiteral("open sftp://nobody@127.0.0.1:1/")) && R.Output.contains(QStringLiteral("Connecting to host...")) &&
     !R.Output.contains(QStringLiteral("Session started.")), R.Output);
+  // a note item has no server: refused with a clear message, no host prompt
+  QFile NoteIni(ScratchDir + QStringLiteral("/note.ini"));
+  CHECK(NoteIni.open(QIODevice::WriteOnly));
+  NoteIni.write("[Sessions\\Office/Wifi]\nNoteOnly=1\nNote=SSID office%0Apassword on the fridge\n");
+  NoteIni.close();
+  R = RunCli({QStringLiteral("/ini=") + NoteIni.fileName(), QStringLiteral("/command"), QStringLiteral("open Office/Wifi"), QStringLiteral("exit")});
+  CHECK_MSG((R.ExitCode == 1) && R.Output.contains(QStringLiteral("is a note in NixSCP, not a site")) && !R.Output.contains(QStringLiteral("Host:")), R.Output);
   // command line session (deprecated in scripting); connection refused
   R = RunCli({QStringLiteral("/ini=nul"), QStringLiteral("sftp://nobody@127.0.0.1:1/"), QStringLiteral("/command"), QStringLiteral("echo next")});
   CHECK_MSG((R.ExitCode == 1) && R.Output.contains(QStringLiteral("Opening session using command-line parameter in scripting is deprecated.")) &&

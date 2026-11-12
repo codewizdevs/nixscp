@@ -78,14 +78,51 @@ The Help button in the dialog opens the Agent Access FAQ. **Commands > Agent Acc
 | Download files | Downloading single files | `--get`, MCP `download_file` |
 | Upload files (needs Download files) | Uploading single files | `--put`, MCP `upload_file` |
 | Open tunnels | Local port forwarding through the site | `--tunnel` |
+| Allow Agent Access (in the site's note) | Reading the site's note | `--note`, MCP `read_note` |
+| Allow Agent Edit (in the site's note, needs Allow Agent Access) | Replacing the site's note | `--note-set`, MCP `write_note` |
 | Record sessions | Not a permission: keeps a transcript of each request ([Session recordings](#session-recordings)) | |
 
-All four permissions and recording are on by default when you switch a site on. With **Download files** on and
+The first four permissions and recording are on by default when you switch a site on. The note permissions are off
+until you tick them above the note in the Login dialog ([Site notes](#site-notes)). With **Download files** on and
 **Upload files** off, the site is download-only. Command rules apply to commands only; they do not restrict
 downloads, uploads or tunnels.
 
 `nixscp --list` shows each site's permissions as `commands`, `files` (downloads and uploads) or `downloads`
-(download-only) and `tunnels`, with `(restricted commands)` when the site has command rules.
+(download-only), `tunnels`, and `note` or `note-edit`, with `(restricted commands)` when the site has command rules.
+
+## Site notes
+
+Every site has a note: what you need to know about the server, such as where its logs are, what runs there or what
+not to restart. It is shown in the Login dialog under the site's settings. Click **Edit** to change it and **Save** to
+keep it; the site itself is not edited for this. A site with a note has a small yellow page on its icon, and its
+tooltip shows the start of the note. A note holds up to 64 KB of text. It travels with the site: in cloud sync, in
+exports, and in WinSCP's own **Note** field (**Advanced › Note**), so WinSCP shows it too.
+
+On a team site, the note is the team's: its owners and admins edit it, and everyone in the team sees it.
+
+A note does not need a server. **New Note** (in the Login dialog's **Manage** menu, or the context menu of the site
+list) adds a note item: a yellow page in the list, with only the note and no connection settings. Use it for what
+belongs with your sites but is not one, such as office network details or who to call when a server is down. Note
+items live in folders, sync, and can be shared with a team like sites; they cannot be opened, so **Login** stays off,
+and scripts refuse them. Agents see them in `nixscp --list` as `(note)` and can only read or edit their note. WinSCP,
+which knows nothing of them, shows a note item as a site without a host name.
+
+The two checkboxes above the note decide what agents may do with it:
+
+- **Allow Agent Access**: agents may read the note (`nixscp --note <site>`, the MCP tool `read_note`). Give agents the
+  facts they need before they work on the server, so they do not have to guess.
+- **Allow Agent Edit**: agents may replace the note (`nixscp --note-set <site>`, the MCP tool `write_note`), for
+  example to record what they found or changed. On a team site only owners and admins can tick it, because an agent
+  cannot do more than its user.
+
+They are Agent Access permissions of the site, kept on this computer like the others. When Agent Access is off for the
+site, ticking one asks whether to turn it on, with **Ask me each time** and the note as the only permission: agents get
+no commands, files or tunnels from it. Unticking the last permission turns Agent Access off again. Notes are for SFTP
+and SCP sites, like the rest of Agent Access.
+
+A note request needs no connection to the server: NixSCP answers it from the saved site. It is asked about and logged
+like any other request. The audit log records that the note was read or replaced and the new note's size, not its
+text.
 
 ## Approval: Ask me each time
 
@@ -276,6 +313,8 @@ written for both people and AI agents. On Windows the program is `nixscp.exe` in
 | `nixscp --get <site> <remote-file> [<local-file-or-folder>]` | Downloads one file. Without a local name, saves into the current folder. Relative remote paths and `~/...` are in the home folder. |
 | `nixscp --put <site> <local-file> [<remote-file-or-folder>]` | Uploads one file. Without a remote name, uploads into the home folder. |
 | `nixscp --tunnel <site> <local-port>:<host>:<port>` | Forwards `127.0.0.1:<local-port>` to `<host>:<port>` as seen from the server (like `ssh -L`) until the command ends (Ctrl+C). The local port must be 1024 or higher. Instead of the specification you can give the name of one of the site's saved [tunnels](tunnels.md). |
+| `nixscp --note <site>` | Prints the site's note. Needs **Allow Agent Access** in the site's note. |
+| `nixscp --note-set <site> [<file>]` | Replaces the site's note with the text of the file, or with standard input (at most 64 KB; an empty input clears the note). Needs **Allow Agent Edit**. |
 | `nixscp --mcp` | Runs the [MCP server](mcp.md) on standard input/output. |
 | `nixscp --help` | Shows the help text. (WinSCP-compatible switches: `nixscp /help`.) |
 
@@ -325,6 +364,10 @@ psql -h 127.0.0.1 -p 5433
 
 # a saved tunnel by name
 nixscp --tunnel db1 postgres
+
+# what to know about the server, then a note of what was done
+nixscp --note web1
+printf 'Checked 2026-11-12: nginx 1.26, disk 41%% used.\n' | nixscp --note-set web1
 ```
 
 A typical instruction for an AI agent: *"Use `nixscp` to work on my servers. Run `nixscp --help` first, then

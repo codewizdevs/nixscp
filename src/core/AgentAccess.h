@@ -32,7 +32,15 @@ namespace AgentAccess
   // SessionData::AgentPermissions (bits)
   enum TPermission { apCommands = 0x01, apTransfer = 0x02, apTunnels = 0x04, apAll = 0x07,
     // with apTransfer: downloads only (no uploads)
-    apDownloadOnly = 0x10 };
+    apDownloadOnly = 0x10,
+    // the site's note (SessionData::Note): read it, replace it. Not in apAll:
+    // a site's notes reach agents only when the user ticks these.
+    apNoteRead = 0x08, apNoteWrite = 0x20 };
+
+  // A site's note, as teams accept it: at most this many bytes of UTF-8, no
+  // control characters other than line breaks and tabs
+  constexpr int MaxNoteBytes = 64 * 1024;
+  bool NoteAcceptable(const QString & Text, QString * Reason = nullptr);
 
   enum TFrame : quint8
   {

@@ -10,6 +10,7 @@
 #include "core/SecureShell.h"
 #include "core/Security.h"
 #include "core/SessionData.h"
+#include "core/TeamSync.h"
 
 #include <QApplication>
 #include <QDateTime>
@@ -81,7 +82,7 @@ struct JobInput
 
 struct Request
 {
-  QString Op;                // list, exec, shell, get, put
+  QString Op;                // list, exec, shell, get, put, tunnel, note-get, note-set
   QString Site;
   QString Command;
   QString Term;
@@ -92,6 +93,7 @@ struct Request
   int Rows = 24;
 
   QString Forward;           // tunnel: "<local port>:<host>:<port>" or a saved forward's name
+  QString Text;              // note-set: the new note
 
   QString Detail() const
   {
@@ -99,11 +101,14 @@ struct Request
     if (Op == QStringLiteral("tunnel")) return Forward;
     if (Op == QStringLiteral("get")) return Remote;
     if (Op == QStringLiteral("put")) return Name + QStringLiteral(" -> ") + (Remote.isEmpty() ? QStringLiteral("~") : Remote);
+    if (Op == QStringLiteral("note-set")) return QStringLiteral("%1 bytes").arg(Text.toUtf8().size());
     return QString();
   }
   int Permission() const
   {
     if (Op == QStringLiteral("tunnel")) return apTunnels;
+    if (Op == QStringLiteral("note-get")) return apNoteRead;
+    if (Op == QStringLiteral("note-set")) return apNoteWrite;
     return ((Op == QStringLiteral("get")) || (Op == QStringLiteral("put"))) ? apTransfer : apCommands;
   }
 };
@@ -702,6 +707,7 @@ private:
   std::unique_ptr<AgentUserInterface> FTunnelUI;
   PortForward * FTunnel = nullptr;
   void StartTunnel(const SessionData & Data);
+  void AnswerNote(const QString & SiteName);
 
   void Read();
   void Fail(const QString & Message, const QString & AuditResult = QString());
@@ -905,10 +911,12 @@ void Connection::Read()
       FRequest.Cols = qBound(10, J.value(QStringLiteral("cols")).toInt(80), 1000);
       FRequest.Rows = qBound(2, J.value(QStringLiteral("rows")).toInt(24), 1000);
       FRequest.Forward = J.value(QStringLiteral("forward")).toString();
+      FRequest.Text = J.value(QStringLiteral("text")).toString();
       FHaveRequest = true;
       // libssh takes C strings: a NUL (\u0000 in the JSON) would end the text
       // the server gets, after the rules, the prompt and the log saw all of it
-      for (const QString * Text : {&FRequest.Op, &FRequest.Site, &FRequest.Command, &FRequest.Term, &FRequest.Remote, &FRequest.Name, &FRequest.Forward})
+      for (const QString * Text : {&FRequest.Op, &FRequest.Site, &FRequest.Command, &FRequest.Term, &FRequest.Remote, &FRequest.Name,
+        &FRequest.Forward, &FRequest.Text})
       {
         if (Text->contains(QChar(0)))
         {
@@ -1042,12 +1050,36 @@ bool Connection::CheckAccess(std::shared_ptr<SessionData> & Data, QString & Erro
     return false;
   }
   FLogSite = LogName(*Data);
+  if (Data->NoteOnly && (FRequest.Op != QStringLiteral("note-get")) && (FRequest.Op != QStringLiteral("note-set")))
+  {
+    Error = QStringLiteral("\"%1\" is a note, not a server: only --note and --note-set work for it.").arg(FRequest.Site);
+    return false;
+  }
   if (!(Data->AgentPermissions & FRequest.Permission()))
   {
     Error = QStringLiteral("Site \"%1\" does not allow %2 for agents.").arg(FRequest.Site,
       (FRequest.Permission() == apTransfer) ? QStringLiteral("file transfers") :
-      (FRequest.Permission() == apTunnels) ? QStringLiteral("tunnels") : QStringLiteral("commands"));
+      (FRequest.Permission() == apTunnels) ? QStringLiteral("tunnels") :
+      (FRequest.Permission() == apNoteRead) ? QStringLiteral("reading its note") :
+      (FRequest.Permission() == apNoteWrite) ? QStringLiteral("editing its note") : QStringLiteral("commands"));
     return false;
+  }
+  if (FRequest.Op == QStringLiteral("note-set"))
+  {
+    QString Why;
+    if (!NoteAcceptable(FRequest.Text, &Why))
+    {
+      Error = Why;
+      return false;
+    }
+    // a team site's note is the team's: only its owners and admins change it
+    // (a member's change would be reverted at the next sync anyway)
+    const TeamSync::Team * Team = TeamSync::Instance().TeamOfSite(Data->Name);
+    if ((Team != nullptr) && !Team->CanEdit())
+    {
+      Error = QStringLiteral("Site \"%1\" is shared by a team, and only the team's owners and admins can edit its note.").arg(FRequest.Site);
+      return false;
+    }
   }
   if ((FRequest.Op == QStringLiteral("put")) && (Data->AgentPermissions & apDownloadOnly))
   {
@@ -1109,7 +1141,7 @@ bool Connection::CheckAccess(std::shared_ptr<SessionData> & Data, QString & Erro
 void Connection::Authorize()
 {
   static const QStringList Ops{QStringLiteral("list"), QStringLiteral("exec"), QStringLiteral("shell"), QStringLiteral("get"),
-    QStringLiteral("put"), QStringLiteral("tunnel")};
+    QStringLiteral("put"), QStringLiteral("tunnel"), QStringLiteral("note-get"), QStringLiteral("note-set")};
   if (!Ops.contains(FRequest.Op))
   {
     Fail(QStringLiteral("Unknown request."));
@@ -1217,6 +1249,15 @@ void Connection::AskApproval(const SessionData & Data)
     What = QStringLiteral("Open a tunnel:");
     Detail = QStringLiteral("127.0.0.1:%1").arg(FTunnelSpec.Text());
   }
+  else if (FRequest.Op == QStringLiteral("note-get"))
+  {
+    What = QStringLiteral("Read the site's note.");
+  }
+  else if (FRequest.Op == QStringLiteral("note-set"))
+  {
+    What = QStringLiteral("Replace the site's note with:");
+    Detail = FRequest.Text.isEmpty() ? QStringLiteral("(an empty note)") : FRequest.Text;
+  }
   else
   {
     What = QStringLiteral("Upload file:");
@@ -1296,10 +1337,12 @@ void Connection::SendList()
     }
     Sites.append(QJsonObject{
       {QStringLiteral("name"), AgentSiteName(*Data)},
-      {QStringLiteral("host"), Data->HostName},
-      {QStringLiteral("user"), Data->UserName},
-      {QStringLiteral("port"), Data->PortNumber},
-      {QStringLiteral("permissions"), PermissionsText(Data->AgentPermissions) +
+      // a note item has no server
+      {QStringLiteral("kind"), Data->NoteOnly ? QStringLiteral("note") : QStringLiteral("site")},
+      {QStringLiteral("host"), Data->NoteOnly ? QString() : Data->HostName},
+      {QStringLiteral("user"), Data->NoteOnly ? QString() : Data->UserName},
+      {QStringLiteral("port"), Data->NoteOnly ? 0 : Data->PortNumber},
+      {QStringLiteral("permissions"), PermissionsText(Data->NoteOnly ? (Data->AgentPermissions & (apNoteRead | apNoteWrite)) : Data->AgentPermissions) +
         (HasCommandRules(*Data) ? QStringLiteral(" (restricted commands)") : QString())},
       {QStringLiteral("approval"), ((Data->AgentAccess == amAsk) || !SettingsConfirmed(*Data)) ? QStringLiteral("ask") : QStringLiteral("none")},
     });
@@ -1332,9 +1375,40 @@ void Connection::Authorized(const SessionData & Data)
     Fail(QStringLiteral("The agent access log cannot be written, so NixSCP refuses agent requests."));
     return;
   }
+  if ((FRequest.Op == QStringLiteral("note-get")) || (FRequest.Op == QStringLiteral("note-set")))
+  {
+    AnswerNote(Data.Name);
+    return;
+  }
   GActiveJobs++;
   FHasSlot = true;
   Start(Data);
+}
+
+// Notes need no connection: the stored site has them
+void Connection::AnswerNote(const QString & SiteName)
+{
+  std::shared_ptr<SessionData> Site = Configuration::Instance().StoredSessions().FindByName(SiteName);
+  if (Site == nullptr)
+  {
+    Fail(QStringLiteral("The site is no longer there."), QStringLiteral("failed: site gone"));
+    return;
+  }
+  if (FRequest.Op == QStringLiteral("note-get"))
+  {
+    QByteArray Note = Site->Note.toUtf8();
+    if (!Note.isEmpty() && !Note.endsWith('\n'))
+    {
+      Note += '\n';
+    }
+    FSocket->write(Frame(frStdout, Note));
+    Finish(0);
+    return;
+  }
+  Site->Note = FRequest.Text;
+  Configuration::Instance().Save();
+  emit Configuration::Instance().StoredSessionsChanged();
+  Finish(0);
 }
 
 void Connection::StartTunnel(const SessionData & Data)

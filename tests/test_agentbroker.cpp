@@ -1118,6 +1118,120 @@ static void TestRecordings()
   CHECK(!AuditLog().contains("stored site password"));
 }
 
+// Site notes: read and replaced by agents, only with their own permissions
+static void TestNotes(const QString & Folder)
+{
+  auto Plain = AddSite(QStringLiteral("note-none"), amAllow, apCommands);
+  Plain->Note = QStringLiteral("secret plans");
+  Result R = Agent({QStringLiteral("--note"), QStringLiteral("note-none")});
+  CHECK_MSG((R.Code == 255) && R.Err.contains("does not allow reading its note") && R.Out.isEmpty(), R.Text());
+
+  auto Read = AddSite(QStringLiteral("note-read"), amAllow, apNoteRead);
+  Read->Note = QStringLiteral("Logs: /var/log/shop\nDo not restart MySQL in the daytime.");
+  R = Agent({QStringLiteral("--note"), QStringLiteral("note-read")});
+  CHECK_MSG((R.Code == 0) && (R.Out == Read->Note.toUtf8() + "\n"), R.Text());
+  R = Agent({QStringLiteral("--note-set"), QStringLiteral("note-read")}, "overwritten");
+  CHECK_MSG((R.Code == 255) && R.Err.contains("does not allow editing its note"), R.Text());
+  CHECK(Read->Note.startsWith(QStringLiteral("Logs:")));
+  // the note alone: nothing else on the server
+  R = Connect(QStringLiteral("note-read"), QStringLiteral("big 1"));
+  CHECK_MSG((R.Code == 255) && R.Err.contains("does not allow commands"), R.Text());
+  R = Agent({QStringLiteral("--list")});
+  CHECK_MSG((R.Code == 0) && R.Out.contains("note-read") && R.Out.contains("note"), R.Text());
+
+  auto Write = AddSite(QStringLiteral("note-write"), amAllow, apNoteRead | apNoteWrite);
+  QByteArray Text = "Checked on 2026-11-12: nginx 1.26, disk 41% used.\n\xc3\x9cmlauts and tabs\tstay.";
+  R = Agent({QStringLiteral("--note-set"), QStringLiteral("note-write")}, Text);
+  CHECK_MSG(R.Code == 0, R.Text());
+  CHECK(Write->Note == QString::fromUtf8(Text));
+  R = Agent({QStringLiteral("--note"), QStringLiteral("note-write")});
+  CHECK_MSG((R.Code == 0) && (R.Out == Text + "\n"), R.Text());
+  // from a file
+  QString File = Folder + QStringLiteral("/note.txt");
+  QFile Out(File);
+  CHECK(Out.open(QIODevice::WriteOnly) && (Out.write("from a file\n") > 0));
+  Out.close();
+  R = Agent({QStringLiteral("--note-set"), QStringLiteral("note-write"), File});
+  CHECK_MSG((R.Code == 0) && (Write->Note == QStringLiteral("from a file\n")), R.Text());
+  // the log has the size, not the text
+  CHECK(AuditLog().contains("note-set") && AuditLog().contains("12 bytes") && !AuditLog().contains("from a file"));
+  // limits: size and control characters
+  R = Agent({QStringLiteral("--note-set"), QStringLiteral("note-write")}, QByteArray(MaxNoteBytes + 1, 'x'));
+  CHECK_MSG((R.Code != 0) && R.Err.contains("too long"), R.Text());
+  R = Agent({QStringLiteral("--note-set"), QStringLiteral("note-write")}, QByteArray(MaxNoteBytes, 'x'));
+  CHECK_MSG((R.Code == 0) && (Write->Note.size() == MaxNoteBytes), R.Text());
+  R = Agent({QStringLiteral("--note-set"), QStringLiteral("note-write")}, QByteArray("bell\x07here"));
+  CHECK_MSG((R.Code == 255) && R.Err.contains("control characters") && (Write->Note.size() == MaxNoteBytes), R.Text());
+  // an empty note clears it
+  R = Agent({QStringLiteral("--note-set"), QStringLiteral("note-write")}, QByteArray());
+  CHECK_MSG((R.Code == 0) && Write->Note.isEmpty(), R.Text());
+  R = Agent({QStringLiteral("--note"), QStringLiteral("note-write")});
+  CHECK_MSG((R.Code == 0) && R.Out.isEmpty(), R.Text());
+
+  // asking: Deny keeps the old note
+  auto Asked = AddSite(QStringLiteral("note-ask"), amAsk, apNoteRead | apNoteWrite);
+  Asked->Note = QStringLiteral("old");
+  Answer(QStringLiteral("Deny"));
+  R = Agent({QStringLiteral("--note-set"), QStringLiteral("note-ask")}, "new");
+  CHECK_MSG((R.Code == 255) && R.Err.contains("denied") && (Asked->Note == QStringLiteral("old")), R.Text());
+  Answer(QStringLiteral("Allow once"));
+  R = Agent({QStringLiteral("--note-set"), QStringLiteral("note-ask")}, "new");
+  CHECK_MSG((R.Code == 0) && (Asked->Note == QStringLiteral("new")), R.Text());
+
+  // a note item: no server behind it, whatever its permissions say
+  auto Item = AddSite(QStringLiteral("office-note"), amAllow, apAll | apNoteRead | apNoteWrite, false);
+  Item->NoteOnly = true;
+  Item->HostName.clear();
+  Item->Note = QStringLiteral("Office VPN: vpn.example.com");
+  CHECK(ConfirmSettings(*Item));
+  R = Agent({QStringLiteral("--note"), QStringLiteral("office-note")});
+  CHECK_MSG((R.Code == 0) && R.Out.startsWith("Office VPN"), R.Text());
+  R = Connect(QStringLiteral("office-note"), QStringLiteral("big 1"));
+  CHECK_MSG((R.Code == 255) && R.Err.contains("is a note, not a server"), R.Text());
+  R = Agent({QStringLiteral("--list")});
+  QByteArray Line;
+  for (const QByteArray & L : R.Out.split('\n')) if (L.startsWith("office-note\t")) Line = L;
+  CHECK_MSG(Line.contains("(note)") && Line.contains("note-edit") && !Line.contains("commands") && !Line.contains("files"), R.Text());
+  R = Agent({QStringLiteral("--note-set"), QStringLiteral("office-note")}, "Office VPN: vpn2.example.com");
+  CHECK_MSG((R.Code == 0) && (Item->Note == QStringLiteral("Office VPN: vpn2.example.com")), R.Text());
+
+  // the same through MCP
+  QProcess Mcp;
+  Mcp.start(GClient, {QStringLiteral("--mcp")});
+  CHECK(Mcp.waitForStarted(10000));
+  QByteArray Buffer;
+  auto Call = [&](int Id, const QString & Tool, const QJsonObject & Arguments) -> QJsonObject
+  {
+    Mcp.write(QJsonDocument(QJsonObject{{QStringLiteral("jsonrpc"), QStringLiteral("2.0")}, {QStringLiteral("id"), Id},
+      {QStringLiteral("method"), QStringLiteral("tools/call")},
+      {QStringLiteral("params"), QJsonObject{{QStringLiteral("name"), Tool}, {QStringLiteral("arguments"), Arguments}}}}).toJson(QJsonDocument::Compact) + '\n');
+    QJsonObject Reply;
+    WaitFor([&]()
+    {
+      Buffer += Mcp.readAllStandardOutput();
+      qsizetype End = Buffer.indexOf('\n');
+      if (End < 0) return false;
+      Reply = QJsonDocument::fromJson(Buffer.left(End)).object().value(QStringLiteral("result")).toObject();
+      Buffer.remove(0, End + 1);
+      return true;
+    }, 20000);
+    return Reply;
+  };
+  Mcp.write("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\"}}\n");
+  WaitFor([&]() { Buffer += Mcp.readAllStandardOutput(); return Buffer.contains('\n'); }, 10000);
+  Buffer.clear();
+  QJsonObject Got = Call(2, QStringLiteral("read_note"), QJsonObject{{QStringLiteral("site"), QStringLiteral("note-read")}});
+  CHECK_MSG(!Got.value(QStringLiteral("isError")).toBool() &&
+    Got.value(QStringLiteral("structuredContent")).toObject().value(QStringLiteral("note")).toString().startsWith(QStringLiteral("Logs:")),
+    QString::fromUtf8(QJsonDocument(Got).toJson()));
+  Got = Call(3, QStringLiteral("write_note"), QJsonObject{{QStringLiteral("site"), QStringLiteral("note-read")}, {QStringLiteral("text"), QStringLiteral("x")}});
+  CHECK(Got.value(QStringLiteral("isError")).toBool());
+  Got = Call(4, QStringLiteral("write_note"), QJsonObject{{QStringLiteral("site"), QStringLiteral("note-write")}, {QStringLiteral("text"), QStringLiteral("by MCP")}});
+  CHECK_MSG(!Got.value(QStringLiteral("isError")).toBool() && (Write->Note == QStringLiteral("by MCP")), QString::fromUtf8(QJsonDocument(Got).toJson()));
+  Mcp.closeWriteChannel();
+  CHECK(Mcp.waitForFinished(10000));
+}
+
 // X-M11, L15, L16
 static void TestMcp()
 {
@@ -1473,6 +1587,7 @@ int main(int argc, char ** argv)
   TestAccessDialog();
   TestRecordings();
   TestMcp();
+  TestNotes(Dir.path());
   TestFiles(Dir.path(), OpenSshKnownHosts);
   TestSurrogateOnServer(Dir.path(), OpenSshKnownHosts);
   TestTwoInstances(Dir.path());

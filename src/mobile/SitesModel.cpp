@@ -52,7 +52,8 @@ void SitesModel::reload()
   QList<Site> Sites;
   for (const auto & Data : Configuration::Instance().StoredSessions().Sessions())
   {
-    if (Data->IsWorkspace)
+    // note items: not on Android yet
+    if (Data->IsWorkspace || Data->NoteOnly)
     {
       continue;
     }

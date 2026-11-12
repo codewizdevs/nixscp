@@ -49,6 +49,7 @@ const Rule Rules[] = {
   {"LocalDirectory", kText},
   {"OtherLocalDirectory", kText},
   {"Note", kNote},
+  {"NoteOnly", kBool},
   {"Color", kInt, 0, 0xFFFFFF},
   {"SshHostKey", kHostKey},
   {"EOLType", kInt, 0, 2},

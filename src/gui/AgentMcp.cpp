@@ -231,7 +231,8 @@ QJsonArray Tools()
   return QJsonArray{
     QJsonObject{{QStringLiteral("name"), QStringLiteral("list_sites")},
       {QStringLiteral("description"), QStringLiteral("Lists the SSH servers (sites) you may use through NixSCP: name, host, "
-        "what is permitted and whether the user approves each request. Call this first. Passwords and keys are never revealed.")},
+        "what is permitted and whether the user approves each request. Call this first. Passwords and keys are never revealed. "
+        "Sites with \"note\" in their permissions have a note from the user: read it with read_note before working there.")},
       {QStringLiteral("inputSchema"), Schema(QJsonObject(), {})}},
     QJsonObject{{QStringLiteral("name"), QStringLiteral("run_command")},
       {QStringLiteral("description"), QStringLiteral("Runs a shell command on a site (the user's login shell on the server, "
@@ -258,6 +259,19 @@ QJsonArray Tools()
         {QStringLiteral("local_path"), Prop(QStringLiteral("string"), QStringLiteral("File on this computer"))},
         {QStringLiteral("remote_path"), Prop(QStringLiteral("string"), QStringLiteral("File or folder on the server (default: the home folder)"))},
       }, {QStringLiteral("site"), QStringLiteral("local_path")})}},
+    QJsonObject{{QStringLiteral("name"), QStringLiteral("read_note")},
+      {QStringLiteral("description"), QStringLiteral("Reads the note the user keeps about a site: what to know before working on "
+        "that server, for example where its logs are, what runs there or what not to restart. Needs the site's \"note\" or "
+        "\"note-edit\" permission.")},
+      {QStringLiteral("inputSchema"), Schema(QJsonObject{{QStringLiteral("site"), Site}}, {QStringLiteral("site")})}},
+    QJsonObject{{QStringLiteral("name"), QStringLiteral("write_note")},
+      {QStringLiteral("description"), QStringLiteral("Replaces the whole note of a site with new text (at most 64 KB). Read it "
+        "with read_note first and keep what is still true. Use it to record what you found or changed on the server. Needs the "
+        "site's \"note-edit\" permission; the user may be asked to approve.")},
+      {QStringLiteral("inputSchema"), Schema(QJsonObject{
+        {QStringLiteral("site"), Site},
+        {QStringLiteral("text"), Prop(QStringLiteral("string"), QStringLiteral("The complete new note"))},
+      }, {QStringLiteral("site"), QStringLiteral("text")})}},
   };
 }
 
@@ -352,6 +366,42 @@ QJsonObject CallTool(const QString & Name, const QJsonObject & Args)
       return TextResult(R.Error, true);
     }
     return TextResult(QStringLiteral("Uploaded %1 (%2 bytes).").arg(Info.fileName()).arg(Info.size()), false);
+  }
+  if (Name == QStringLiteral("read_note"))
+  {
+    if (Str("site").isEmpty())
+    {
+      return TextResult(QStringLiteral("Give \"site\"."), true);
+    }
+    Outcome R = Request(QJsonObject{{QStringLiteral("op"), QStringLiteral("note-get")}, {QStringLiteral("site"), Str("site")}},
+      QByteArray(), QString(), AgentAccess::MaxNoteBytes + 2);
+    if (!R.Error.isEmpty())
+    {
+      return TextResult(R.Error, true);
+    }
+    QString Note = QString::fromUtf8(R.Stdout);
+    QJsonObject Result = TextResult(Note.isEmpty() ? QStringLiteral("(The site has no note.)") : Note, false);
+    Result.insert(QStringLiteral("structuredContent"), QJsonObject{{QStringLiteral("note"), Note}});
+    return Result;
+  }
+  if (Name == QStringLiteral("write_note"))
+  {
+    if (Str("site").isEmpty() || !Args.value(QStringLiteral("text")).isString())
+    {
+      return TextResult(QStringLiteral("Give \"site\" and \"text\"."), true);
+    }
+    QString Why;
+    if (!AgentAccess::NoteAcceptable(Str("text"), &Why))
+    {
+      return TextResult(Why, true);
+    }
+    Outcome R = Request(QJsonObject{{QStringLiteral("op"), QStringLiteral("note-set")}, {QStringLiteral("site"), Str("site")},
+      {QStringLiteral("text"), Str("text")}}, QByteArray(), QString(), 0);
+    if (!R.Error.isEmpty())
+    {
+      return TextResult(R.Error, true);
+    }
+    return TextResult(QStringLiteral("The note of %1 was saved (%2 bytes).").arg(Str("site")).arg(Str("text").toUtf8().size()), false);
   }
   return QJsonObject();
 }

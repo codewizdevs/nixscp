@@ -157,7 +157,7 @@ void SetupMenu(QMenu * Menu, QAction * Manage)
     int Count = 0;
     for (const auto & Data : Configuration::Instance().StoredSessions().Sessions())
     {
-      if (!Data->IsSsh() || Data->IsWorkspace)
+      if (!Data->IsSsh() || Data->IsWorkspace || Data->NoteOnly)
       {
         continue;
       }
@@ -302,7 +302,7 @@ void TunnelsDialog::Reload()
   TunnelManager & Manager = TunnelManager::Instance();
   for (const auto & Data : Configuration::Instance().StoredSessions().Sessions())
   {
-    if (!Data->IsSsh() || Data->IsWorkspace)
+    if (!Data->IsSsh() || Data->IsWorkspace || Data->NoteOnly)
     {
       continue;
     }
@@ -376,7 +376,7 @@ void TunnelsDialog::Edit(bool New)
   auto * SiteCombo = new QComboBox(&Dialog);
   for (const auto & Data : Sites.Sessions())
   {
-    if (Data->IsSsh() && !Data->IsWorkspace)
+    if (Data->IsSsh() && !Data->IsWorkspace && !Data->NoteOnly)
     {
       SiteCombo->addItem(Data->Name);
     }

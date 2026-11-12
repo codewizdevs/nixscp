@@ -4,6 +4,7 @@
 #include "core/CloudSettings.h"
 #include "gui/TeamsDialog.h"
 #include "core/TeamSync.h"
+#include "core/AgentAccess.h"
 #include "gui/AgentAccessDialog.h"
 #include "core/Platform.h"
 #include "gui/CloudSyncUi.h"
@@ -46,6 +47,8 @@
 #include <QMimeData>
 #include <QPainter>
 #include <QPlainTextEdit>
+#include <QSignalBlocker>
+#include <QTextCursor>
 #include <QProcess>
 #include <QPushButton>
 #include <QScreen>
@@ -396,8 +399,9 @@ LoginDialog::LoginDialog(StoredSessionList & Sessions, QWidget * Parent) :
   }
   connect(&Configuration::Instance(), &Configuration::StoredSessionsChanged, this, [this]()
   {
-    // another instance saved the sites, or a team's sites changed
-    if (!FEditing && !FRenaming)
+    // another instance saved the sites, or a team's sites changed, or an agent
+    // edited a note (not while the user edits one: that text is kept)
+    if (!FEditing && !FRenaming && !FNoteEditing)
     {
       ReloadSessions(SessionNodePath(Selected()) + (IsFolderNode(Selected()) ? QStringLiteral("/") : QString()));
     }
@@ -444,6 +448,7 @@ void LoginDialog::CreateActions()
   RenameSessionAction = Action(QStringLiteral("&Rename"), [this]() { RenameSessionActionExecute(); });
   RenameSessionAction->setIcon(Icons::Get(QStringLiteral("rename")));
   NewSessionFolderAction = Action(QStringLiteral("Ne&w Folder..."), [this]() { NewSessionFolderActionExecute(); });
+  NewNoteAction = Action(QStringLiteral("New &Note..."), [this]() { NewNoteActionExecute(); });
   NewSessionFolderAction->setIcon(Icons::Get(QStringLiteral("new-folder")));
   // Unix PuTTY tools; shown only when installed (FindTool)
   RunPageantAction = Action(QStringLiteral("Run Pagea&nt"), []()
@@ -765,11 +770,51 @@ void LoginDialog::CreateControls()
   SessionButtons->addWidget(AdvancedButton);
   Grid->addLayout(SessionButtons, 7, 0, 1, 4);
 
+  // The site's note: what you (or your team) need to know about the server.
+  // Saved on its own with Save, without editing the site.
   NoteGroup = new QGroupBox(QStringLiteral("Note"));
   auto * NoteLayout = new QVBoxLayout(NoteGroup);
+  auto * NoteChecks = new QHBoxLayout();
+  NoteAgentReadCheck = new QCheckBox(QStringLiteral("Allow Agent Access"));
+  NoteAgentWriteCheck = new QCheckBox(QStringLiteral("Allow Agent Edit"));
+  NoteChecks->addWidget(NoteAgentReadCheck);
+  NoteChecks->addWidget(NoteAgentWriteCheck);
+  NoteChecks->addStretch();
+  NoteLayout->addLayout(NoteChecks);
   NoteMemo = new QPlainTextEdit();
   NoteMemo->setReadOnly(true);
-  NoteLayout->addWidget(NoteMemo);
+  NoteMemo->setPlaceholderText(QStringLiteral("No note yet. Click Edit to write down what you need to know about this server: "
+    "where its logs are, what runs there, what not to restart, who to call."));
+  NoteMemo->setMinimumHeight(150);
+  NoteLayout->addWidget(NoteMemo, 1);
+  auto * NoteButtons = new QHBoxLayout();
+  NoteInfo = new QLabel();
+  NoteInfo->setWordWrap(true);
+  NoteEditButton = new QPushButton(QStringLiteral("Edit"));
+  NoteSaveButton = new QPushButton(QStringLiteral("Save"));
+  NoteCancelButton = new QPushButton(QStringLiteral("Cancel"));
+  for (QPushButton * B : {NoteEditButton, NoteSaveButton, NoteCancelButton})
+  {
+    B->setAutoDefault(false);
+  }
+  NoteMemo->setObjectName(QStringLiteral("NoteMemo"));
+  NoteEditButton->setObjectName(QStringLiteral("NoteEdit"));
+  NoteSaveButton->setObjectName(QStringLiteral("NoteSave"));
+  NoteCancelButton->setObjectName(QStringLiteral("NoteCancel"));
+  NoteAgentReadCheck->setObjectName(QStringLiteral("NoteAgentRead"));
+  NoteAgentWriteCheck->setObjectName(QStringLiteral("NoteAgentWrite"));
+  NoteInfo->setObjectName(QStringLiteral("NoteInfo"));
+  NoteButtons->addWidget(NoteInfo, 1);
+  NoteButtons->addWidget(NoteCancelButton);
+  NoteButtons->addWidget(NoteSaveButton);
+  NoteButtons->addWidget(NoteEditButton);
+  NoteLayout->addLayout(NoteButtons);
+  connect(NoteEditButton, &QPushButton::clicked, this, [this]() { StartNoteEdit(); });
+  connect(NoteSaveButton, &QPushButton::clicked, this, [this]() { SaveNote(); });
+  connect(NoteCancelButton, &QPushButton::clicked, this, [this]() { CancelNoteEdit(); });
+  connect(NoteMemo, &QPlainTextEdit::textChanged, this, [this]() { if (FNoteEditing) UpdateNoteInfo(); });
+  connect(NoteAgentReadCheck, &QCheckBox::clicked, this, [this](bool Checked) { NoteAgentChecked(false, Checked); });
+  connect(NoteAgentWriteCheck, &QCheckBox::clicked, this, [this](bool Checked) { NoteAgentChecked(true, Checked); });
 
   SitePanel = new QWidget();
   auto * SitePanelLayout = new QVBoxLayout(SitePanel);
@@ -852,6 +897,22 @@ void LoginDialog::CreateControls()
     {
       return;
     }
+    if (FNoteEditing && (Previous != nullptr) && (Current != Previous))
+    {
+      // a changed note is not lost by clicking another site: select back and ask
+      FNoUpdate++;
+      SessionTree->setCurrentItem(Previous);
+      FNoUpdate--;
+      QString Target = SessionNodePath(Current) + (IsFolderNode(Current) ? QStringLiteral("/") : QString());
+      QTimer::singleShot(0, this, [this, Target]()
+      {
+        if (EnsureNoteSaved())
+        {
+          ReloadSessions(Target);
+        }
+      });
+      return;
+    }
     if (FEditing && (Previous != nullptr) && (Current != Previous))
     {
       // SessionTreeChanging: the user has to decide first; select back and ask
@@ -892,7 +953,13 @@ void LoginDialog::CreateControls()
     // SessionTreeDblClick
     if ((Node == Selected()) && EnsureNotEditing())
     {
-      if (IsCloneToNewSiteDefault())
+      std::shared_ptr<SessionData> Note = SelectedSession();
+      if ((Note != nullptr) && Note->NoteOnly)
+      {
+        // a note item opens its note for editing
+        if (!FNoteEditing) StartNoteEdit();
+      }
+      else if (IsCloneToNewSiteDefault())
       {
         CloneToNewSite();
       }
@@ -1046,9 +1113,290 @@ QIcon LoginDialog::SiteIcon(const SessionData & Data)
   return Result;
 }
 
+// A site with a note gets a small yellow page in the top right corner of its
+// icon (the site color marks the bottom right)
 QIcon LoginDialog::SessionIcon(const SessionData & Data)
 {
-  return SiteIcon(Data);
+  if (Data.NoteOnly)
+  {
+    return NoteItemIcon();
+  }
+  QIcon Base = SiteIcon(Data);
+  if (Data.Note.trimmed().isEmpty())
+  {
+    return Base;
+  }
+  static QHash<int, QIcon> Cache;
+  auto It = Cache.constFind(Data.Color);
+  if (It != Cache.constEnd())
+  {
+    return It.value();
+  }
+  QIcon Result;
+  for (int Size : {16, 24, 32})
+  {
+    QPixmap Pixmap = Base.pixmap(Size, Size);
+    if (Pixmap.isNull())
+    {
+      Pixmap = QPixmap(Size, Size);
+      Pixmap.fill(Qt::transparent);
+    }
+    QPainter Painter(&Pixmap);
+    int Width = (Size * 7) / 16;
+    int Height = Size / 2;
+    QRect Page(Size - Width, 0, Width - 1, Height - 1);
+    Painter.fillRect(Page, QColor(255, 226, 110));
+    Painter.setPen(QColor(150, 112, 0));
+    Painter.drawRect(Page);
+    for (int Y = Page.top() + 2; Y < Page.bottom() - 1; Y += qMax(2, Size / 8))
+    {
+      Painter.drawLine(Page.left() + 2, Y, Page.right() - 2, Y);
+    }
+    Painter.end();
+    Result.addPixmap(Pixmap);
+  }
+  Cache.insert(Data.Color, Result);
+  return Result;
+}
+
+// A note item: a yellow page with lines
+QIcon LoginDialog::NoteItemIcon()
+{
+  static QIcon Result;
+  if (!Result.isNull())
+  {
+    return Result;
+  }
+  for (int Size : {16, 24, 32})
+  {
+    QPixmap Pixmap(Size, Size);
+    Pixmap.fill(Qt::transparent);
+    QPainter Painter(&Pixmap);
+    int Margin = qMax(1, Size / 8);
+    QRect Page(Margin + 1, 0, Size - 2 * Margin - 2, Size - 1);
+    Painter.fillRect(Page, QColor(255, 226, 110));
+    Painter.setPen(QColor(150, 112, 0));
+    Painter.drawRect(Page);
+    for (int Y = Page.top() + qMax(3, Size / 5); Y < Page.bottom() - 1; Y += qMax(2, Size / 6))
+    {
+      Painter.drawLine(Page.left() + 2, Y, Page.right() - 2, Y);
+    }
+    Painter.end();
+    Result.addPixmap(Pixmap);
+  }
+  return Result;
+}
+
+// The start of the note, in the site's tooltip
+QString LoginDialog::NoteTip(const SessionData & Data)
+{
+  QString Note = Data.Note.trimmed();
+  if (Note.isEmpty())
+  {
+    return QString();
+  }
+  QStringList Lines = Note.split(QLatin1Char('\n'));
+  QString Shown = Lines.mid(0, 6).join(QLatin1Char('\n'));
+  if (Shown.size() > 400)
+  {
+    Shown = Shown.left(400);
+  }
+  if ((Shown.size() < Note.size()))
+  {
+    Shown += QStringLiteral("…");
+  }
+  return QStringLiteral("\n\nNote:\n") + Shown;
+}
+
+void LoginDialog::UpdateNotePanel(const SessionData & Data)
+{
+  // a stored site, not one being edited (then the note shows only, and
+  // Advanced > Note edits it with the site)
+  std::shared_ptr<SessionData> Site = IsEditable() ? nullptr : SelectedSession();
+  bool Stored = (Site != nullptr) && (Site->Name == Data.Name);
+  if (!FNoteEditing)
+  {
+    NoteMemo->setPlainText(Data.Note);
+  }
+  NoteGroup->setVisible(Stored || !Data.Note.trimmed().isEmpty());
+  // a note item has no server: the note is all there is
+  BasicGroup->setVisible(!Data.NoteOnly);
+  NoteGroup->setTitle(Data.NoteOnly ? QStringLiteral("Note: %1").arg(Data.LocalName()) : QStringLiteral("Note"));
+  const TeamSync::Team * Team = Stored ? TeamSync::Instance().TeamOfSite(Data.Name) : nullptr;
+  FNoteMayEdit = Stored && ((Team == nullptr) || Team->CanEdit());
+  NoteMemo->setReadOnly(!FNoteEditing);
+  NoteEditButton->setVisible(Stored && !FNoteEditing);
+  NoteEditButton->setEnabled(FNoteMayEdit && !FEditing);
+  NoteEditButton->setToolTip(FNoteMayEdit ? QStringLiteral("Edit the note") :
+    QStringLiteral("This site is shared by a team: only the team's owners and admins edit its note."));
+  NoteSaveButton->setVisible(FNoteEditing);
+  NoteCancelButton->setVisible(FNoteEditing);
+  // agents reach SFTP and SCP sites only (AgentAccess::UsableByAgents)
+  bool AgentSite = (Data.IsSsh() && !Data.IsWorkspace) || Data.NoteOnly;
+  bool On = AgentAccess::UsableByAgents(Data);
+  NoteAgentReadCheck->setVisible(Stored);
+  NoteAgentWriteCheck->setVisible(Stored);
+  {
+    QSignalBlocker BlockRead(NoteAgentReadCheck);
+    QSignalBlocker BlockWrite(NoteAgentWriteCheck);
+    NoteAgentReadCheck->setChecked(On && (Data.AgentPermissions & (AgentAccess::apNoteRead | AgentAccess::apNoteWrite)));
+    NoteAgentWriteCheck->setChecked(On && (Data.AgentPermissions & AgentAccess::apNoteWrite));
+  }
+  NoteAgentReadCheck->setEnabled(AgentSite && !FNoteEditing);
+  NoteAgentWriteCheck->setEnabled(AgentSite && FNoteMayEdit && !FNoteEditing);
+  QString NotForAgents = QStringLiteral("Agents can reach SFTP and SCP sites only.");
+  NoteAgentReadCheck->setToolTip(AgentSite ? QStringLiteral("Let AI agents read this note through NixSCP "
+    "(nixscp --note, the MCP tool read_note). It tells them what to know about the server; they never see its password.") : NotForAgents);
+  NoteAgentWriteCheck->setToolTip(!AgentSite ? NotForAgents : !FNoteMayEdit ?
+    QStringLiteral("Only the team's owners and admins edit this note, so their agents only.") :
+    QStringLiteral("Let AI agents replace this note (nixscp --note-set, the MCP tool write_note), "
+      "for example to record what they found or changed on the server."));
+  UpdateNoteInfo();
+}
+
+void LoginDialog::UpdateNoteInfo()
+{
+  qsizetype Bytes = NoteMemo->toPlainText().toUtf8().size();
+  QString Size = (Bytes < 1024) ? QStringLiteral("%1 bytes").arg(Bytes) : QStringLiteral("%1 KB").arg(Bytes / 1024.0, 0, 'f', 1);
+  QString Text = QStringLiteral("%1 of %2 KB").arg(Size).arg(AgentAccess::MaxNoteBytes / 1024);
+  if (!FNoteMayEdit && NoteEditButton->isVisible())
+  {
+    Text += QStringLiteral(" · Shared by a team: only its owners and admins edit this note.");
+  }
+  NoteInfo->setText(Text);
+  NoteInfo->setStyleSheet((Bytes > AgentAccess::MaxNoteBytes) ? QStringLiteral("color: #c0392b;") : QString());
+}
+
+void LoginDialog::StartNoteEdit()
+{
+  std::shared_ptr<SessionData> Site = SelectedSession();
+  if ((Site == nullptr) || !FNoteMayEdit || FEditing)
+  {
+    return;
+  }
+  FNoteEditing = true;
+  FNoteSite = Site->Name;
+  UpdateNotePanel(*Site);
+  UpdateControls();
+  NoteMemo->setFocus();
+  NoteMemo->moveCursor(QTextCursor::End);
+}
+
+bool LoginDialog::SaveNote()
+{
+  std::shared_ptr<SessionData> Site = FSessions.FindByName(FNoteSite);
+  if (Site == nullptr)
+  {
+    QMessageBox::warning(this, QStringLiteral("Note"), QStringLiteral("The site is no longer there, so the note cannot be saved."));
+    FNoteEditing = false;
+    UpdateControls();
+    return true;
+  }
+  QString Text = NoteMemo->toPlainText();
+  QString Why;
+  if (!AgentAccess::NoteAcceptable(Text, &Why))
+  {
+    QMessageBox::warning(this, QStringLiteral("Note"), Why);
+    return false;
+  }
+  Site->Note = Text;
+  Configuration::Instance().Save();
+  FNoteEditing = false;
+  for (QTreeWidgetItem * Node : AllNodes())
+  {
+    if (IsSiteNode(Node) && (Node->data(0, ItemNameRole).toString() == Site->Name))
+    {
+      UpdateNodeImage(Node);
+    }
+  }
+  UpdateNotePanel(*Site);
+  UpdateControls();
+  return true;
+}
+
+void LoginDialog::CancelNoteEdit()
+{
+  FNoteEditing = false;
+  if (std::shared_ptr<SessionData> Site = FSessions.FindByName(FNoteSite))
+  {
+    UpdateNotePanel(*Site);
+  }
+  UpdateControls();
+}
+
+// Before the selection moves or the dialog closes: a changed note is saved or dropped
+bool LoginDialog::EnsureNoteSaved()
+{
+  if (!FNoteEditing)
+  {
+    return true;
+  }
+  std::shared_ptr<SessionData> Site = FSessions.FindByName(FNoteSite);
+  if ((Site == nullptr) || (NoteMemo->toPlainText() == Site->Note))
+  {
+    CancelNoteEdit();
+    return true;
+  }
+  QMessageBox::StandardButton Answer = QMessageBox::question(this, QStringLiteral("Note"),
+    QStringLiteral("Save your changes to the note of \"%1\"?").arg(Site->Name),
+    QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Save);
+  if (Answer == QMessageBox::Save)
+  {
+    return SaveNote();
+  }
+  if (Answer == QMessageBox::Discard)
+  {
+    CancelNoteEdit();
+    return true;
+  }
+  return false;
+}
+
+// The note's agent checkboxes: Agent Access permissions of the site (kept on
+// this computer, also for team sites)
+void LoginDialog::NoteAgentChecked(bool Write, bool Checked)
+{
+  std::shared_ptr<SessionData> Site = SelectedSession();
+  if ((Site == nullptr) || IsEditable())
+  {
+    return;
+  }
+  int Bits = Site->AgentPermissions;
+  if (Checked)
+  {
+    if (!AgentAccess::UsableByAgents(*Site))
+    {
+      if (QMessageBox::question(this, QStringLiteral("Agent Access"),
+        QStringLiteral("Agents can reach only sites with Agent Access turned on. Turn it on for \"%1\", with NixSCP asking you "
+          "to approve each request?\n\nAgents get the note only: no commands, files or tunnels on the server.").arg(Site->Name),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes) != QMessageBox::Yes)
+      {
+        UpdateNotePanel(*Site);
+        return;
+      }
+      Site->AgentAccess = AgentAccess::amAsk;
+      // permissions left from earlier must not come back with it
+      Bits = 0;
+    }
+    Bits |= Write ? (AgentAccess::apNoteRead | AgentAccess::apNoteWrite) : AgentAccess::apNoteRead;
+  }
+  else
+  {
+    Bits &= Write ? ~AgentAccess::apNoteWrite : ~(AgentAccess::apNoteRead | AgentAccess::apNoteWrite);
+    if ((Bits & (AgentAccess::apAll | AgentAccess::apNoteRead | AgentAccess::apNoteWrite)) == 0)
+    {
+      // nothing left for agents: the site is off for them again
+      Site->AgentAccess = AgentAccess::amOff;
+    }
+  }
+  Site->AgentPermissions = Bits;
+  // set by the user here (as in the Agent Access dialog): no need to ask again
+  if (AgentAccess::UsableByAgents(*Site))
+  {
+    AgentAccess::ConfirmSettings(*Site);
+  }
+  Configuration::Instance().Save();
+  UpdateNotePanel(*Site);
 }
 
 void LoginDialog::UpdateNodeImage(QTreeWidgetItem * Node)
@@ -1056,6 +1404,7 @@ void LoginDialog::UpdateNodeImage(QTreeWidgetItem * Node)
   if (std::shared_ptr<SessionData> Data = NodeSession(Node))
   {
     Node->setIcon(0, SessionIcon(*Data));
+    Node->setToolTip(0, Data->InfoTip() + NoteTip(*Data));
   }
 }
 
@@ -1111,7 +1460,7 @@ QTreeWidgetItem * LoginDialog::AddSession(const std::shared_ptr<SessionData> & D
   Node->setData(0, ItemTypeRole, itSite);
   Node->setData(0, ItemNameRole, Data->Name);
   Node->setIcon(0, SessionIcon(*Data));
-  Node->setToolTip(0, Data->InfoTip());
+  Node->setToolTip(0, Data->InfoTip() + NoteTip(*Data));
   if (Data->Special)
   {
     // SessionTreeCustomDrawItem
@@ -1656,8 +2005,7 @@ void LoginDialog::LoadSession(const SessionData & Data)
   }
   // LOGIN_S3_GENERAL_CREDENTIALS
   S3ProfileCombo->setEditText(Data.S3Profile.isEmpty() ? QStringLiteral("General") : Data.S3Profile);
-  NoteGroup->setVisible(!Data.Note.trimmed().isEmpty());
-  NoteMemo->setPlainText(Data.Note);
+  UpdateNotePanel(Data);
   if (&Data != &FEditingData)
   {
     FEditingData = Data;
@@ -1741,12 +2089,14 @@ void LoginDialog::UpdateActions()
   bool Special = (Session != nullptr) && Session->Special;
   bool Editable = IsEditable();
 
-  EditSessionAction->setEnabled(SiteSelected && !FEditing);
-  CloneToNewSiteAction->setEnabled(SiteSelected && !FEditing);
+  // a note item has no server: no site settings, no clone, no shell icon
+  bool NoteItem = (Session != nullptr) && Session->NoteOnly;
+  EditSessionAction->setEnabled(SiteSelected && !FEditing && !NoteItem);
+  CloneToNewSiteAction->setEnabled(SiteSelected && !FEditing && !NoteItem);
   EditCancelAction->setEnabled(FEditing);
   DeleteSessionAction->setEnabled((SiteSelected && !Special && !FEditing) || FolderOrWorkspaceSelected);
   RenameSessionAction->setEnabled((SiteSelected && !Special && !FEditing) || FolderOrWorkspaceSelected);
-  DesktopIconAction->setEnabled((SiteSelected && !FEditing) || (FolderOrWorkspaceSelected && HasNodeAnySession(Node)));
+  DesktopIconAction->setEnabled((SiteSelected && !FEditing && !NoteItem) || (FolderOrWorkspaceSelected && HasNodeAnySession(Node)));
   LoginAction->setEnabled(CanOpen());
   // LOGIN_OPEN / LOGIN_LOGIN
   LoginAction->setText(FolderOrWorkspaceSelected ? QStringLiteral("Open") : QStringLiteral("Login"));
@@ -1780,6 +2130,7 @@ void LoginDialog::UpdateActions()
   SessionRawAction->setEnabled(Editable);
   SaveAsSessionAction->setEnabled(Editable);
   NewSessionFolderAction->setEnabled(!FEditing);
+  NewNoteAction->setEnabled(!FEditing && !FNoteEditing);
   PasteUrlAction->setEnabled(FClipboardHasUrl);
   SearchSiteStartAction->setEnabled(!FRenaming && !FEditing);
   bool HasHost = (Session != nullptr) ? !Session->HostNameExpanded().isEmpty() :
@@ -1863,6 +2214,8 @@ void LoginDialog::UpdateControls()
   LoginButton->setDefault(!FEditing && !FRenaming && !IsCloneToNewSiteDefault());
   SaveButton->setVisible(SaveSessionAction->isEnabled());
   EditButton->setVisible(EditSessionAction->isEnabled());
+  // one edit at a time: the site, or its note
+  EditButton->setEnabled(!FNoteEditing);
   EditCancelButton->setVisible(EditCancelAction->isEnabled());
   SaveAsSessionMenuItem->setVisible(FEditing);
   FNoUpdate--;
@@ -2061,7 +2414,7 @@ bool LoginDialog::CanOpen() const
 bool LoginDialog::IsCloneToNewSiteDefault() const
 {
   std::shared_ptr<SessionData> Data = SelectedSession();
-  return !FEditing && !FRenaming && (Data != nullptr) && !FSessions.CanOpen(*Data);
+  return !FEditing && !FRenaming && (Data != nullptr) && !Data->NoteOnly && !FSessions.CanOpen(*Data);
 }
 
 void LoginDialog::ResetNewSiteData()
@@ -2741,6 +3094,53 @@ void LoginDialog::SessionTreeEdited(QTreeWidgetItem * Node)
   }
 }
 
+// A note in the site list, with no server behind it: office network details,
+// who to call, anything that belongs with the sites
+void LoginDialog::NewNoteActionExecute()
+{
+  if (!EnsureNotEditing() || !EnsureNoteSaved())
+  {
+    return;
+  }
+  QTreeWidgetItem * ParentNode = SessionFolderNode(Selected());
+  QString ParentPath = SessionNodePath(ParentNode);
+  QString Name = (ParentPath.isEmpty() ? QString() : (ParentPath + QLatin1Char('/'))) + QStringLiteral("New note");
+  QInputDialog Dialog(this);
+  Dialog.setWindowTitle(QStringLiteral("Create Note"));
+  Dialog.setLabelText(QStringLiteral("Note name (use / for a folder):"));
+  Dialog.setTextValue(Name);
+  QTimer::singleShot(0, &Dialog, [&Dialog, Name]()
+  {
+    if (QLineEdit * Edit = Dialog.findChild<QLineEdit *>())
+    {
+      qsizetype P = Name.lastIndexOf(QLatin1Char('/'));
+      Edit->setSelection(static_cast<int>(P + 1), static_cast<int>(Name.size() - P - 1));
+    }
+  });
+  if (Dialog.exec() != QDialog::Accepted)
+  {
+    return;
+  }
+  Name = Dialog.textValue().trimmed();
+  while (Name.endsWith(QLatin1Char('/')))
+  {
+    Name.chop(1);
+  }
+  if (Name.isEmpty())
+  {
+    return;
+  }
+  auto Note = std::make_shared<SessionData>();
+  Note->Name = Name;
+  Note->NoteOnly = true;
+  // as sites get " (2)" when the name is taken
+  Note->MakeUniqueIn(FSessions);
+  FSessions.Add(Note);
+  Configuration::Instance().Save();
+  ReloadSessions(Note->Name);
+  StartNoteEdit();
+}
+
 void LoginDialog::NewSessionFolderActionExecute()
 {
   QTreeWidgetItem * ParentNode = SessionFolderNode(Selected());
@@ -3156,6 +3556,7 @@ QMenu * LoginDialog::GetSelectedNodePopupMenu()
     Menu->addAction(SetDefaultSessionAction);
     Menu->addSeparator();
     Menu->addAction(NewSessionFolderAction);
+    Menu->addAction(NewNoteAction);
     AddSearch();
   }
   else if (IsSiteNode(Node))
@@ -3174,6 +3575,7 @@ QMenu * LoginDialog::GetSelectedNodePopupMenu()
     Menu->addAction(SetDefaultSessionAction);
     Menu->addSeparator();
     Menu->addAction(NewSessionFolderAction);
+    Menu->addAction(NewNoteAction);
     if (ShareWithTeamAction->isVisible() || StopSharingAction->isVisible())
     {
       Menu->addSection(QStringLiteral("Team"));
@@ -3197,6 +3599,7 @@ QMenu * LoginDialog::GetSelectedNodePopupMenu()
     Menu->addAction(RenameSessionAction);
     Menu->addSeparator();
     Menu->addAction(NewSessionFolderAction);
+    Menu->addAction(NewNoteAction);
     if (ShareWithTeamAction->isVisible() || StopSharingAction->isVisible())
     {
       Menu->addSection(QStringLiteral("Team"));
@@ -3613,7 +4016,7 @@ void LoginDialog::SaveConfiguration()
 void LoginDialog::done(int Result)
 {
   // FormCloseQuery
-  if (!EnsureNotEditing())
+  if (!EnsureNotEditing() || !EnsureNoteSaved())
   {
     return;
   }

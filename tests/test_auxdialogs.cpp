@@ -25,7 +25,9 @@ int main()
 #include "core/Bookmarks.h"
 #include "core/Configuration.h"
 #include "core/IniStorage.h"
+#include "core/TeamContent.h"
 #include "core/SessionData.h"
+#include "core/AgentAccess.h"
 #include "core/Terminal.h"
 #include "gui/AboutDialog.h"
 #include "gui/ConsoleDialog.h"
@@ -56,6 +58,9 @@ int main()
 #include <QMainWindow>
 #include <QMenu>
 #include <QMutex>
+#include <QMessageBox>
+#include <QInputDialog>
+#include <QLabel>
 #include <QPlainTextEdit>
 #include <QProcess>
 #include <QPushButton>
@@ -1094,6 +1099,137 @@ static void TestSftpLive()
 }
 
 //---------------------------------------------------------------------------
+// The note panel of the Login dialog: shown, edited and saved on its own, and
+// the agent checkboxes as Agent Access permissions of the site
+static void TestLoginNote()
+{
+  StoredSessionList & Sites = Configuration::Instance().StoredSessions();
+  auto Shop = std::make_shared<SessionData>();
+  Shop->Name = QStringLiteral("Shop production");
+  Shop->HostName = QStringLiteral("shop.example.com");
+  Shop->UserName = QStringLiteral("deploy");
+  Shop->FSProtocol = fsSFTP;
+  Shop->Note = QStringLiteral("Logs: /var/log/shop\nNever restart MySQL during business hours.\nBackups run at 03:00 (kept 14 days).");
+  Sites.Add(Shop);
+  auto Ftp = std::make_shared<SessionData>();
+  Ftp->Name = QStringLiteral("Old FTP");
+  Ftp->HostName = QStringLiteral("ftp.example.com");
+  Ftp->FSProtocol = fsFTP;
+  Sites.Add(Ftp);
+  LoginDialog Dialog(Sites);
+  Dialog.resize(960, 640);
+  Dialog.show();
+  QCoreApplication::processEvents();
+  auto * Tree = Dialog.findChild<QTreeWidget *>();
+  auto Select = [&](const QString & Name)
+  {
+    const QList<QTreeWidgetItem *> Found = Tree->findItems(Name, Qt::MatchExactly | Qt::MatchRecursive);
+    CHECK(!Found.isEmpty());
+    if (!Found.isEmpty()) Tree->setCurrentItem(Found.first());
+    QCoreApplication::processEvents();
+  };
+  auto * Memo = Dialog.findChild<QPlainTextEdit *>(QStringLiteral("NoteMemo"));
+  auto * Edit = Dialog.findChild<QPushButton *>(QStringLiteral("NoteEdit"));
+  auto * Save = Dialog.findChild<QPushButton *>(QStringLiteral("NoteSave"));
+  auto * Read = Dialog.findChild<QCheckBox *>(QStringLiteral("NoteAgentRead"));
+  auto * Write = Dialog.findChild<QCheckBox *>(QStringLiteral("NoteAgentWrite"));
+  auto * Info = Dialog.findChild<QLabel *>(QStringLiteral("NoteInfo"));
+  CHECK((Memo != nullptr) && (Edit != nullptr) && (Save != nullptr) && (Read != nullptr) && (Write != nullptr) && (Info != nullptr));
+  if ((Memo == nullptr) || (Edit == nullptr) || (Save == nullptr) || (Read == nullptr) || (Write == nullptr) || (Info == nullptr))
+  {
+    return;
+  }
+  Select(Shop->Name);
+  CHECK(Memo->isVisible() && Memo->isReadOnly());
+  CHECK_EQ(Memo->toPlainText(), Shop->Note);
+  CHECK(Edit->isVisible() && Edit->isEnabled() && !Save->isVisible());
+  CHECK(Read->isEnabled() && !Read->isChecked() && !Write->isChecked());
+  CHECK(Info->text().contains(QStringLiteral("of 64 KB")));
+  Screenshot(&Dialog, QStringLiteral("login-note"));
+  // edit and save, without editing the site
+  Edit->click();
+  CHECK(!Memo->isReadOnly() && Save->isVisible() && !Edit->isVisible());
+  Memo->setPlainText(Shop->Note + QStringLiteral("\nChecked on 2026-11-12."));
+  Screenshot(&Dialog, QStringLiteral("login-note-editing"));
+  Save->click();
+  CHECK(Shop->Note.endsWith(QStringLiteral("Checked on 2026-11-12.")));
+  CHECK(Memo->isReadOnly() && Edit->isVisible());
+  // Agent Access was off: ticking asks first, and grants the note only
+  OnModal(IsA<QMessageBox>(), [](QWidget * W)
+  {
+    QPushButton * Yes = FindButton(W, QStringLiteral("&Yes"));
+    CHECK(Yes != nullptr);
+    if (Yes != nullptr) Yes->click();
+  });
+  Read->click();
+  QCoreApplication::processEvents();
+  CHECK_EQ(Shop->AgentAccess, int(AgentAccess::amAsk));
+  CHECK_EQ(Shop->AgentPermissions, int(AgentAccess::apNoteRead));
+  Write->click();
+  CHECK_EQ(Shop->AgentPermissions, int(AgentAccess::apNoteRead | AgentAccess::apNoteWrite));
+  // unticking the last permission turns Agent Access off again
+  Read->click();
+  CHECK_EQ(Shop->AgentPermissions, 0);
+  CHECK_EQ(Shop->AgentAccess, int(AgentAccess::amOff));
+  // New Note: a note item in the selected folder, edited at once
+  QAction * NewNote = nullptr;
+  for (QAction * A : Dialog.findChildren<QAction *>())
+  {
+    if (A->text() == QStringLiteral("New &Note...")) NewNote = A;
+  }
+  CHECK(NewNote != nullptr);
+  if (NewNote != nullptr)
+  {
+    OnModal(IsA<QInputDialog>(), [](QWidget * W)
+    {
+      auto * Input = qobject_cast<QInputDialog *>(W);
+      Input->setTextValue(QStringLiteral("Office/Network"));
+      Input->accept();
+    });
+    NewNote->trigger();
+    QCoreApplication::processEvents();
+    std::shared_ptr<SessionData> Note = Sites.FindByName(QStringLiteral("Office/Network"));
+    CHECK((Note != nullptr) && Note->NoteOnly && !Note->CanLogin() && !Sites.CanOpen(*Note));
+    CHECK(!Memo->isReadOnly() && Save->isVisible());
+    Memo->setPlainText(QStringLiteral("Wi-Fi: office-5G\nVPN: vpn.example.com (ask Ana for an account)\nPrinter: 192.168.1.40"));
+    Save->click();
+    CHECK((Note != nullptr) && Note->Note.startsWith(QStringLiteral("Wi-Fi")));
+    // no server: the site settings are hidden and Login is off
+    QGroupBox * Basic = nullptr;
+    for (QGroupBox * G : Dialog.findChildren<QGroupBox *>())
+    {
+      if (G->title() == QStringLiteral("Session")) Basic = G;
+    }
+    CHECK((Basic != nullptr) && !Basic->isVisible());
+    QPushButton * Login = FindButton(&Dialog, QStringLiteral("Login"));
+    CHECK((Login != nullptr) && !Login->isEnabled());
+    CHECK(Read->isEnabled());
+    Screenshot(&Dialog, QStringLiteral("login-note-item"));
+    // it stays a note after saving and loading
+    Configuration::Instance().Save();
+    IniFile Saved;
+    CHECK(Saved.Load(Configuration::Instance().IniFileName()));
+    StoredSessionList Reloaded;
+    Reloaded.Load(Saved);
+    std::shared_ptr<SessionData> Again = Reloaded.FindByName(QStringLiteral("Office/Network"));
+    CHECK((Again != nullptr) && Again->NoteOnly && Again->Note.contains(QStringLiteral("Printer")));
+    // shared through a team, it stays a note (the marker is in the team's allow-list)
+    IniFile Team;
+    CHECK(TeamContent::AddSite(Team, QStringLiteral("Network"), *Note));
+    QString TeamName;
+    IniFile Received;
+    CHECK(TeamContent::Decode(TeamContent::Encode(QStringLiteral("Office"), Team), TeamName, Received));
+    CHECK_EQ(Received.ReadRaw(TeamContent::SiteSection(QStringLiteral("Network")), QStringLiteral("NoteOnly")), QStringLiteral("1"));
+    Sites.Remove(QStringLiteral("Office/Network"));
+  }
+  // agents reach SFTP and SCP sites only
+  Select(Ftp->Name);
+  CHECK(Memo->isVisible() && Memo->toPlainText().isEmpty() && !Read->isEnabled() && !Write->isEnabled());
+  Dialog.reject();
+  Sites.Remove(Shop->Name);
+  Sites.Remove(Ftp->Name);
+}
+
 int main(int argc, char ** argv)
 {
   if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM"))
@@ -1109,6 +1245,7 @@ int main(int argc, char ** argv)
   ScreenshotDir = qEnvironmentVariable("NIXSCP_TEST_SCREENSHOT_DIR");
 
   TestHistory();
+  TestLoginNote();
   TestHelp();
   TestAbout();
   TestOpenDirectory();

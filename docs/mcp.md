@@ -96,6 +96,27 @@ Uploads one file from this computer to a site.
 
 The file name of an upload cannot hold a path: give the folder as `remote_path`.
 
+### read_note
+
+Reads the site's note: what the user wrote down about the server. Needs **Allow Agent Access** in the site's note
+([Site notes](agent-access.md#site-notes)).
+
+| Argument | Required | Description |
+|---|---|---|
+| `site` | yes | Site name |
+
+The result's `structuredContent` has `note` (empty when the site has no note).
+
+### write_note
+
+Replaces the whole note of a site (at most 64 KB). Needs **Allow Agent Edit** in the site's note. Agents should read
+the note first and keep what is still true.
+
+| Argument | Required | Description |
+|---|---|---|
+| `site` | yes | Site name |
+| `text` | yes | The complete new note |
+
 ## What MCP does not offer
 
 Interactive shells and tunnels are only available through the command line (`nixscp --connect <site>` and

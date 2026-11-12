@@ -1072,7 +1072,7 @@ void CommanderWindow::FillSitesMenu(QMenu * Menu)
   QMap<QString, QMenu *> Folders;
   for (const auto & Data : Configuration::Instance().StoredSessions().Sessions())
   {
-    if (Data->IsWorkspace) continue;
+    if (Data->IsWorkspace || Data->NoteOnly) continue;
     QMenu * Parent = Menu;
     QStringList Parts = Data->Name.split(QLatin1Char('/'));
     QString Path;
