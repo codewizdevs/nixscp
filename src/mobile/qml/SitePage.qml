@@ -1,7 +1,8 @@
 // A new site or the changes of one (original: its name), as a full page
 // (fields stacked, Save in the top bar); the content scrolls above the
 // on-screen keyboard. Editing keeps the site's other settings (key file,
-// proxy...) and, with an empty password, the saved one.
+// proxy...) and, with an empty password, the saved one. The site's note is
+// shown under the settings and edited and saved on its own (NoteSection).
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
@@ -37,7 +38,24 @@ Page {
         keyPath = site.keyFile
     }
 
+    // Back (Android's or the arrow): a changed note is not lost unasked
+    function back() {
+        if (!note.changed)
+            return false
+        note.confirmLeave(function() { page.StackView.view.pop() })
+        return true
+    }
+    function leave() {
+        if (!back()) {
+            Qt.inputMethod.hide()
+            page.StackView.view.pop()
+        }
+    }
+
     function save() {
+        // a note being written is saved first (refused: it says why, the page stays)
+        if (note.editing && !note.save())
+            return
         if (host.text.trim().length === 0) {
             app.toast(qsTr("Enter the host name."))
             host.forceActiveFocus()
@@ -57,7 +75,7 @@ Page {
         Material.foreground: "white"
         RowLayout {
             anchors.fill: parent
-            ToolButton { icon.source: "icons/back.svg"; icon.color: "white"; Accessible.name: qsTr("Back"); onClicked: { Qt.inputMethod.hide(); page.StackView.view.pop() } }
+            ToolButton { icon.source: "icons/back.svg"; icon.color: "white"; Accessible.name: qsTr("Back"); onClicked: page.leave() }
             Label { text: page.original ? qsTr("Edit site") : qsTr("New site"); font.pixelSize: 18; font.bold: true; Layout.fillWidth: true; elide: Text.ElideRight }
             ToolButton { text: qsTr("Save"); font.bold: true; onClicked: page.save() }
         }
@@ -187,6 +205,13 @@ Page {
                 text: qsTr("Use / for folders, e.g. Clients/web1.")
             }
 
+            // ---- the site's note (a stored site's) ----
+            NoteSection {
+                id: note
+                Layout.fillWidth: true
+                site: page.original
+            }
+
             // ---- NixSCP Teams: share this site, or stop sharing it ----
             Label {
                 visible: page.original.length > 0 && teams.available
@@ -285,16 +310,23 @@ Page {
         }
     }
 
-    // keep the focused field above the keyboard
+    // keep the focused field (in the note: the cursor) above the keyboard
     Connections {
         target: page.Window.window
-        function onActiveFocusItemChanged() {
-            var item = page.Window.window ? page.Window.window.activeFocusItem : null
-            if (!item || !form.contains(form.mapFromItem(item, 0, 0))) return
-            var y = form.mapFromItem(item, 0, 0).y + form.y
-            var visible = flick.height - page.keyboardHeight
-            if (y + item.height + 24 > flick.contentY + visible || y < flick.contentY)
-                flick.contentY = Math.max(0, y - visible / 3)
-        }
+        function onActiveFocusItemChanged() { page.ensureVisible() }
+    }
+    Connections {
+        target: Qt.inputMethod
+        function onCursorRectangleChanged() { if (note.editing) page.ensureVisible() }
+    }
+    function ensureVisible() {
+        var item = page.Window.window ? page.Window.window.activeFocusItem : null
+        if (!item || !form.contains(form.mapFromItem(item, 0, 0))) return
+        // a field as a whole; the note's text area (taller than the screen) at its cursor
+        var area = item.objectName === "noteText" ? item.cursorRectangle : Qt.rect(0, 0, item.width, item.height)
+        var y = form.mapFromItem(item, 0, area.y).y + form.y
+        var visible = flick.height - page.keyboardHeight
+        if (y + area.height + 24 > flick.contentY + visible || y < flick.contentY)
+            flick.contentY = Math.max(0, y - visible / 3)
     }
 }

@@ -263,6 +263,11 @@ void RemoteSession::cancel()
 }
 
 //---------------------------------------------------------------------------
+QString RemoteSession::NoteMessage(const QString & SiteName)
+{
+  return QStringLiteral("\"%1\" is a note: it has no server to connect to.").arg(SiteName);
+}
+
 void RemoteSession::open(const QString & SiteName)
 {
   close();
@@ -271,6 +276,13 @@ void RemoteSession::open(const QString & SiteName)
   {
     emit error(QStringLiteral("The site \"%1\" no longer exists.").arg(SiteName), QString());
     // a shortcut of a deleted site: no tab remains for it
+    emit closed();
+    return;
+  }
+  if (Data->NoteOnly)
+  {
+    // a note item: nothing to connect to
+    emit error(NoteMessage(SiteName), QString());
     emit closed();
     return;
   }

@@ -163,7 +163,11 @@ Page {
                     Layout.fillWidth: true
                     contentItem: RowLayout {
                         spacing: 12
-                        IconImage { source: "icons/server.svg"; sourceSize: Qt.size(22, 22); color: Material.foreground; opacity: 0.7 }
+                        // a shared note item: a note, not a server
+                        IconImage {
+                            source: sites.isNote((page.team.folder || "") + "/" + modelData) ? "icons/note.svg" : "icons/server.svg"
+                            sourceSize: Qt.size(22, 22); color: Material.foreground; opacity: 0.7
+                        }
                         ColumnLayout {
                             Layout.fillWidth: true
                             spacing: 0

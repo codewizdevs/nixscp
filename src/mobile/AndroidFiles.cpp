@@ -2,6 +2,9 @@
 #include "mobile/PrivateState.h"
 #include "mobile/TextFile.h"
 
+#include "core/Configuration.h"
+#include "core/SessionData.h"
+
 #include <QDesktopServices>
 #include <QDir>
 #include <QDirIterator>
@@ -673,6 +676,12 @@ QString AndroidFiles::DisplayName(const QString & Uri)
 
 bool AndroidFiles::pinShortcut(const QString & Site)
 {
+  // a shortcut connects: a note item has no server
+  std::shared_ptr<SessionData> Data = Configuration::Instance().StoredSessions().FindByName(Site);
+  if ((Data != nullptr) && Data->NoteOnly)
+  {
+    return false;
+  }
 #ifdef Q_OS_ANDROID
   QJniEnvironment Env;
   QJniObject Ctx = Context();

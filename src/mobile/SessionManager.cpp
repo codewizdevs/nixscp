@@ -1,5 +1,8 @@
 #include "mobile/SessionManager.h"
 
+#include "core/Configuration.h"
+#include "core/SessionData.h"
+
 #include <QTimer>
 
 SessionManager::SessionManager(MobileUserInterface * UI, MobileSettings * Settings, MobileQueue * Queue, QObject * Parent) :
@@ -148,6 +151,13 @@ void SessionManager::Watch(RemoteSession * Session)
 
 void SessionManager::open(const QString & Site)
 {
+  // a note item has no server: no tab, no connection
+  std::shared_ptr<SessionData> Data = Configuration::Instance().StoredSessions().FindByName(Site);
+  if ((Data != nullptr) && Data->NoteOnly)
+  {
+    emit error(Site, RemoteSession::NoteMessage(Site), QString());
+    return;
+  }
   auto * Session = new RemoteSession(FUI, FSettings, FQueue, this);
   Watch(Session);
   FSessions.append(Session);

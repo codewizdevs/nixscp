@@ -1,7 +1,8 @@
 // The saved sites: search as you type (name, host, user), Favourites and
 // Recent on top, folders that fold. Tap to connect; the star pins a
 // favourite; long press for Edit, Duplicate, Delete. + adds a site, the menu
-// imports a WinSCP.ini.
+// adds a note or imports a WinSCP.ini. Note items (a note with no server)
+// open as a note and never connect.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
@@ -31,7 +32,10 @@ Page {
         return false
     }
     function edit(name) {
-        page.StackView.view.push(Qt.resolvedUrl("SitePage.qml"), { original: name })
+        if (name.length > 0 && sites.isNote(name))
+            page.StackView.view.push(Qt.resolvedUrl("NotePage.qml"), { name: name })
+        else
+            page.StackView.view.push(Qt.resolvedUrl("SitePage.qml"), { original: name })
     }
 
     header: ToolBar {
@@ -68,6 +72,7 @@ Page {
                     MenuItem { text: qsTr("Teams"); onTriggered: page.StackView.view.push(Qt.resolvedUrl("TeamsPage.qml")) }
                     MenuItem { text: qsTr("Settings"); onTriggered: page.StackView.view.push(Qt.resolvedUrl("SettingsPage.qml")) }
                     MenuItem { text: qsTr("SSH keys"); onTriggered: page.StackView.view.push(Qt.resolvedUrl("KeysPage.qml")) }
+                    MenuItem { text: qsTr("New note…"); onTriggered: newNoteDialog.open() }
                     MenuItem { text: qsTr("Import WinSCP.ini…"); onTriggered: importDialog.open() }
                     MenuItem { text: qsTr("About NixSCP"); onTriggered: aboutDialog.open() }
                 }
@@ -129,7 +134,7 @@ Page {
                         if (sites.matches === 1) {
                             for (var i = 0; i < list.count; i++) {
                                 var item = list.itemAtIndex(i)
-                                if (item && !item.isHeader) { sessions.open(item.name); break }
+                                if (item && !item.isHeader) { app.openSite(item.name); break }
                             }
                         }
                     }
@@ -171,6 +176,10 @@ Page {
                 required property bool collapsed
                 required property int siteCount
                 required property bool favourite
+                // a note item (no server); a site with a note; its first line
+                required property bool noteItem
+                required property bool hasNote
+                required property string noteLine
                 width: ListView.view.width
                 height: isHeader ? headerRow.height : siteRow.height
 
@@ -209,20 +218,41 @@ Page {
                     width: parent.width
                     height: visible ? implicitHeight : 0
                     leftPadding: 24
-                    onClicked: sessions.open(row.name)
-                    onPressAndHold: siteMenu.show(row.name, row.favourite)
+                    onClicked: app.openSite(row.name)
+                    onPressAndHold: row.noteItem ? noteMenu.show(row.name, row.favourite) : siteMenu.show(row.name, row.favourite)
                     contentItem: RowLayout {
                         spacing: 4
                         ColumnLayout {
                             Layout.fillWidth: true
                             spacing: 2
                             Label { text: row.title; font.pixelSize: 16; elide: Text.ElideRight; Layout.fillWidth: true }
-                            Label {
-                                text: row.protocol + " · " + (row.user ? row.user + "@" : "") + row.host
-                                opacity: 0.65
-                                font.pixelSize: 13
-                                elide: Text.ElideRight
+                            RowLayout {
                                 Layout.fillWidth: true
+                                spacing: 4
+                                // a note item: its icon and the note's first line
+                                IconImage {
+                                    visible: row.noteItem
+                                    source: "icons/note.svg"
+                                    sourceSize: Qt.size(15, 15)
+                                    color: Material.accent
+                                }
+                                Label {
+                                    text: row.noteItem ? (row.noteLine || qsTr("Empty note"))
+                                                       : row.protocol + " · " + (row.user ? row.user + "@" : "") + row.host
+                                    opacity: 0.65
+                                    font.pixelSize: 13
+                                    elide: Text.ElideRight
+                                    Layout.fillWidth: true
+                                }
+                                // a site with a note
+                                IconImage {
+                                    visible: row.hasNote && !row.noteItem
+                                    source: "icons/note.svg"
+                                    sourceSize: Qt.size(14, 14)
+                                    color: Material.foreground
+                                    opacity: 0.5
+                                    Accessible.name: qsTr("Has a note")
+                                }
                             }
                         }
                         ToolButton {
@@ -349,6 +379,67 @@ Page {
         MenuItem { text: qsTr("Delete…"); onTriggered: { removeDialog.site = siteMenu.site; removeDialog.open() } }
     }
 
+    // ---- a note item's actions (long press): no connecting, checking or shortcut ----
+    Menu {
+        // not under the status or navigation bar (popups cover the whole window)
+        topMargin: insets.top + 4
+        bottomMargin: insets.bottom + 4
+        id: noteMenu
+        property string site
+        property bool favourite
+        function show(name, fav) { site = name; favourite = fav; popup() }
+        MenuItem { text: noteMenu.site; enabled: false }
+        MenuItem { text: qsTr("Open"); onTriggered: page.edit(noteMenu.site) }
+        MenuItem {
+            text: noteMenu.favourite ? qsTr("Remove from favourites") : qsTr("Add to favourites")
+            onTriggered: sites.toggleFavourite(noteMenu.site)
+        }
+        MenuItem { text: qsTr("Delete…"); onTriggered: { removeDialog.site = noteMenu.site; removeDialog.open() } }
+    }
+
+    // "New note…": a note in the site list, with no server behind it
+    Dialog {
+        id: newNoteDialog
+        anchors.centerIn: undefined
+        x: (parent.width - width) / 2
+        y: Math.max(8, Math.min((parent.height - height) / 2, parent.height - app.keyboardHeight - height - 8))
+        width: Math.min(parent.width - 32, 440)
+        modal: true
+        title: qsTr("New note")
+        standardButtons: Dialog.Cancel | Dialog.Ok
+        onOpened: { newNoteField.text = ""; newNoteField.forceActiveFocus() }
+        onAccepted: {
+            if (newNoteField.text.trim().length === 0)
+                return
+            var name = sites.newNote(newNoteField.text)
+            if (name)
+                page.StackView.view.push(Qt.resolvedUrl("NotePage.qml"), { name: name, startEditing: true })
+        }
+        ColumnLayout {
+            width: newNoteDialog.availableWidth
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                opacity: 0.7
+                text: qsTr("A note in your site list, with no server behind it: office network details, who to call, anything that belongs with your sites.")
+            }
+            TextField {
+                id: newNoteField
+                Layout.fillWidth: true
+                placeholderText: qsTr("Note name")
+                inputMethodHints: Qt.ImhNoPredictiveText
+                onAccepted: newNoteDialog.accept()
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                opacity: 0.6
+                font.pixelSize: 12
+                text: qsTr("Use / for folders, e.g. Office/Network.")
+            }
+        }
+    }
+
     // "Check connection": the name, the port, the server's greeting
     Dialog {
         id: checkDialog
@@ -404,7 +495,7 @@ Page {
         anchors.centerIn: parent
         width: Math.min(parent.width - 32, 420)
         modal: true
-        title: qsTr("Delete site?")
+        title: sites.isNote(site) ? qsTr("Delete note?") : qsTr("Delete site?")
         Label { text: removeDialog.site; wrapMode: Text.Wrap; width: removeDialog.availableWidth }
         standardButtons: Dialog.Cancel | Dialog.Yes
         onAccepted: sites.removeSite(site)

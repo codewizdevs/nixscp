@@ -14,6 +14,12 @@ void SiteChecker::check(const QString & Site)
     emit finished(Site, false, QStringLiteral("The site no longer exists."));
     return;
   }
+  if (Data->NoteOnly)
+  {
+    // a note item: no server to check
+    emit finished(Site, false, QStringLiteral("This is a note: it has no server."));
+    return;
+  }
   FSite = Site;
   FReport.clear();
   FConnected = false;

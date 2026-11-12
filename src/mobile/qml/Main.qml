@@ -36,6 +36,24 @@ ApplicationWindow {
     // the keyboard's height (dialogs with a field stay above it)
     readonly property real keyboardHeight: insets.keyboard || (Qt.inputMethod.visible ? Qt.inputMethod.keyboardRectangle.height / Screen.devicePixelRatio : 0)
 
+    // a site from the list, a search or a shortcut: a note item (no server)
+    // opens as a note, every other site connects in a new tab
+    function openSite(name) {
+        if (sites.isNote(name))
+            stack.push(Qt.resolvedUrl("NotePage.qml"), { name: name })
+        else
+            sessions.open(name)
+    }
+
+    // picking a site for a new tab or for files shared to NixSCP: only sites
+    // that connect are offered
+    Binding {
+        target: sites
+        property: "connectOnly"
+        value: androidFiles.sharedFiles.length > 0
+               || (stack.currentItem !== null && stack.currentItem.objectName === "sites" && stack.currentItem.picker === true)
+    }
+
     function toast(text) {
         toastLabel.text = text
         toastPopup.open()
@@ -211,7 +229,7 @@ ApplicationWindow {
     Connections {
         target: androidFiles
         function onOpenSiteRequested(site) {
-            if (lock.started && !lock.locked) sessions.open(site)
+            if (lock.started && !lock.locked) app.openSite(site)
             else app.pendingSite = site
         }
     }
@@ -219,7 +237,7 @@ ApplicationWindow {
         target: lock
         function onChanged() {
             if (lock.started && !lock.locked && app.pendingSite.length > 0) {
-                sessions.open(app.pendingSite)
+                app.openSite(app.pendingSite)
                 app.pendingSite = ""
             }
         }

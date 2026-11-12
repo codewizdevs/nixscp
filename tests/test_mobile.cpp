@@ -3,10 +3,14 @@
 // the cache and the private state, and real sessions against the test
 // servers (NIXSCP_TEST_SSH_PORT, NIXSCP_TEST_FTP_PORT: without them those
 // parts are skipped). A small proxy can cut connections, and a small libssh
-// server refuses a terminal. The pages (QML) run only on a device.
+// server refuses a terminal. Site notes against the fake cloud of the team
+// tests (TeamsFake.h): a member's team note is read-only. The pages (QML) run
+// only on a device.
+#include "core/AgentAccess.h"
 #include "core/ConfigVault.h"
 #include "core/Configuration.h"
 #include "core/CloudCrypto.h"
+#include "core/IniStorage.h"
 #include "core/PuttyKey.h"
 #include "core/SessionData.h"
 #include "core/Terminal.h"
@@ -58,6 +62,8 @@ static int Failures = 0;
 
 #define CHECK(Cond) \
   do { if (!(Cond)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #Cond); std::fflush(stdout); Failures++; } } while (0)
+#define CHECK_MSG(Cond, Msg) \
+  do { if (!(Cond)) { std::printf("FAIL %s:%d: %s\n  %s\n", __FILE__, __LINE__, #Cond, qPrintable(Msg)); std::fflush(stdout); Failures++; } } while (0)
 
 static bool Wait(const std::function<bool()> & Done, int Ms = 15000)
 {
@@ -71,6 +77,9 @@ static bool Wait(const std::function<bool()> & Done, int Ms = 15000)
   }
   return Done();
 }
+
+// the fake cloud of the team tests (TestTeamNotes)
+#include "TeamsFake.h"
 
 static void WriteFile(const QString & Path, const QByteArray & Data)
 {
@@ -910,6 +919,306 @@ static void TestSites()
   CHECK(!Failed.isEmpty());
   Sites.removeSite(QStringLiteral("One"));
   Config.Save();
+}
+
+//---------------------------------------------------------------------------
+// Site notes and note items
+
+// the first row of the site list showing Name (-1: not listed); Section: only in that section
+static int RowOf(const SitesModel & Sites, const QString & Name, const QString & Section = QString())
+{
+  for (int Row = 0; Row < Sites.rowCount(); Row++)
+  {
+    QModelIndex Index = Sites.index(Row);
+    if (!Sites.data(Index, SitesModel::IsHeaderRole).toBool() && (Sites.data(Index, SitesModel::NameRole).toString() == Name) &&
+        (Section.isEmpty() || (Sites.data(Index, SitesModel::SectionRole).toString() == Section)))
+    {
+      return Row;
+    }
+  }
+  return -1;
+}
+
+static QVariant RowData(const SitesModel & Sites, const QString & Name, int Role)
+{
+  int Row = RowOf(Sites, Name);
+  return (Row >= 0) ? Sites.data(Sites.index(Row), Role) : QVariant();
+}
+
+// what the configuration stores of a site, without its password (stored
+// with random padding)
+static QByteArray StoredText(SessionData Data)
+{
+  Data.Password.clear();
+  IniFile File;
+  IniStorage Storage(&File);
+  Storage.OpenSubKey(QStringLiteral("Site"), true);
+  Data.Save(Storage);
+  return File.SaveToData();
+}
+
+// The site page's note: shown, saved on its own (nothing else of the site
+// changes), refused when too long or with control characters
+static void TestSiteNotes()
+{
+  Configuration & Config = Configuration::Instance();
+  StoredSessionList & Stored = Config.StoredSessions();
+  MobileSettings Settings;
+  Settings.Private().Load();
+  SitesModel Sites(&Settings);
+  Sites.LoadState();
+  CHECK(Sites.saveSite(QString(), QStringLiteral("Shop"), QStringLiteral("SFTP"), QStringLiteral("shop.example.com"), 2222,
+    QStringLiteral("deploy"), QStringLiteral("S3cret"), false, QStringLiteral("/var/www"), QString()).isEmpty());
+  std::shared_ptr<SessionData> Shop = Stored.FindByName(QStringLiteral("Shop"));
+  CHECK(Shop != nullptr);
+  if (Shop == nullptr)
+  {
+    return;
+  }
+  // settings the phone does not show stay too
+  Shop->Color = 0x336699;
+  Shop->LocalDirectory = QStringLiteral("/home/me/shop");
+  Config.Save();
+  QVariantMap Data = Sites.siteData(QStringLiteral("Shop"));
+  CHECK(Data.value(QStringLiteral("note")).toString().isEmpty());
+  CHECK(Data.value(QStringLiteral("canEditNote")).toBool());
+  CHECK(!Data.value(QStringLiteral("noteItem")).toBool());
+  CHECK(!RowData(Sites, QStringLiteral("Shop"), SitesModel::HasNoteRole).toBool());
+
+  SessionData Before = *Shop;
+  const QString Note = QStringLiteral("\nLogs: /var/log/shop\nNever restart MySQL during business hours.\tTabs are fine.\r\n");
+  QSignalSpy Rows(&Sites, &SitesModel::rowsChanged);
+  CHECK(Sites.saveNote(QStringLiteral("Shop"), Note).isEmpty());
+  CHECK(!Rows.isEmpty());
+  Shop = Stored.FindByName(QStringLiteral("Shop"));
+  CHECK(Shop->Note == Note);
+  CHECK(Sites.siteData(QStringLiteral("Shop")).value(QStringLiteral("note")).toString() == Note);
+  // nothing else of the site
+  Before.Note = Note;
+  CHECK(StoredText(*Shop) == StoredText(Before));
+  CHECK(Shop->Password == Before.Password);
+  CHECK(Shop->Password == QStringLiteral("S3cret"));
+  // listed with a mark and its first line
+  CHECK(RowData(Sites, QStringLiteral("Shop"), SitesModel::HasNoteRole).toBool());
+  CHECK(RowData(Sites, QStringLiteral("Shop"), SitesModel::NoteLineRole).toString() == QStringLiteral("Logs: /var/log/shop"));
+  // in the configuration file
+  Config.Load();
+  Shop = Stored.FindByName(QStringLiteral("Shop"));
+  CHECK((Shop != nullptr) && (Shop->Note == Note) && (Shop->Color == 0x336699) && (Shop->PortNumber == 2222));
+  if (Shop == nullptr)
+  {
+    return;
+  }
+  Sites.reload();
+
+  // refused: what AgentAccess::NoteAcceptable refuses; the stored note stays
+  const QString Limit(AgentAccess::MaxNoteBytes, QLatin1Char('x'));
+  CHECK(Sites.saveNote(QStringLiteral("Shop"), Limit).isEmpty());
+  QString Reason = Sites.saveNote(QStringLiteral("Shop"), Limit + QLatin1Char('x'));
+  CHECK_MSG(Reason.contains(QStringLiteral("too long")), Reason);
+  // bytes of UTF-8, not characters
+  Reason = Sites.saveNote(QStringLiteral("Shop"), QString(AgentAccess::MaxNoteBytes / 2 + 1, QChar(0x10D)));
+  CHECK_MSG(Reason.contains(QStringLiteral("too long")), Reason);
+  Reason = Sites.saveNote(QStringLiteral("Shop"), QStringLiteral("bell") + QChar(7));
+  CHECK_MSG(Reason.contains(QStringLiteral("control characters")), Reason);
+  Reason = Sites.saveNote(QStringLiteral("Shop"), QStringLiteral("delete") + QChar(0x7F));
+  CHECK_MSG(Reason.contains(QStringLiteral("control characters")), Reason);
+  CHECK(Stored.FindByName(QStringLiteral("Shop"))->Note == Limit);
+  CHECK(!Sites.saveNote(QStringLiteral("gone"), QStringLiteral("x")).isEmpty());
+  // the size shown under the note
+  CHECK(Sites.noteSize(QStringLiteral("abc")) == QStringLiteral("3 bytes of 64 KB"));
+  CHECK(Sites.noteSize(QString(2150, QLatin1Char('a'))) == QStringLiteral("2.1 KB of 64 KB"));
+  CHECK(Sites.noteSize(Limit) == QStringLiteral("64.0 KB of 64 KB"));
+  CHECK(Sites.noteBytes(QString(QChar(0x10D))) == 2);
+  CHECK(Sites.maxNoteBytes() == 64 * 1024);
+  // the site page's Save keeps the note
+  CHECK(Sites.saveNote(QStringLiteral("Shop"), Note).isEmpty());
+  CHECK(Sites.saveSite(QStringLiteral("Shop"), QStringLiteral("Shop"), QStringLiteral("SFTP"), QStringLiteral("shop2.example.com"), 0,
+    QStringLiteral("deploy"), QString(), true, QStringLiteral("/"), QString()).isEmpty());
+  Shop = Stored.FindByName(QStringLiteral("Shop"));
+  CHECK((Shop->Note == Note) && (Shop->HostName == QStringLiteral("shop2.example.com")));
+  // an empty note: no mark
+  CHECK(Sites.saveNote(QStringLiteral("Shop"), QString()).isEmpty());
+  CHECK(!RowData(Sites, QStringLiteral("Shop"), SitesModel::HasNoteRole).toBool());
+  Sites.removeSite(QStringLiteral("Shop"));
+}
+
+// Note items: created with New note, listed, opened as notes, never
+// connected (nor checked or put on the home screen), renamed and deleted
+static void TestNoteItems()
+{
+  Configuration & Config = Configuration::Instance();
+  StoredSessionList & Stored = Config.StoredSessions();
+  MobileSettings Settings;
+  Settings.Private().Load();
+  SitesModel Sites(&Settings);
+  Sites.LoadState();
+  CHECK(Sites.saveSite(QString(), QStringLiteral("Office/Router"), QStringLiteral("SFTP"), QStringLiteral("192.168.1.1"), 0,
+    QStringLiteral("admin"), QString(), false, QString(), QString()).isEmpty());
+
+  // New note: folders with "/", a taken name gets " (2)"
+  QSignalSpy Failed(&Sites, &SitesModel::failed);
+  QString Name = Sites.newNote(QStringLiteral(" /Office//Network/ "));
+  CHECK_MSG(Name == QStringLiteral("Office/Network"), Name);
+  CHECK(Sites.newNote(QStringLiteral("Office/Network")) == QStringLiteral("Office/Network (1)"));
+  CHECK(Sites.newNote(QStringLiteral(" / ")).isEmpty());
+  CHECK(Failed.size() == 1);
+  std::shared_ptr<SessionData> Item = Stored.FindByName(Name);
+  CHECK((Item != nullptr) && Item->NoteOnly && Item->Note.isEmpty() && !Item->CanLogin() && !Item->CanOpen());
+  if (Item == nullptr)
+  {
+    return;
+  }
+  CHECK(Sites.isNote(Name));
+  CHECK(!Sites.isNote(QStringLiteral("Office/Router")));
+  CHECK(!Sites.isNote(QStringLiteral("gone")));
+
+  // listed in its folder, as a note
+  CHECK(RowOf(Sites, Name, QStringLiteral("Office")) >= 0);
+  CHECK(RowData(Sites, Name, SitesModel::NoteItemRole).toBool());
+  CHECK(!RowData(Sites, QStringLiteral("Office/Router"), SitesModel::NoteItemRole).toBool());
+  CHECK(RowData(Sites, Name, SitesModel::TitleRole).toString() == QStringLiteral("Network"));
+  CHECK(RowData(Sites, Name, SitesModel::HostRole).toString().isEmpty());
+  CHECK(RowData(Sites, Name, SitesModel::ProtocolRole).toString().isEmpty());
+  CHECK(Sites.saveNote(Name, QStringLiteral("Wi-Fi: office-5G\nVPN: vpn.example.com (ask Ana for an account)")).isEmpty());
+  CHECK(RowData(Sites, Name, SitesModel::NoteLineRole).toString() == QStringLiteral("Wi-Fi: office-5G"));
+  // a note item has no mark of its own: it is a note
+  CHECK(RowData(Sites, Name, SitesModel::HasNoteRole).toBool());
+  QVariantMap Data = Sites.siteData(Name);
+  CHECK(Data.value(QStringLiteral("noteItem")).toBool());
+  CHECK(Data.value(QStringLiteral("note")).toString().startsWith(QStringLiteral("Wi-Fi")));
+  // found by its name
+  Sites.setFilter(QStringLiteral("network"));
+  CHECK(Sites.matches() == 2);
+  Sites.setFilter(QString());
+  // the site page cannot make it a server
+  CHECK(!Sites.saveSite(Name, Name, QStringLiteral("SFTP"), QStringLiteral("x.example.com"), 0, QString(), QString(), false,
+    QString(), QString()).isEmpty());
+  Item = Stored.FindByName(Name);
+  CHECK(Item->NoteOnly && Item->HostName.isEmpty());
+
+  // never in the recent connections, never offered to connect to
+  Sites.toggleFavourite(Name);
+  CHECK(RowOf(Sites, Name, QStringLiteral("\x01" "favourites")) >= 0);
+  Sites.addRecent(Name);
+  Sites.addRecent(QStringLiteral("Office/Router"));
+  CHECK(RowOf(Sites, Name, QStringLiteral("\x01" "recent")) < 0);
+  CHECK(RowOf(Sites, QStringLiteral("Office/Router"), QStringLiteral("\x01" "recent")) >= 0);
+  QSignalSpy ConnectOnly(&Sites, &SitesModel::connectOnlyChanged);
+  Sites.setConnectOnly(true);
+  CHECK(ConnectOnly.size() == 1);
+  CHECK(RowOf(Sites, Name) < 0);
+  CHECK(RowOf(Sites, QStringLiteral("Office/Network (1)")) < 0);
+  CHECK(RowOf(Sites, QStringLiteral("Office/Router")) >= 0);
+  Sites.setFilter(QStringLiteral("office"));
+  CHECK(Sites.matches() == 1);
+  Sites.setFilter(QString());
+  Sites.setConnectOnly(false);
+  CHECK(RowOf(Sites, Name, QStringLiteral("\x01" "favourites")) >= 0);
+
+  // never connected: no tab, no connection, no check, no shortcut
+  {
+    MobileUserInterface UI;
+    MobileQueue Queue;
+    SessionManager Sessions(&UI, &Settings, &Queue);
+    QSignalSpy Errors(&Sessions, &SessionManager::error);
+    QSignalSpy Tabs(&Sessions, &SessionManager::sessionsChanged);
+    Sessions.open(Name);
+    CHECK(Errors.size() == 1);
+    CHECK(!Errors.isEmpty() && Errors.first().at(1).toString().contains(QStringLiteral("is a note")));
+    CHECK(Tabs.isEmpty() && (Sessions.count() == 0));
+    // a session asked directly refuses too
+    RemoteSession Session(&UI, &Settings, nullptr);
+    QSignalSpy SessionErrors(&Session, &RemoteSession::error);
+    QSignalSpy Closed(&Session, &RemoteSession::closed);
+    Session.open(Name);
+    CHECK((SessionErrors.size() == 1) && (Closed.size() == 1));
+    CHECK(!Session.busy() && !Session.connected());
+    SiteChecker Checker;
+    QSignalSpy Finished(&Checker, &SiteChecker::finished);
+    Checker.check(Name);
+    CHECK((Finished.size() == 1) && !Finished.first().at(1).toBool() && !Checker.checking());
+    AndroidFiles Files;
+    CHECK(!Files.pinShortcut(Name));
+  }
+
+  // renamed: the note, the favourite and nothing else move
+  CHECK(Sites.renameSite(Name, QStringLiteral("Office/Wi-Fi")).isEmpty());
+  CHECK(Stored.FindByName(Name) == nullptr);
+  Item = Stored.FindByName(QStringLiteral("Office/Wi-Fi"));
+  CHECK((Item != nullptr) && Item->NoteOnly && Item->Note.startsWith(QStringLiteral("Wi-Fi")));
+  CHECK(RowOf(Sites, QStringLiteral("Office/Wi-Fi"), QStringLiteral("\x01" "favourites")) >= 0);
+  CHECK(RowOf(Sites, Name) < 0);
+  CHECK(Sites.renameSite(QStringLiteral("Office/Wi-Fi"), QStringLiteral("Office/Wi-Fi")).isEmpty());
+  // only the case changes (names are compared without case)
+  CHECK(Sites.renameSite(QStringLiteral("Office/Wi-Fi"), QStringLiteral("Office/WI-FI")).isEmpty());
+  CHECK((Stored.FindByName(QStringLiteral("Office/WI-FI")) != nullptr) && (Stored.FindByName(QStringLiteral("Office/WI-FI"))->Name == QStringLiteral("Office/WI-FI")));
+  CHECK(Sites.renameSite(QStringLiteral("Office/WI-FI"), QStringLiteral("Office/Wi-Fi")).isEmpty());
+  CHECK(!Sites.renameSite(QStringLiteral("Office/Wi-Fi"), QStringLiteral("Office/Router")).isEmpty());
+  CHECK(!Sites.renameSite(QStringLiteral("Office/Wi-Fi"), QStringLiteral(" / ")).isEmpty());
+  CHECK(!Sites.renameSite(QStringLiteral("gone"), QStringLiteral("here")).isEmpty());
+  CHECK(Sites.cleanName(QStringLiteral(" /a//b/ ")) == QStringLiteral("a/b"));
+  // still a note after loading the configuration
+  Config.Load();
+  Item = Stored.FindByName(QStringLiteral("Office/Wi-Fi"));
+  CHECK((Item != nullptr) && Item->NoteOnly && Item->Note.contains(QStringLiteral("VPN")));
+  Sites.reload();
+
+  // deleted
+  Sites.removeSite(QStringLiteral("Office/Wi-Fi"));
+  Sites.removeSite(QStringLiteral("Office/Network (1)"));
+  Sites.removeSite(QStringLiteral("Office/Router"));
+  CHECK(Stored.FindByName(QStringLiteral("Office/Wi-Fi")) == nullptr);
+  CHECK(RowOf(Sites, QStringLiteral("Office/Wi-Fi")) < 0);
+  CHECK(RowOf(Sites, QStringLiteral("Office/Network (1)")) < 0);
+}
+
+// A team's note: its owners and admins edit it, its members read it
+// (SitesModel::canEditNote). Against the fake cloud of the team tests; it
+// signs in and turns on a data key, so it runs last.
+static void TestTeamNotes(const QString & Folder)
+{
+  Fake Server;
+  Server.Start();
+  Srv = &Server;
+  qputenv("NIXSCP_CLOUD_URL", Server.Base.toLatin1());
+  Dir = Folder + QStringLiteral("/teams");
+  QDir().mkpath(Dir);
+  Boot();
+  MobileSettings Settings;
+  Settings.Private().Load();
+  SitesModel Sites(&Settings);
+  Sites.LoadState();
+
+  // a member: read-only
+  Joined Member = MemberOf(QStringLiteral("Ops"), {{"db", "db.internal", "S3cret-password"}});
+  const QString Db = Member.Folder + QStringLiteral("/db");
+  CHECK_MSG(Site(Db) != nullptr, Db);
+  Sites.reload();
+  CHECK(RowOf(Sites, Db) >= 0);
+  CHECK(!Sites.canEditNote(Db));
+  CHECK(!Sites.siteData(Db).value(QStringLiteral("canEditNote")).toBool());
+  QString Reason = Sites.saveNote(Db, QStringLiteral("Restarted it at 3 am."));
+  CHECK_MSG(Reason.contains(QStringLiteral("owners and admins")), Reason);
+  CHECK((Site(Db) != nullptr) && Site(Db)->Note.isEmpty());
+  // a member's note item of the team: read-only as well
+  CHECK(!Sites.canEditNote(Member.Folder + QStringLiteral("/Runbook")));
+
+  // an admin and an owner edit it; a personal site is the user's own
+  Joined Admin = MemberOf(QStringLiteral("Dev"), {{"api", "api.internal", "S3cret-password"}}, QStringLiteral("admin"));
+  const QString Api = Admin.Folder + QStringLiteral("/api");
+  CHECK_MSG(Site(Api) != nullptr, Api);
+  CHECK(Sites.canEditNote(Api));
+  CHECK(Sites.saveNote(Api, QStringLiteral("Deploy with make deploy.")).isEmpty());
+  CHECK((Site(Api) != nullptr) && (Site(Api)->Note == QStringLiteral("Deploy with make deploy.")));
+  QString Owned = CreateTeam(QStringLiteral("Mine"));
+  const QString Web = FolderOf(Owned) + QStringLiteral("/web");
+  AddSite(Web);
+  CHECK(Sites.canEditNote(Web));
+  CHECK(Sites.saveNote(Web, QStringLiteral("Behind Cloudflare.")).isEmpty());
+  AddSite(QStringLiteral("Personal"));
+  CHECK(Sites.canEditNote(QStringLiteral("Personal")));
+  Srv = nullptr;
 }
 
 // M18: a cloud pull brings the desktop's settings; the phone's stay over them
@@ -2022,6 +2331,8 @@ int main(int Argc, char ** Argv)
   TestKeepAlive();
   TestLocalBrowser();
   TestSites();
+  TestSiteNotes();
+  TestNoteItems();
   TestPhoneSettings();
   TestDeletedSite();
   TestSiteChecker();
@@ -2035,6 +2346,7 @@ int main(int Argc, char ** Argv)
   TestLostConnections();
   TestSshSession();
   TestShell();
+  TestTeamNotes(Home.path());
 
   ssh_finalize();
   std::printf("%s (%d failures)\n", (Failures == 0) ? "OK" : "FAILED", Failures);

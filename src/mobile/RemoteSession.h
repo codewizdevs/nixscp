@@ -164,6 +164,8 @@ public:
   void DeleteWhenClosed();
   // Connections and shells of closed sessions that are still ending
   static int Closing();
+  // why a note item (SessionData::NoteOnly) does not connect
+  static QString NoteMessage(const QString & SiteName);
 
 signals:
   void stateChanged();

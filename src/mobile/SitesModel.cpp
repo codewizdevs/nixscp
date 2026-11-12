@@ -1,7 +1,9 @@
 #include "mobile/SitesModel.h"
 
+#include "core/AgentAccess.h"
 #include "core/Configuration.h"
 #include "core/SessionData.h"
+#include "core/TeamSync.h"
 #include "mobile/KeyStore.h"
 #include "mobile/MobileSettings.h"
 
@@ -52,13 +54,18 @@ void SitesModel::reload()
   QList<Site> Sites;
   for (const auto & Data : Configuration::Instance().StoredSessions().Sessions())
   {
-    // note items: not on Android yet
-    if (Data->IsWorkspace || Data->NoteOnly)
+    if (Data->IsWorkspace)
     {
       continue;
     }
+    // a note item has no server: no host, user or protocol to show or search
+    if (Data->NoteOnly)
+    {
+      Sites.append(Site{Data->Name, Data->LocalName(), Data->FolderName(), QString(), QString(), QString(), true, Data->Note});
+      continue;
+    }
     Sites.append(Site{Data->Name, Data->LocalName(), Data->FolderName(), Data->HostNameExpanded(),
-      Data->UserNameExpanded(), Data->ProtocolStr()});
+      Data->UserNameExpanded(), Data->ProtocolStr(), false, Data->Note});
   }
   // folders in natural order (the sites without a folder first), then the site names
   std::sort(Sites.begin(), Sites.end(), [](const Site & A, const Site & B)
@@ -91,6 +98,16 @@ void SitesModel::setFilter(const QString & Value)
   }
 }
 
+void SitesModel::setConnectOnly(bool Value)
+{
+  if (Value != FConnectOnly)
+  {
+    FConnectOnly = Value;
+    Rebuild();
+    emit connectOnlyChanged();
+  }
+}
+
 void SitesModel::Rebuild()
 {
   beginResetModel();
@@ -111,13 +128,15 @@ void SitesModel::Rebuild()
     }
     return true;
   };
-  auto Find = [this](const QString & Name) -> const Site *
+  // a note item is no choice where a site to connect to is picked
+  auto Shown = [this](const Site & S) { return !FConnectOnly || !S.NoteOnly; };
+  auto Find = [this, &Shown](const QString & Name) -> const Site *
   {
     for (const Site & S : FSites)
     {
       if (S.Name == Name)
       {
-        return &S;
+        return Shown(S) ? &S : nullptr;
       }
     }
     return nullptr;
@@ -167,7 +186,8 @@ void SitesModel::Rebuild()
     for (const QString & Name : FRecent)
     {
       const Site * S = Find(Name);
-      if ((S != nullptr) && (Recent.size() < RecentCount))
+      // recent connections: a note item never connects
+      if ((S != nullptr) && !S->NoteOnly && (Recent.size() < RecentCount))
       {
         Recent.append(S);
       }
@@ -182,7 +202,7 @@ void SitesModel::Rebuild()
     QList<const Site *> Sites;
     for (; (I < FSites.size()) && (FSites.at(I).Folder == Folder); I++)
     {
-      if (!Searching || Matches(FSites.at(I)))
+      if (Shown(FSites.at(I)) && (!Searching || Matches(FSites.at(I))))
       {
         Sites.append(&FSites.at(I));
       }
@@ -254,6 +274,9 @@ QVariantMap SitesModel::siteData(const QString & Name) const
     : (Data->PublicKeyFile.startsWith(KeyStore::Folder() + QLatin1Char('/')) ? Data->PublicKeyFile : QString());
   // a key that was deleted is no longer the site's
   Result[QStringLiteral("keyFile")] = QFileInfo::exists(KeyFile) ? KeyFile : QString();
+  Result[QStringLiteral("note")] = Data->Note;
+  Result[QStringLiteral("noteItem")] = Data->NoteOnly;
+  Result[QStringLiteral("canEditNote")] = canEditNote(Name);
   return Result;
 }
 
@@ -271,6 +294,11 @@ QString SitesModel::saveSite(const QString & Original, const QString & Name, con
   if (!Original.isEmpty() && (Existing == nullptr))
   {
     return QStringLiteral("The site \"%1\" no longer exists.").arg(Original);
+  }
+  // a note item has no server to set up (renameSite renames it)
+  if (Existing && Existing->NoteOnly)
+  {
+    return QStringLiteral("\"%1\" is a note, not a site.").arg(Original);
   }
   SessionData Data = Existing ? *Existing : Sessions.DefaultSettings();
   QString OldPassword = Data.Password;
@@ -296,13 +324,7 @@ QString SitesModel::saveSite(const QString & Original, const QString & Name, con
     else Data.FSProtocol = fsSFTP;
   }
   Data.PortNumber = (Port > 0) ? Port : Data.DefaultPort();
-  QString SiteName = Name.trimmed();
-  while (SiteName.contains(QStringLiteral("//")))
-  {
-    SiteName.replace(QStringLiteral("//"), QStringLiteral("/"));
-  }
-  if (SiteName.startsWith(QLatin1Char('/'))) SiteName.remove(0, 1);
-  if (SiteName.endsWith(QLatin1Char('/'))) SiteName.chop(1);
+  QString SiteName = cleanName(Name);
   if (SiteName.isEmpty())
   {
     SiteName = Data.DefaultSessionName();
@@ -371,6 +393,148 @@ void SitesModel::removeSite(const QString & Name)
   reload();
 }
 
+QString SitesModel::cleanName(const QString & Name) const
+{
+  QString Result = Name.trimmed();
+  while (Result.contains(QStringLiteral("//")))
+  {
+    Result.replace(QStringLiteral("//"), QStringLiteral("/"));
+  }
+  if (Result.startsWith(QLatin1Char('/'))) Result.remove(0, 1);
+  if (Result.endsWith(QLatin1Char('/'))) Result.chop(1);
+  return Result.trimmed();
+}
+
+QString SitesModel::renameSite(const QString & Original, const QString & Name)
+{
+  Configuration & Config = Configuration::Instance();
+  StoredSessionList & Sessions = Config.StoredSessions();
+  std::shared_ptr<SessionData> Existing = Sessions.FindByName(Original);
+  if (Existing == nullptr)
+  {
+    return QStringLiteral("\"%1\" no longer exists.").arg(Original);
+  }
+  QString NewName = cleanName(Name);
+  if (NewName.isEmpty())
+  {
+    return QStringLiteral("Enter a name.");
+  }
+  if (NewName == Original)
+  {
+    return QString();
+  }
+  // names are compared without case: only another site's name is taken
+  std::shared_ptr<SessionData> Taken = Sessions.FindByName(NewName);
+  if ((Taken != nullptr) && (Taken != Existing))
+  {
+    return QStringLiteral("\"%1\" already exists.").arg(NewName);
+  }
+  SessionData Data = *Existing;
+  Sessions.Remove(Original);
+  Sessions.NewSession(NewName, Data);
+  if (!Config.Save())
+  {
+    // as it was
+    Sessions.Remove(NewName);
+    Sessions.NewSession(Original, Data);
+    return QStringLiteral("The new name could not be saved.");
+  }
+  // the favourite, recent and key entries follow
+  SiteMoved(Original, NewName);
+  reload();
+  return QString();
+}
+
+//---------------------------------------------------------------------------
+int SitesModel::maxNoteBytes() const
+{
+  return AgentAccess::MaxNoteBytes;
+}
+
+bool SitesModel::isNote(const QString & Name) const
+{
+  std::shared_ptr<SessionData> Data = Configuration::Instance().StoredSessions().FindByName(Name);
+  return (Data != nullptr) && Data->NoteOnly;
+}
+
+bool SitesModel::canEditNote(const QString & Name) const
+{
+  // as on the desktop (LoginDialog): a member of a team reads its notes
+  const TeamSync::Team * Team = TeamSync::Instance().TeamOfSite(Name);
+  return (Team == nullptr) || Team->CanEdit();
+}
+
+QString SitesModel::saveNote(const QString & Name, const QString & Text)
+{
+  Configuration & Config = Configuration::Instance();
+  std::shared_ptr<SessionData> Data = Config.StoredSessions().FindByName(Name);
+  if (Data == nullptr)
+  {
+    return QStringLiteral("\"%1\" no longer exists, so the note cannot be saved.").arg(Name);
+  }
+  if (!canEditNote(Name))
+  {
+    return QStringLiteral("Only the team's owners and admins edit this note.");
+  }
+  QString Reason;
+  if (!AgentAccess::NoteAcceptable(Text, &Reason))
+  {
+    return Reason;
+  }
+  if (Data->Note == Text)
+  {
+    return QString();
+  }
+  // the note only: the site's other settings stay as they are stored
+  QString Before = Data->Note;
+  Data->Note = Text;
+  if (!Config.Save())
+  {
+    Data->Note = Before;
+    return QStringLiteral("The note could not be saved.");
+  }
+  reload();
+  return QString();
+}
+
+QString SitesModel::newNote(const QString & Name)
+{
+  QString NoteName = cleanName(Name);
+  if (NoteName.isEmpty())
+  {
+    emit failed(QStringLiteral("Enter a name for the note."));
+    return QString();
+  }
+  Configuration & Config = Configuration::Instance();
+  StoredSessionList & Sessions = Config.StoredSessions();
+  // as on the desktop (LoginDialog::NewNoteActionExecute)
+  auto Note = std::make_shared<SessionData>();
+  Note->Name = NoteName;
+  Note->NoteOnly = true;
+  Note->MakeUniqueIn(Sessions);
+  Sessions.Add(Note);
+  if (!Config.Save())
+  {
+    Sessions.Remove(Note->Name);
+    emit failed(QStringLiteral("The note could not be saved."));
+    return QString();
+  }
+  reload();
+  return Note->Name;
+}
+
+int SitesModel::noteBytes(const QString & Text) const
+{
+  return static_cast<int>(Text.toUtf8().size());
+}
+
+QString SitesModel::noteSize(const QString & Text) const
+{
+  int Bytes = noteBytes(Text);
+  QString Size = (Bytes < 1024) ? QStringLiteral("%1 bytes").arg(Bytes) : QStringLiteral("%1 KB").arg(Bytes / 1024.0, 0, 'f', 1);
+  return QStringLiteral("%1 of %2 KB").arg(Size).arg(AgentAccess::MaxNoteBytes / 1024);
+}
+
 void SitesModel::RenameState(const QString & From, const QString & To)
 {
   for (QStringList * List : {&FFavourites, &FRecent})
@@ -419,6 +583,10 @@ void SitesModel::toggleSection(const QString & Section)
 
 void SitesModel::addRecent(const QString & Name)
 {
+  if (isNote(Name))
+  {
+    return;
+  }
   FRecent.removeAll(Name);
   FRecent.prepend(Name);
   while (FRecent.size() > 20)
@@ -457,6 +625,24 @@ QVariant SitesModel::data(const QModelIndex & Index, int Role) const
     case UserRole: return R.S ? R.S->User : QString();
     case ProtocolRole: return R.S ? R.S->Protocol : QString();
     case FavouriteRole: return R.S && FFavourites.contains(R.S->Name);
+    case NoteItemRole: return R.S && R.S->NoteOnly;
+    case HasNoteRole: return R.S && !R.S->Note.trimmed().isEmpty();
+    case NoteLineRole:
+    {
+      if (!R.S)
+      {
+        return QString();
+      }
+      // the first line with text
+      for (const QString & Line : R.S->Note.split(QLatin1Char('\n')))
+      {
+        if (!Line.trimmed().isEmpty())
+        {
+          return Line.trimmed().left(200);
+        }
+      }
+      return QString();
+    }
     default: return QVariant();
   }
 }
@@ -465,5 +651,6 @@ QHash<int, QByteArray> SitesModel::roleNames() const
 {
   return {{NameRole, "name"}, {TitleRole, "title"}, {FolderRole, "folder"}, {HostRole, "host"},
     {UserRole, "user"}, {ProtocolRole, "protocol"}, {IsHeaderRole, "isHeader"}, {SectionRole, "section"},
-    {CollapsedRole, "collapsed"}, {SiteCountRole, "siteCount"}, {FavouriteRole, "favourite"}};
+    {CollapsedRole, "collapsed"}, {SiteCountRole, "siteCount"}, {FavouriteRole, "favourite"},
+    {NoteItemRole, "noteItem"}, {HasNoteRole, "hasNote"}, {NoteLineRole, "noteLine"}};
 }
