@@ -1101,6 +1101,12 @@ static void TestSftpLive()
 //---------------------------------------------------------------------------
 // The note panel of the Login dialog: shown, edited and saved on its own, and
 // the agent checkboxes as Agent Access permissions of the site
+static bool IsNewNoteSelected(QTreeWidget * Tree)
+{
+  return (Tree->currentItem() != nullptr) && (Tree->currentItem() == Tree->topLevelItem(1)) &&
+    (Tree->currentItem()->text(0) == QStringLiteral("New Note"));
+}
+
 static void TestLoginNote()
 {
   StoredSessionList & Sites = Configuration::Instance().StoredSessions();
@@ -1154,6 +1160,90 @@ static void TestLoginNote()
   Save->click();
   CHECK(Shop->Note.endsWith(QStringLiteral("Checked on 2026-11-12.")));
   CHECK(Memo->isReadOnly() && Edit->isVisible());
+  // The site's Edit edits the note with it: typed into, saved by the site's Save
+  // (it used to hide an empty note and leave a written one read-only)
+  {
+    QPushButton * SiteEdit = FindButton(&Dialog, QStringLiteral("&Edit"));
+    QPushButton * SiteCancel = FindButton(&Dialog, QStringLiteral("Cancel"));
+    QAction * SiteSave = nullptr;
+    for (QAction * A : Dialog.findChildren<QAction *>())
+    {
+      if (A->text() == QStringLiteral("&Save")) SiteSave = A;
+    }
+    CHECK((SiteEdit != nullptr) && (SiteCancel != nullptr) && (SiteSave != nullptr));
+    auto Type = [&](const QString & Text)
+    {
+      Memo->setFocus();
+      Memo->moveCursor(QTextCursor::End);
+      for (QChar C : Text)
+      {
+        QKeyEvent Press(QEvent::KeyPress, (C == QLatin1Char('\n')) ? int(Qt::Key_Return) : 0, Qt::NoModifier,
+          (C == QLatin1Char('\n')) ? QStringLiteral("\r") : QString(C));
+        QApplication::sendEvent(Memo, &Press);
+      }
+      QCoreApplication::processEvents();
+    };
+    if ((SiteEdit != nullptr) && (SiteCancel != nullptr) && (SiteSave != nullptr))
+    {
+      // a site without a note
+      Select(Ftp->Name);
+      CHECK(Ftp->Note.isEmpty());
+      SiteEdit->click();
+      QCoreApplication::processEvents();
+      CHECK(Memo->isVisible() && !Memo->isReadOnly());
+      CHECK(!Edit->isVisible() && !Save->isVisible());
+      CHECK(Info->text().contains(QStringLiteral("Saved with the site")));
+      Type(QStringLiteral("Port 2121 only"));
+      CHECK_EQ(Memo->toPlainText(), QStringLiteral("Port 2121 only"));
+      CHECK(Info->text().startsWith(QStringLiteral("14 bytes")));
+      Screenshot(&Dialog, QStringLiteral("login-note-site-edit"));
+      SiteSave->trigger();
+      QCoreApplication::processEvents();
+      std::shared_ptr<SessionData> SavedFtp = Sites.FindByName(QStringLiteral("Old FTP"));
+      CHECK((SavedFtp != nullptr) && (SavedFtp->Note == QStringLiteral("Port 2121 only")));
+      CHECK(Memo->isVisible() && Memo->isReadOnly() && Edit->isVisible());
+      CHECK_EQ(Memo->toPlainText(), QStringLiteral("Port 2121 only"));
+      // a site with a note: changed in place, and the other fields still saved
+      Select(Shop->Name);
+      QString Before = Shop->Note;
+      SiteEdit->click();
+      QCoreApplication::processEvents();
+      CHECK(Memo->isVisible() && !Memo->isReadOnly());
+      CHECK_EQ(Memo->toPlainText(), Before);
+      Type(QStringLiteral("\nDisk check weekly."));
+      SiteSave->trigger();
+      QCoreApplication::processEvents();
+      std::shared_ptr<SessionData> SavedShop = Sites.FindByName(QStringLiteral("Shop production"));
+      CHECK((SavedShop != nullptr) && (SavedShop->Note == Before + QStringLiteral("\nDisk check weekly.")));
+      CHECK((SavedShop != nullptr) && (SavedShop->HostName == QStringLiteral("shop.example.com")));
+      // Cancel drops the typed text
+      Select(Shop->Name);
+      SiteEdit->click();
+      QCoreApplication::processEvents();
+      Type(QStringLiteral("\nnot kept"));
+      SiteCancel->click();
+      QCoreApplication::processEvents();
+      SavedShop = Sites.FindByName(QStringLiteral("Shop production"));
+      CHECK((SavedShop != nullptr) && !SavedShop->Note.contains(QStringLiteral("not kept")));
+      CHECK(Memo->isReadOnly() && !Memo->toPlainText().contains(QStringLiteral("not kept")));
+      // too long a note stops the save; the site stays in editing with the text
+      SiteEdit->click();
+      QCoreApplication::processEvents();
+      Memo->setPlainText(QString(AgentAccess::MaxNoteBytes + 1, QLatin1Char('x')));
+      OnModal(IsA<QMessageBox>(), [](QWidget * W) { qobject_cast<QMessageBox *>(W)->accept(); });
+      SiteSave->trigger();
+      QCoreApplication::processEvents();
+      CHECK(!Memo->isReadOnly() && (Memo->toPlainText().size() == AgentAccess::MaxNoteBytes + 1));
+      SiteCancel->click();
+      QCoreApplication::processEvents();
+      SavedShop = Sites.FindByName(QStringLiteral("Shop production"));
+      CHECK((SavedShop != nullptr) && SavedShop->Note.endsWith(QStringLiteral("Disk check weekly.")));
+      // the panel's own Edit still works afterwards
+      Select(Shop->Name);
+      CHECK(Edit->isVisible() && Edit->isEnabled());
+      Shop = SavedShop;
+    }
+  }
   // Agent Access was off: ticking asks first, and grants the note only
   OnModal(IsA<QMessageBox>(), [](QWidget * W)
   {
@@ -1222,9 +1312,70 @@ static void TestLoginNote()
     CHECK_EQ(Received.ReadRaw(TeamContent::SiteSection(QStringLiteral("Network")), QStringLiteral("NoteOnly")), QStringLiteral("1"));
     Sites.Remove(QStringLiteral("Office/Network"));
   }
+  // the New Note entry, below New Site: type first, Save names it
+  {
+    CHECK(Tree->topLevelItemCount() > 1);
+    CHECK_EQ(Tree->topLevelItem(0)->text(0), QStringLiteral("New Site"));
+    CHECK_EQ(Tree->topLevelItem(1)->text(0), QStringLiteral("New Note"));
+    Tree->setCurrentItem(Tree->topLevelItem(1));
+    QCoreApplication::processEvents();
+    QGroupBox * Basic = nullptr;
+    for (QGroupBox * G : Dialog.findChildren<QGroupBox *>())
+    {
+      if (G->title() == QStringLiteral("Session")) Basic = G;
+    }
+    CHECK((Basic != nullptr) && !Basic->isVisible());
+    CHECK(Memo->isVisible() && !Memo->isReadOnly() && Memo->toPlainText().isEmpty());
+    CHECK(Save->isVisible() && Save->isEnabled() && !Edit->isVisible() && !Read->isVisible());
+    QPushButton * Login = FindButton(&Dialog, QStringLiteral("Login"));
+    CHECK((Login != nullptr) && !Login->isEnabled());
+    Memo->setFocus();
+    for (QChar C : QStringLiteral("Wi-Fi: office-5G"))
+    {
+      QKeyEvent Press(QEvent::KeyPress, 0, Qt::NoModifier, QString(C));
+      QApplication::sendEvent(Memo, &Press);
+    }
+    Memo->appendPlainText(QStringLiteral("VPN: vpn.example.com"));
+    QString Typed = QStringLiteral("Wi-Fi: office-5G\nVPN: vpn.example.com");
+    CHECK_EQ(Memo->toPlainText(), Typed);
+    Screenshot(&Dialog, QStringLiteral("login-new-note"));
+    // away and back: the text waits, as New Site's
+    Select(Shop->Name);
+    CHECK(Memo->isReadOnly() && (Basic != nullptr) && Basic->isVisible() && Read->isVisible());
+    Tree->setCurrentItem(Tree->topLevelItem(1));
+    QCoreApplication::processEvents();
+    CHECK_EQ(Memo->toPlainText(), Typed);
+    // cancelling the name keeps the text
+    OnModal(IsA<QInputDialog>(), [](QWidget * W) { qobject_cast<QInputDialog *>(W)->reject(); });
+    Save->click();
+    QCoreApplication::processEvents();
+    CHECK(IsNewNoteSelected(Tree) && (Memo->toPlainText() == Typed));
+    // the name starts as the first line
+    QString Offered;
+    OnModal(IsA<QInputDialog>(), [&Offered](QWidget * W)
+    {
+      auto * Input = qobject_cast<QInputDialog *>(W);
+      Offered = Input->textValue();
+      Input->setTextValue(QStringLiteral("Office/Wi-Fi"));
+      Input->accept();
+    });
+    Save->click();
+    QCoreApplication::processEvents();
+    CHECK_EQ(Offered, QStringLiteral("Wi-Fi: office-5G"));
+    std::shared_ptr<SessionData> Created = Sites.FindByName(QStringLiteral("Office/Wi-Fi"));
+    CHECK((Created != nullptr) && Created->NoteOnly && (Created->Note == Typed));
+    CHECK((Tree->currentItem() != nullptr) && (Tree->currentItem()->text(0) == QStringLiteral("Wi-Fi")));
+    CHECK(Memo->isReadOnly() && (Memo->toPlainText() == Typed) && Edit->isVisible() && !Save->isVisible());
+    // New Note is empty again
+    Tree->setCurrentItem(Tree->topLevelItem(1));
+    QCoreApplication::processEvents();
+    CHECK(Memo->toPlainText().isEmpty() && !Memo->isReadOnly());
+    Sites.Remove(QStringLiteral("Office/Wi-Fi"));
+    Select(Shop->Name);
+  }
   // agents reach SFTP and SCP sites only
   Select(Ftp->Name);
-  CHECK(Memo->isVisible() && Memo->toPlainText().isEmpty() && !Read->isEnabled() && !Write->isEnabled());
+  CHECK(Memo->isVisible() && (Memo->toPlainText() == QStringLiteral("Port 2121 only")) && !Read->isEnabled() && !Write->isEnabled());
   Dialog.reject();
   Sites.Remove(Shop->Name);
   Sites.Remove(Ftp->Name);

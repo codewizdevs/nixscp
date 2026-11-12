@@ -579,7 +579,7 @@ static void TestOpenSsh(const QString & Folder, int LocalPort)
   Data.Name = QStringLiteral("openssh");
   Data.HostName = QStringLiteral("127.0.0.1");
   Data.PortNumber = SshPort;
-  Data.UserName = qEnvironmentVariable("USER", QStringLiteral("dragan"));
+  Data.UserName = qEnvironmentVariable("USER", QStringLiteral("user"));
   Data.PublicKeyFile = Key;
   Data.FSProtocol = fsSFTP;
   Data.KnownHostsFile = KnownHosts;

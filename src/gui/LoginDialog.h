@@ -78,7 +78,8 @@ protected:
   void showEvent(QShowEvent * Event) override;
 
 private:
-  enum ItemType { itNewSite = 1, itSite, itFolder, itWorkspace };
+  // (itNewNote: the "New Note" entry below New Site, a note without a server)
+  enum ItemType { itNewSite = 1, itSite, itFolder, itWorkspace, itNewNote };
 
   StoredSessionList & FSessions;
   QList<SessionData> FSessionsToOpen;
@@ -152,7 +153,14 @@ private:
   bool FNoteMayEdit = false;
   QString FNoteStatus;
   QString FNoteSite;
+  // while a site is edited (Edit, New Site) its note is edited with it: the
+  // site's own Note field, or for team sites the note this person sees (saved
+  // through TeamSync after the site, from the text loaded here)
+  bool FSiteNoteLoaded = false;
+  bool FSiteNoteSeparate = false;
+  QString FSiteNoteBase;
   void UpdateNotePanel(const SessionData & Data);
+  bool StoreNote(const QString & SiteName, const QString & Text);
   void UpdateNoteInfo();
   void StartNoteEdit();
   bool SaveNote();
@@ -233,6 +241,7 @@ private:
   static ItemType NodeType(const QTreeWidgetItem * Node);
   bool IsSiteNode(const QTreeWidgetItem * Node) const { return (Node != nullptr) && (NodeType(Node) == itSite); }
   bool IsNewSiteNode(const QTreeWidgetItem * Node) const { return (Node != nullptr) && (NodeType(Node) == itNewSite); }
+  bool IsNewNoteNode(const QTreeWidgetItem * Node) const { return (Node != nullptr) && (NodeType(Node) == itNewNote); }
   bool IsFolderNode(const QTreeWidgetItem * Node) const { return (Node != nullptr) && (NodeType(Node) == itFolder); }
   bool IsWorkspaceNode(const QTreeWidgetItem * Node) const { return (Node != nullptr) && (NodeType(Node) == itWorkspace); }
   bool IsFolderOrWorkspaceNode(const QTreeWidgetItem * Node) const { return IsFolderNode(Node) || IsWorkspaceNode(Node); }
@@ -296,6 +305,11 @@ private:
   void SessionTreeEdited(QTreeWidgetItem * Node);
   void NewSessionFolderActionExecute();
   void NewNoteActionExecute();
+  // the New Note entry: a note typed first, named when it is saved
+  QString FNewNoteText;
+  void LoadNewNote();
+  void SaveNewNote();
+  QString AskNoteName(const QString & Default);
   static QIcon NoteItemIcon();
   void CloneToNewSite();
   void ResetNewSessionActionExecute();

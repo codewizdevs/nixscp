@@ -48,6 +48,7 @@
 #include <QMimeData>
 #include <QPainter>
 #include <QPlainTextEdit>
+#include <QPointer>
 #include <QSignalBlocker>
 #include <QTextCursor>
 #include <QProcess>
@@ -789,8 +790,6 @@ void LoginDialog::CreateControls()
   NoteLayout->addLayout(NoteChecks);
   NoteMemo = new QPlainTextEdit();
   NoteMemo->setReadOnly(true);
-  NoteMemo->setPlaceholderText(QStringLiteral("No note yet. Click Edit to write down what you need to know about this server: "
-    "where its logs are, what runs there, what not to restart, who to call."));
   NoteMemo->setMinimumHeight(150);
   NoteLayout->addWidget(NoteMemo, 1);
   auto * NoteButtons = new QHBoxLayout();
@@ -818,9 +817,19 @@ void LoginDialog::CreateControls()
   NoteButtons->addWidget(NoteEditButton);
   NoteLayout->addLayout(NoteButtons);
   connect(NoteEditButton, &QPushButton::clicked, this, [this]() { StartNoteEdit(); });
-  connect(NoteSaveButton, &QPushButton::clicked, this, [this]() { SaveNote(); });
+  connect(NoteSaveButton, &QPushButton::clicked, this, [this]()
+  {
+    if (IsNewNoteNode(Selected()) && !FNoteEditing)
+    {
+      SaveNewNote();
+    }
+    else
+    {
+      SaveNote();
+    }
+  });
   connect(NoteCancelButton, &QPushButton::clicked, this, [this]() { CancelNoteEdit(); });
-  connect(NoteMemo, &QPlainTextEdit::textChanged, this, [this]() { if (FNoteEditing) UpdateNoteInfo(); });
+  connect(NoteMemo, &QPlainTextEdit::textChanged, this, [this]() { if (FNoteEditing || !NoteMemo->isReadOnly()) UpdateNoteInfo(); });
   connect(NoteShareCheck, &QCheckBox::clicked, this, [this](bool Checked) { NoteShareChecked(Checked); });
   connect(NoteTeamEditCheck, &QCheckBox::clicked, this, [this](bool Checked) { NoteTeamEditChecked(Checked); });
   connect(NoteAgentReadCheck, &QCheckBox::clicked, this, [this](bool Checked) { NoteAgentChecked(false, Checked); });
@@ -952,6 +961,11 @@ void LoginDialog::CreateControls()
       // PersistNewSiteIfNeeded (controls still show New Site)
       SaveSession(FNewSiteData);
     }
+    if (IsNewNoteNode(Previous) && (Current != Previous))
+    {
+      // as New Site: the typed note waits there
+      FNewNoteText = NoteMemo->toPlainText();
+    }
     if (FIncrementalSearching <= 0)
     {
       ResetSitesIncrementalSearch();
@@ -964,7 +978,11 @@ void LoginDialog::CreateControls()
     if ((Node == Selected()) && EnsureNotEditing())
     {
       std::shared_ptr<SessionData> Note = SelectedSession();
-      if ((Note != nullptr) && Note->NoteOnly)
+      if (IsNewNoteNode(Node))
+      {
+        NoteMemo->setFocus();
+      }
+      else if ((Note != nullptr) && Note->NoteOnly)
       {
         // a note item opens its note for editing
         if (!FNoteEditing) StartNoteEdit();
@@ -1220,30 +1238,77 @@ QString LoginDialog::NoteTip(const SessionData & Data)
 
 void LoginDialog::UpdateNotePanel(const SessionData & Data)
 {
-  // a stored site, not one being edited (then the note shows only, and
-  // Advanced > Note edits it with the site)
-  std::shared_ptr<SessionData> Site = IsEditable() ? nullptr : SelectedSession();
+  // a stored site, not one being edited (then the note is edited with the site,
+  // and saved by its Save)
+  bool SiteEditing = IsEditable();
+  std::shared_ptr<SessionData> Site = SiteEditing ? nullptr : SelectedSession();
   bool Stored = (Site != nullptr) && (Site->Name == Data.Name);
   // what this person sees: the site's own note, the team's, or their private one
   TeamSync::NoteView View;
+  bool SiteNoteEditable = false;
   if (Stored)
   {
     View = TeamSync::Instance().NoteOf(*Site);
+  }
+  else if (SiteEditing)
+  {
+    // a team site's note is not its Note field alone (private, shared, the
+    // team's channel): it is edited as seen and saved through TeamSync
+    std::shared_ptr<SessionData> Edited = FEditing ? SelectedSession() : nullptr;
+    TeamSync::NoteView EditedView;
+    if (Edited != nullptr)
+    {
+      EditedView = TeamSync::Instance().NoteOf(*Edited);
+    }
+    bool Separate = (Edited != nullptr) && EditedView.InTeam;
+    if (Separate)
+    {
+      View = EditedView;
+      SiteNoteEditable = EditedView.CanEdit;
+    }
+    else
+    {
+      View.Text = Data.Note;
+      SiteNoteEditable = true;
+    }
+    // the site's own note follows Data (SaveSession puts the text back in it);
+    // a team note is loaded once per edit, then the typed text is kept
+    if (!Separate || !FSiteNoteLoaded || !FSiteNoteSeparate || (View.Text != FSiteNoteBase))
+    {
+      if (NoteMemo->toPlainText() != View.Text)
+      {
+        NoteMemo->setPlainText(View.Text);
+      }
+    }
+    FSiteNoteLoaded = true;
+    FSiteNoteSeparate = Separate;
+    FSiteNoteBase = View.Text;
   }
   else
   {
     View.Text = Data.Note;
   }
-  if (!FNoteEditing)
+  if (!SiteEditing)
+  {
+    FSiteNoteLoaded = false;
+    FSiteNoteSeparate = false;
+    FSiteNoteBase.clear();
+  }
+  if (!FNoteEditing && !SiteEditing)
   {
     NoteMemo->setPlainText(View.Text);
   }
-  NoteGroup->setVisible(Stored || !View.Text.trimmed().isEmpty());
+  NoteGroup->setVisible(Stored || SiteEditing || !View.Text.trimmed().isEmpty());
   // a note item has no server: the note is all there is
   BasicGroup->setVisible(!Data.NoteOnly);
   NoteGroup->setTitle(Data.NoteOnly ? QStringLiteral("Note: %1").arg(Data.LocalName()) : QStringLiteral("Note"));
   FNoteMayEdit = Stored && View.CanEdit;
-  NoteMemo->setReadOnly(!FNoteEditing);
+  NoteMemo->setReadOnly(SiteEditing ? !SiteNoteEditable : !FNoteEditing);
+  NoteMemo->setPlaceholderText(SiteEditing ?
+    QStringLiteral("No note yet. Write down what you need to know about this server: where its logs are, what runs there, "
+      "what not to restart, who to call. It is saved with the site.") :
+    QStringLiteral("No note yet. Click Edit to write down what you need to know about this server: "
+      "where its logs are, what runs there, what not to restart, who to call."));
   NoteEditButton->setVisible(Stored && !FNoteEditing);
   NoteEditButton->setEnabled(FNoteMayEdit && !FEditing);
   NoteEditButton->setToolTip(FNoteMayEdit ? QStringLiteral("Edit the note") :
@@ -1289,7 +1354,12 @@ void LoginDialog::UpdateNotePanel(const SessionData & Data)
       "for example to record what they found or changed on the server."));
   // who wrote it last, for team notes
   FNoteStatus.clear();
-  if (View.InTeam && View.Shared && !View.EditedBy.isEmpty())
+  if (SiteEditing)
+  {
+    FNoteStatus = SiteNoteEditable ? QStringLiteral("Saved with the site") :
+      QStringLiteral("Only the team's owners and admins edit this note");
+  }
+  else if (View.InTeam && View.Shared && !View.EditedBy.isEmpty())
   {
     FNoteStatus = QStringLiteral("Last edited by %1%2").arg(View.EditedBy,
       View.EditedAt.isValid() ? QStringLiteral(", ") + QLocale().toString(View.EditedAt.toLocalTime(), QLocale::ShortFormat) : QString());
@@ -1333,6 +1403,41 @@ void LoginDialog::StartNoteEdit()
   NoteMemo->moveCursor(QTextCursor::End);
 }
 
+// The site's own note, a private one, or the team's (signed sites or the note
+// channel, which answers over the network): wait for the answer here, so the
+// caller keeps the text until it is saved
+bool LoginDialog::StoreNote(const QString & SiteName, const QString & Text)
+{
+  // the answer may come after the wait gave up: it must not reach this frame
+  struct Answer { bool Finished = false; bool Ok = false; QString Error; QPointer<QEventLoop> Loop; };
+  auto Result = std::make_shared<Answer>();
+  QEventLoop Loop;
+  Result->Loop = &Loop;
+  TeamSync::Instance().SaveNote(SiteName, Text, [Result](bool Saved, const QString & Message)
+  {
+    Result->Finished = true;
+    Result->Ok = Saved;
+    Result->Error = Message;
+    if (Result->Loop)
+    {
+      Result->Loop->quit();
+    }
+  });
+  if (!Result->Finished)
+  {
+    QTimer::singleShot(30000, &Loop, &QEventLoop::quit);
+    Loop.exec();
+  }
+  Result->Loop = nullptr;
+  if (!Result->Finished || !Result->Ok)
+  {
+    QMessageBox::warning(this, QStringLiteral("Note"), Result->Finished ? Result->Error :
+      QStringLiteral("The team's server did not answer in time. Your text is still in the editor; try again."));
+    return false;
+  }
+  return true;
+}
+
 bool LoginDialog::SaveNote()
 {
   std::shared_ptr<SessionData> Site = FSessions.FindByName(FNoteSite);
@@ -1350,31 +1455,11 @@ bool LoginDialog::SaveNote()
     QMessageBox::warning(this, QStringLiteral("Note"), Why);
     return false;
   }
-  // The site's own note, a private one, or the team's (signed sites or the note
-  // channel, which answers over the network): wait for the answer here, the text
-  // stays in the editor until it is saved
-  bool Finished = false;
-  bool Ok = false;
-  QString Error;
-  QEventLoop Loop;
   NoteSaveButton->setEnabled(false);
-  TeamSync::Instance().SaveNote(Site->Name, Text, [&Finished, &Ok, &Error, &Loop](bool Saved, const QString & Message)
-  {
-    Finished = true;
-    Ok = Saved;
-    Error = Message;
-    Loop.quit();
-  });
-  if (!Finished)
-  {
-    QTimer::singleShot(30000, &Loop, &QEventLoop::quit);
-    Loop.exec();
-  }
+  bool Ok = StoreNote(Site->Name, Text);
   NoteSaveButton->setEnabled(true);
-  if (!Finished || !Ok)
+  if (!Ok)
   {
-    QMessageBox::warning(this, QStringLiteral("Note"), Finished ? Error :
-      QStringLiteral("The team's server did not answer in time. Your text is still in the editor; try again."));
     return false;
   }
   FNoteEditing = false;
@@ -1597,8 +1682,8 @@ static void SortChildren(QTreeWidgetItem * Parent)
   {
     int TypeA = A->data(0, ItemTypeRole).toInt();
     int TypeB = B->data(0, ItemTypeRole).toInt();
-    // itNewSite = 1, itSite = 2, itFolder = 3, itWorkspace = 4
-    auto Rank = [](int Type) { return (Type == 1) ? 0 : ((Type == 4) ? 1 : ((Type == 3) ? 2 : 3)); };
+    // itNewSite = 1, itSite = 2, itFolder = 3, itWorkspace = 4, itNewNote = 5
+    auto Rank = [](int Type) { return (Type == 1) ? 0 : ((Type == 5) ? 1 : ((Type == 4) ? 2 : ((Type == 3) ? 3 : 4))); };
     if (Rank(TypeA) != Rank(TypeB))
     {
       return Rank(TypeA) < Rank(TypeB);
@@ -1675,6 +1760,12 @@ void LoginDialog::LoadSessions()
   NewSite->setText(0, Translator::Tr(QStringLiteral("New Site"), "Login"));
   NewSite->setIcon(0, Icons::Get(QStringLiteral("new-session")));
   NewSite->setData(0, ItemTypeRole, itNewSite);
+  auto * NewNote = new QTreeWidgetItem(SessionTree);
+  NewNote->setText(0, QStringLiteral("New Note"));
+  NewNote->setIcon(0, NoteItemIcon());
+  NewNote->setData(0, ItemTypeRole, itNewNote);
+  NewNote->setToolTip(0, QStringLiteral("A note without a server: Wi-Fi and VPN details, who to call, a checklist.\n"
+    "Type it, then Save names it. It syncs and can be shared with a team like a site."));
 
   for (const QString & Workspace : Workspaces::WorkspaceNames(FSessions))
   {
@@ -1957,7 +2048,7 @@ void LoginDialog::showEvent(QShowEvent * Event)
     FInitialized = true;
     LoadContents();
     // Init: Host name when there are no sites (or forced New Site), else the tree
-    if ((SessionTree->topLevelItemCount() == 1) || (FForceNewSite && IsNewSiteNode(Selected())))
+    if ((SessionTree->topLevelItemCount() <= 2) || (FForceNewSite && IsNewSiteNode(Selected())))
     {
       HostNameEdit->setFocus();
     }
@@ -2027,6 +2118,10 @@ void LoginDialog::LoadContents()
   else if (IsNewSiteNode(Node) || (Node == nullptr))
   {
     LoadSession(FNewSiteData);
+  }
+  else if (IsNewNoteNode(Node))
+  {
+    LoadNewNote();
   }
   else
   {
@@ -2174,6 +2269,12 @@ void LoginDialog::SaveSession(SessionData & Data)
   if (&Data != &FEditingData)
   {
     Data = FEditingData;
+  }
+  // the note typed in the note panel, when it is the site's own Note field
+  // (a team site's note is saved through TeamSync after the site: SaveAsSession)
+  if (IsEditable() && FSiteNoteLoaded && !FSiteNoteSeparate && !NoteMemo->isReadOnly())
+  {
+    Data.Note = NoteMemo->toPlainText();
   }
   Data.FSProtocol = GetFSProtocol(true);
   Data.S3CredentialsEnv = S3CredentialsEnvCheck->isChecked();
@@ -2829,6 +2930,17 @@ std::shared_ptr<SessionData> LoginDialog::DoSaveSession(SessionData & Data, cons
 
 void LoginDialog::SaveAsSession(bool ForceDialog)
 {
+  // the note is saved with the site: too long a note stops the save, the text stays
+  QString NoteText = NoteMemo->toPlainText();
+  bool NoteChanged = FSiteNoteLoaded && !NoteMemo->isReadOnly() && (NoteText != FSiteNoteBase);
+  bool TeamNote = NoteChanged && FSiteNoteSeparate;
+  QString Why;
+  if (NoteChanged && !AgentAccess::NoteAcceptable(NoteText, &Why))
+  {
+    QMessageBox::warning(this, QStringLiteral("Note"), Why);
+    NoteMemo->setFocus();
+    return;
+  }
   // Parse hostname before saving
   ParseHostName();
   SessionData Data;
@@ -2850,8 +2962,20 @@ void LoginDialog::SaveAsSession(bool ForceDialog)
     FNewSiteKeepName = false;
     ResetNewSiteData();
     // reloads fake password, clears the password box, if not saved
-    ReloadSessions(NewSession->Name);
+    QString Name = NewSession->Name;
+    ReloadSessions(Name);
     SessionTree->setFocus();
+    // a team site's note: through TeamSync (private, signed sites or the team's
+    // channel). If that fails, the text stays in the note's editor to try again.
+    if (TeamNote && !StoreNote(Name, NoteText))
+    {
+      StartNoteEdit();
+      if (FNoteEditing)
+      {
+        NoteMemo->setPlainText(NoteText);
+        UpdateNoteInfo();
+      }
+    }
   }
 }
 
@@ -3213,6 +3337,33 @@ void LoginDialog::SessionTreeEdited(QTreeWidgetItem * Node)
 
 // A note in the site list, with no server behind it: office network details,
 // who to call, anything that belongs with the sites
+// The name of a new note item ("use / for a folder"); empty when cancelled
+QString LoginDialog::AskNoteName(const QString & Default)
+{
+  QInputDialog Dialog(this);
+  Dialog.setWindowTitle(QStringLiteral("Create Note"));
+  Dialog.setLabelText(QStringLiteral("Note name (use / for a folder):"));
+  Dialog.setTextValue(Default);
+  QTimer::singleShot(0, &Dialog, [&Dialog, Default]()
+  {
+    if (QLineEdit * Edit = Dialog.findChild<QLineEdit *>())
+    {
+      qsizetype P = Default.lastIndexOf(QLatin1Char('/'));
+      Edit->setSelection(static_cast<int>(P + 1), static_cast<int>(Default.size() - P - 1));
+    }
+  });
+  if (Dialog.exec() != QDialog::Accepted)
+  {
+    return QString();
+  }
+  QString Name = Dialog.textValue().trimmed();
+  while (Name.endsWith(QLatin1Char('/')))
+  {
+    Name.chop(1);
+  }
+  return Name;
+}
+
 void LoginDialog::NewNoteActionExecute()
 {
   if (!EnsureNotEditing() || !EnsureNoteSaved())
@@ -3221,28 +3372,7 @@ void LoginDialog::NewNoteActionExecute()
   }
   QTreeWidgetItem * ParentNode = SessionFolderNode(Selected());
   QString ParentPath = SessionNodePath(ParentNode);
-  QString Name = (ParentPath.isEmpty() ? QString() : (ParentPath + QLatin1Char('/'))) + QStringLiteral("New note");
-  QInputDialog Dialog(this);
-  Dialog.setWindowTitle(QStringLiteral("Create Note"));
-  Dialog.setLabelText(QStringLiteral("Note name (use / for a folder):"));
-  Dialog.setTextValue(Name);
-  QTimer::singleShot(0, &Dialog, [&Dialog, Name]()
-  {
-    if (QLineEdit * Edit = Dialog.findChild<QLineEdit *>())
-    {
-      qsizetype P = Name.lastIndexOf(QLatin1Char('/'));
-      Edit->setSelection(static_cast<int>(P + 1), static_cast<int>(Name.size() - P - 1));
-    }
-  });
-  if (Dialog.exec() != QDialog::Accepted)
-  {
-    return;
-  }
-  Name = Dialog.textValue().trimmed();
-  while (Name.endsWith(QLatin1Char('/')))
-  {
-    Name.chop(1);
-  }
+  QString Name = AskNoteName((ParentPath.isEmpty() ? QString() : (ParentPath + QLatin1Char('/'))) + QStringLiteral("New note"));
   if (Name.isEmpty())
   {
     return;
@@ -3256,6 +3386,86 @@ void LoginDialog::NewNoteActionExecute()
   Configuration::Instance().Save();
   ReloadSessions(Note->Name);
   StartNoteEdit();
+}
+
+// The New Note entry: an empty note to type into at once; Save names it
+void LoginDialog::LoadNewNote()
+{
+  BasicGroup->setVisible(false);
+  NoteGroup->setVisible(true);
+  NoteGroup->setTitle(QStringLiteral("New Note"));
+  if (NoteMemo->toPlainText() != FNewNoteText)
+  {
+    NoteMemo->setPlainText(FNewNoteText);
+  }
+  NoteMemo->setReadOnly(false);
+  NoteMemo->setPlaceholderText(QStringLiteral("Write a note that is not about one server: Wi-Fi and VPN details, "
+    "who to call, a checklist. Save asks for its name; then it is in the site list, syncs, and can be shared with a team."));
+  for (QWidget * W : std::initializer_list<QWidget *>{NoteShareCheck, NoteTeamEditCheck, NoteAgentReadCheck, NoteAgentWriteCheck,
+    NoteEditButton, NoteCancelButton})
+  {
+    W->setVisible(false);
+  }
+  NoteSaveButton->setVisible(true);
+  NoteSaveButton->setEnabled(true);
+  FNoteMayEdit = false;
+  FSiteNoteLoaded = false;
+  FSiteNoteSeparate = false;
+  FSiteNoteBase.clear();
+  FNoteStatus = QStringLiteral("Save asks for the note's name");
+  UpdateNoteInfo();
+}
+
+void LoginDialog::SaveNewNote()
+{
+  QString Text = NoteMemo->toPlainText();
+  QString Why;
+  if (!AgentAccess::NoteAcceptable(Text, &Why))
+  {
+    QMessageBox::warning(this, QStringLiteral("Note"), Why);
+    return;
+  }
+  // the first line names it, as a start
+  QString First = Text.section(QLatin1Char('\n'), 0, 0, QString::SectionSkipEmpty).trimmed();
+  First.replace(QLatin1Char('/'), QLatin1Char('-'));
+  First.replace(QLatin1Char('\\'), QLatin1Char('-'));
+  if (First.size() > 40)
+  {
+    First = First.left(40).trimmed();
+  }
+  QString Name = AskNoteName(First.isEmpty() ? QStringLiteral("New note") : First);
+  if (Name.isEmpty())
+  {
+    // the text stays here
+    NoteMemo->setFocus();
+    return;
+  }
+  auto Note = std::make_shared<SessionData>();
+  Note->Name = Name;
+  Note->NoteOnly = true;
+  Note->MakeUniqueIn(FSessions);
+  FSessions.Add(Note);
+  Configuration::Instance().Save();
+  FNewNoteText.clear();
+  NoteMemo->clear();
+  ReloadSessions(Note->Name);
+  FNewNoteText.clear();
+  // saved as any note (in a team folder it is the team's site: its note is
+  // private until shared); if that fails, the text stays in its editor
+  StartNoteEdit();
+  if (FNoteEditing)
+  {
+    NoteMemo->setPlainText(Text);
+    SaveNote();
+  }
+  else if (!Text.isEmpty())
+  {
+    // a team folder where only owners and admins edit notes: the item is
+    // there, the text waits in New Note
+    FNewNoteText = Text;
+    QMessageBox::warning(this, QStringLiteral("Note"), QStringLiteral("\"%1\" was created, but only the team's owners and admins "
+      "edit its note. Your text is still in New Note.").arg(Note->Name));
+  }
 }
 
 void LoginDialog::NewSessionFolderActionExecute()
@@ -3704,6 +3914,13 @@ QMenu * LoginDialog::GetSelectedNodePopupMenu()
     AddSearch();
     // SiteLoginMenuItem / SiteClonetoNewSiteMenuItem default
     Menu->setDefaultAction(IsCloneToNewSiteDefault() ? CloneToNewSiteAction : LoginAction);
+  }
+  else if (IsNewNoteNode(Node))
+  {
+    Menu->addSection(QStringLiteral("New Note"));
+    Menu->addAction(NewSessionFolderAction);
+    Menu->addAction(NewNoteAction);
+    AddSearch();
   }
   else if (IsFolderNode(Node))
   {

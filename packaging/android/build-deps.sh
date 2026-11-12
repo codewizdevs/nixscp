@@ -41,13 +41,22 @@ for ABI in $ABIS; do
     # extension; libssl links the shared libcrypto (-lcrypto would otherwise
     # take libcrypto.a and libssl would carry a copy of its own)
     sed -i 's/shared_extension => "\.so"/shared_extension => "_3.so"/' "openssl-$ABI/Configurations/15-android.conf"
+    # built for neutral paths and staged: OpenSSL keeps its directories
+    # (OPENSSLDIR, ENGINESDIR, MODULESDIR) in libcrypto, and the build machine's
+    # would end up in the APK. Android has none of them; Qt reads the system's
+    # certificates itself.
+    STAGE="$SRC/openssl-$ABI-stage"
+    rm -rf "$STAGE"
     (cd "openssl-$ABI" && PATH="$TOOLCHAIN/bin:$PATH" ./Configure "$TARGET" -U__ANDROID_API__ -D__ANDROID_API__=$API \
-        --prefix="$PREFIX" --libdir=lib shared no-tests no-docs no-ui-console >/dev/null \
+        --prefix=/usr/local --openssldir=/etc/ssl --libdir=lib shared no-tests no-docs no-ui-console >/dev/null \
       && PATH="$TOOLCHAIN/bin:$PATH" make -j"$(nproc)" build_generated >/dev/null 2>&1 \
       && PATH="$TOOLCHAIN/bin:$PATH" make -j"$(nproc)" libcrypto_3.so >/dev/null 2>&1 \
       && ln -sf libcrypto_3.so libcrypto.so \
       && PATH="$TOOLCHAIN/bin:$PATH" make -j"$(nproc)" build_libs >/dev/null 2>&1 \
-      && PATH="$TOOLCHAIN/bin:$PATH" make install_dev >/dev/null 2>&1)
+      && PATH="$TOOLCHAIN/bin:$PATH" make install_dev DESTDIR="$STAGE" >/dev/null 2>&1)
+    mkdir -p "$PREFIX"
+    cp -a "$STAGE/usr/local/include" "$STAGE/usr/local/lib" "$PREFIX/"
+    rm -rf "$STAGE"
     rm -f "$PREFIX"/lib/*.a
     for LIB in crypto ssl; do
       [ -f "$PREFIX/lib/lib${LIB}_3.so" ] || { echo "build-deps: no lib${LIB}_3.so"; exit 1; }
@@ -67,8 +76,9 @@ for ABI in $ABIS; do
       -DOPENSSL_CRYPTO_LIBRARY="$PREFIX/lib/libcrypto.so" -DOPENSSL_SSL_LIBRARY="$PREFIX/lib/libssl.so" \
       -DOPENSSL_INCLUDE_DIR="$PREFIX/include" \
       -DWITH_EXAMPLES=OFF -DUNIT_TESTING=OFF -DCLIENT_TESTING=OFF -DWITH_GSSAPI=OFF -DWITH_SERVER=OFF \
-      "-DCMAKE_C_FLAGS=-DGLOB_TILDE=0 -DS_IWRITE=S_IWUSR" >/dev/null 2>&1
-    # bionic has no GLOB_TILDE (~ in config Include) nor the old S_IWRITE name
+      "-DCMAKE_C_FLAGS=-DGLOB_TILDE=0 -DS_IWRITE=S_IWUSR -ffile-prefix-map=$SRC=." >/dev/null 2>&1
+    # bionic has no GLOB_TILDE (~ in config Include) nor the old S_IWRITE name;
+    # source paths (__FILE__) are relative, not the build machine's
     cmake --build "libssh-$ABI" >/dev/null
     cmake --install "libssh-$ABI" >/dev/null
   fi

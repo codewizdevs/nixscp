@@ -94,15 +94,17 @@ downloads, uploads or tunnels.
 
 Every site has a note: what you need to know about the server, such as where its logs are, what runs there or what
 not to restart. It is shown in the Login dialog under the site's settings. Click **Edit** to change it and **Save** to
-keep it; the site itself is not edited for this. A site with a note has a small yellow page on its icon, and its
+keep it; the site itself is not edited for this. When you edit the site (its own **Edit**, or **New Site**), the note
+is edited with it and saved by the site's **Save**. A site with a note has a small yellow page on its icon, and its
 tooltip shows the start of the note. A note holds up to 64 KB of text. It travels with the site: in cloud sync, in
 exports, and in WinSCP's own **Note** field (**Advanced › Note**), so WinSCP shows it too.
 
 On a team site, the note is private to you until an owner or admin shares it with the team; then everyone in the
 team sees it, and owners and admins (or everyone, with **Allow Team Edits**) edit it. See [Teams](teams.md#notes).
 
-A note does not need a server. **New Note** (in the Login dialog's **Manage** menu, or the context menu of the site
-list) adds a note item: a yellow page in the list, with only the note and no connection settings. Use it for what
+A note does not need a server. **New Note**, right below **New Site** at the top of the site list, opens an empty note:
+type it, then **Save** asks for its name (the first line is offered; use / for a folder). **New Note...** in the
+**Manage** menu, or the context menu of the site list, asks for the name first. Either way you get a note item: a yellow page in the list, with only the note and no connection settings. Use it for what
 belongs with your sites but is not one, such as office network details or who to call when a server is down. Note
 items live in folders, sync, and can be shared with a team like sites; they cannot be opened, so **Login** stays off,
 and scripts refuse them. Agents see them in `nixscp --list` as `(note)` and can only read or edit their note. WinSCP,

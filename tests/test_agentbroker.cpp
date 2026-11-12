@@ -373,7 +373,7 @@ static void TestSurrogateOnServer(const QString & Folder, const QString & OpenSs
   {
     auto Site = AddSite(Name, amAllow, apAll, false);
     Site->PortNumber = qEnvironmentVariableIntValue("NIXSCP_TEST_SSH_PORT");
-    Site->UserName = qEnvironmentVariable("USER", QStringLiteral("dragan"));
+    Site->UserName = qEnvironmentVariable("USER", QStringLiteral("user"));
     Site->Password.clear();
     Site->PublicKeyFile = qEnvironmentVariable("NIXSCP_TEST_SSH_KEY");
     Site->KnownHostsFile = OpenSshKnownHosts;
@@ -1366,7 +1366,7 @@ static void TestFiles(const QString & Folder, const QString & OpenSshKnownHosts)
   }
   auto Site = AddSite(QStringLiteral("openssh"), amAllow, apAll, false);
   Site->PortNumber = qEnvironmentVariableIntValue("NIXSCP_TEST_SSH_PORT");
-  Site->UserName = qEnvironmentVariable("USER", QStringLiteral("dragan"));
+  Site->UserName = qEnvironmentVariable("USER", QStringLiteral("user"));
   Site->Password.clear();
   Site->PublicKeyFile = qEnvironmentVariable("NIXSCP_TEST_SSH_KEY");
   Site->KnownHostsFile = OpenSshKnownHosts;
