@@ -2409,6 +2409,11 @@ void TeamSync::ShareSites(const QString & Uuid, const QStringList & Names, const
     auto Copy = std::make_shared<SessionData>(*Data);
     Copy->Name = Target + QLatin1Char('/') + Name.section(QLatin1Char('/'), -1);
     Copy->MakeUniqueIn(Sites);
+    if (!Move)
+    {
+      // the personal site stays under its agent name, the team's copy goes by its site name
+      AgentAccess::DropClashingAgentName(*Copy, Sites);
+    }
     Sites.Add(Copy);
     if (Move)
     {

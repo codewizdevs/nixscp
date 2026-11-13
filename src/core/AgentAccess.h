@@ -17,7 +17,9 @@
 
 #include <QByteArray>
 #include <QDateTime>
+#include <QHash>
 #include <QString>
+#include <QStringList>
 
 #include <memory>
 
@@ -141,9 +143,22 @@ namespace AgentAccess
   QString AgentSiteName(const SessionData & Data);
   // Agent access is on (a known mode), SSH, not a workspace
   bool UsableByAgents(const SessionData & Data);
-  // The stored site agents may use under Name; nullptr when there is none, or
-  // more than one (Ambiguous): an agent must never reach the wrong server
-  std::shared_ptr<SessionData> FindAgentSite(const StoredSessionList & Sites, const QString & Name, bool * Ambiguous = nullptr);
+  // How many sites agents may use have each name (AgentSiteName)
+  QHash<QString, int> AgentNameUse(const StoredSessionList & Sites);
+  // The name agents see in the list and use for a site: AgentSiteName, or the
+  // site's own name (its path, always unique) while another site agents may use
+  // has the same agent name. A copy then never makes both sites unusable.
+  QString AgentAddress(const SessionData & Data, const QHash<QString, int> & Use);
+  // The stored site agents may use under Name (AgentAddress); nullptr when there
+  // is none, or more than one (Ambiguous): an agent must never reach the wrong
+  // server. A name several sites share is refused; Alternatives gets the names
+  // that reach each of them.
+  std::shared_ptr<SessionData> FindAgentSite(const StoredSessionList & Sites, const QString & Name, bool * Ambiguous = nullptr,
+    QStringList * Alternatives = nullptr);
+  // A copy of a site (Save As, a copy shared into a team) keeps its own agent
+  // name only while no other site with agent access on has it, else agents know
+  // it by its site name
+  void DropClashingAgentName(SessionData & Copy, const StoredSessionList & Sites);
 
   // The saved passwords are encrypted and available: the configuration is
   // encrypted with the NixSCP password (Pro), or a master password is set and

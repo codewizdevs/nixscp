@@ -1372,20 +1372,65 @@ bool UsableByAgents(const SessionData & Data)
   return ((Data.AgentAccess == amAllow) || (Data.AgentAccess == amAsk)) && (Data.IsSsh() || Data.NoteOnly) && !Data.IsWorkspace;
 }
 
-std::shared_ptr<SessionData> FindAgentSite(const StoredSessionList & Sites, const QString & Name, bool * Ambiguous)
+QHash<QString, int> AgentNameUse(const StoredSessionList & Sites)
 {
-  std::shared_ptr<SessionData> Result;
+  QHash<QString, int> Result;
+  for (const auto & Data : Sites.Sessions())
+  {
+    if (UsableByAgents(*Data))
+    {
+      Result[AgentSiteName(*Data)]++;
+    }
+  }
+  return Result;
+}
+
+QString AgentAddress(const SessionData & Data, const QHash<QString, int> & Use)
+{
+  QString Name = AgentSiteName(Data);
+  return (Use.value(Name) > 1) ? Data.Name : Name;
+}
+
+std::shared_ptr<SessionData> FindAgentSite(const StoredSessionList & Sites, const QString & Name, bool * Ambiguous,
+  QStringList * Alternatives)
+{
   if (Ambiguous != nullptr)
   {
     *Ambiguous = false;
   }
+  if (Alternatives != nullptr)
+  {
+    Alternatives->clear();
+  }
+  QHash<QString, int> Use = AgentNameUse(Sites);
+  if (Use.value(Name) > 1)
+  {
+    // commands must not land on whichever of two servers happens to come first:
+    // each is reached by its site name instead
+    if (Ambiguous != nullptr)
+    {
+      *Ambiguous = true;
+    }
+    if (Alternatives != nullptr)
+    {
+      for (const auto & Data : Sites.Sessions())
+      {
+        if (UsableByAgents(*Data) && (AgentSiteName(*Data) == Name) && (Data->Name != Name))
+        {
+          Alternatives->append(Data->Name);
+        }
+      }
+    }
+    return nullptr;
+  }
+  std::shared_ptr<SessionData> Result;
   for (const auto & Data : Sites.Sessions())
   {
-    if (UsableByAgents(*Data) && (AgentSiteName(*Data) == Name))
+    if (UsableByAgents(*Data) && (AgentAddress(*Data, Use) == Name))
     {
       if (Result != nullptr)
       {
-        // commands must not land on whichever of two servers happens to come first
+        // a site name that is another site's agent name
         if (Ambiguous != nullptr)
         {
           *Ambiguous = true;
@@ -1396,6 +1441,23 @@ std::shared_ptr<SessionData> FindAgentSite(const StoredSessionList & Sites, cons
     }
   }
   return Result;
+}
+
+void DropClashingAgentName(SessionData & Copy, const StoredSessionList & Sites)
+{
+  if (Copy.AgentName.trimmed().isEmpty())
+  {
+    return;
+  }
+  QString Name = AgentSiteName(Copy);
+  for (const auto & Other : Sites.Sessions())
+  {
+    if ((Other.get() != &Copy) && (Other->Name != Copy.Name) && (Other->AgentAccess != amOff) && (AgentSiteName(*Other) == Name))
+    {
+      Copy.AgentName.clear();
+      return;
+    }
+  }
 }
 
 bool KeyFileHasPassphrase(const QString & FileName)

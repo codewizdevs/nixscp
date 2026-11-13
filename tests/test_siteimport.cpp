@@ -933,17 +933,61 @@ static void TestAgentSiteLookup()
   D.Name = QStringLiteral("copy");
   D.HostName = QStringLiteral("b.example");
   Sites.Add(std::make_shared<SessionData>(D));
-  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("prod"), &Ambiguous) == nullptr);
+  QStringList Alternatives;
+  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("prod"), &Ambiguous, &Alternatives) == nullptr);
   CHECK(Ambiguous);
+  CHECK(Alternatives == QStringList({QStringLiteral("copy"), QStringLiteral("original")}));
+  // ...each is reached by its site name instead, and listed so
+  auto Use = AgentAccess::AgentNameUse(Sites);
+  CHECK(AgentAccess::AgentAddress(*Sites.FindByName(QStringLiteral("copy")), Use) == QStringLiteral("copy"));
+  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("original"), &Ambiguous) == Sites.FindByName(QStringLiteral("original")));
+  CHECK(!Ambiguous);
+  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("copy"))->HostName == QStringLiteral("b.example"));
+  // a copy whose access is off does not take the name from the original
+  Sites.FindByName(QStringLiteral("copy"))->AgentAccess = AgentAccess::amOff;
+  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("prod"))->HostName == QStringLiteral("a.example"));
+  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("original")) == nullptr);
+  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("copy")) == nullptr);
+  Sites.FindByName(QStringLiteral("copy"))->AgentAccess = AgentAccess::amAllow;
+  // a site name that is the agent name of a third site: none of them
+  D.Name = QStringLiteral("third");
+  D.AgentName = QStringLiteral("copy");
+  D.HostName = QStringLiteral("c.example");
+  Sites.Add(std::make_shared<SessionData>(D));
+  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("copy"), &Ambiguous) == nullptr);
+  CHECK(Ambiguous);
+  CHECK(AgentAccess::FindAgentSite(Sites, QStringLiteral("original")) != nullptr);
   // a site whose name equals the agent name of another
   StoredSessionList Mixed;
+  D.HostName = QStringLiteral("b.example");
+  D.AgentName = QStringLiteral("prod");
   D.Name = QStringLiteral("alias-holder");
   Mixed.Add(std::make_shared<SessionData>(D));
   D.Name = QStringLiteral("prod");
   D.AgentName.clear();
   Mixed.Add(std::make_shared<SessionData>(D));
-  CHECK(AgentAccess::FindAgentSite(Mixed, QStringLiteral("prod"), &Ambiguous) == nullptr);
+  CHECK(AgentAccess::FindAgentSite(Mixed, QStringLiteral("prod"), &Ambiguous, &Alternatives) == nullptr);
   CHECK(Ambiguous);
+  CHECK(Alternatives == QStringList({QStringLiteral("alias-holder")}));
+  CHECK(AgentAccess::FindAgentSite(Mixed, QStringLiteral("alias-holder")) != nullptr);
+  // a copy (Save As, shared into a team) keeps its agent name only while no other site has it
+  SessionData Copy;
+  Copy.Name = QStringLiteral("alias-copy");
+  Copy.AgentAccess = AgentAccess::amAsk;
+  Copy.AgentName = QStringLiteral("prod");
+  AgentAccess::DropClashingAgentName(Copy, Mixed);
+  CHECK(Copy.AgentName.isEmpty());
+  Copy.AgentName = QStringLiteral("staging");
+  AgentAccess::DropClashingAgentName(Copy, Mixed);
+  CHECK(Copy.AgentName == QStringLiteral("staging"));
+  // the site it replaces (same name) does not count
+  Copy.Name = QStringLiteral("alias-holder");
+  Copy.AgentName = QStringLiteral("prod");
+  StoredSessionList One;
+  One.Add(Mixed.FindByName(QStringLiteral("alias-holder")));
+  AgentAccess::DropClashingAgentName(Copy, One);
+  CHECK(Copy.AgentName == QStringLiteral("prod"));
+  D.AgentName.clear();
   // a mode this version does not know is off, not "runs without asking"
   for (int Mode : {3, 4, 100, -1})
   {

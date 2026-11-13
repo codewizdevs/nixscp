@@ -857,11 +857,20 @@ static void TestAccess(const QString & Folder)
   Second->AgentName = QStringLiteral("twin");
   CHECK(ConfirmSettings(*First) && ConfirmSettings(*Second));
   R = Connect(QStringLiteral("twin"), QStringLiteral("big 1"));
-  CHECK_MSG((R.Code == 255) && R.Err.contains("More than one site"), R.Text());
+  CHECK_MSG((R.Code == 255) && R.Err.contains("More than one site") && R.Err.contains("\"twin-a\", \"twin-b\""), R.Text());
+  // ...but each still is, under its site name, and is listed so
+  R = Agent({QStringLiteral("--list")});
+  CHECK_MSG((R.Code == 0) && R.Out.contains("twin-a") && R.Out.contains("twin-b"), R.Text());
+  R = Connect(QStringLiteral("twin-b"), QStringLiteral("big 1"));
+  CHECK_MSG(R.Code == 0, R.Text());
+  CHECK(AuditLog().contains("twin-b [agent name: twin]"));
   Second->AgentName = QStringLiteral("twin-2");
   CHECK(ConfirmSettings(*Second));
   R = Connect(QStringLiteral("twin"), QStringLiteral("big 1"));
   CHECK_MSG(R.Code == 0, R.Text());
+  // without the twin, the site name is not a way in
+  R = Connect(QStringLiteral("twin-a"), QStringLiteral("big 1"));
+  CHECK_MSG((R.Code == 255) && R.Err.contains("not available to agents"), R.Text());
 
   // no request without its line in the log
   QString Log = AuditLogFileName();

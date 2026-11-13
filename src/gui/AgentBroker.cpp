@@ -1036,11 +1036,24 @@ bool Connection::CheckAccess(std::shared_ptr<SessionData> & Data, QString & Erro
 {
   // by the name agents see: the site's agent name, else its name
   bool Ambiguous = false;
-  Data = FindAgentSite(Configuration::Instance().StoredSessions(), FRequest.Site, &Ambiguous);
+  QStringList Alternatives;
+  Data = FindAgentSite(Configuration::Instance().StoredSessions(), FRequest.Site, &Ambiguous, &Alternatives);
   if (Ambiguous)
   {
-    Error = QStringLiteral("More than one site is available to agents as \"%1\", so it is not clear which server is meant. "
-      "The user gives each its own name in NixSCP (site settings: Agent Access...).").arg(FRequest.Site);
+    Error = QStringLiteral("More than one site is available to agents as \"%1\", so it is not clear which server is meant.").arg(FRequest.Site);
+    if (!Alternatives.isEmpty())
+    {
+      QStringList Quoted;
+      for (const QString & Name : Alternatives)
+      {
+        Quoted.append(QStringLiteral("\"%1\"").arg(Name));
+      }
+      Error += QStringLiteral(" Each is available under its site name: %1 (\"nixscp --list\" shows their servers).").arg(Quoted.join(QStringLiteral(", ")));
+    }
+    else
+    {
+      Error += QStringLiteral(" The user gives each its own name in NixSCP (site settings: Agent Access...).");
+    }
     return false;
   }
   if (Data == nullptr)
@@ -1262,9 +1275,10 @@ void Connection::AskApproval(const SessionData & Data)
     What = QStringLiteral("Upload file:");
     Detail = FRequest.Detail();
   }
-  auto * Box = new RequestPrompt((AgentSiteName(Data) == Data.Name) ?
+  // the name the request used: the agent name, or the site name while another site has the same agent name
+  auto * Box = new RequestPrompt((FRequest.Site == Data.Name) ?
     QStringLiteral("A program wants to use the site \"%1\".").arg(Data.Name) :
-    QStringLiteral("A program wants to use the site \"%1\" (agents know it as \"%2\").").arg(Data.Name, AgentSiteName(Data)),
+    QStringLiteral("A program wants to use the site \"%1\" (agents know it as \"%2\").").arg(Data.Name, FRequest.Site),
     What, Detail);
   QPushButton * Once = Box->AddButton(QStringLiteral("Allow once"), QStringLiteral("Allow this request only"));
   QPushButton * Hour = Box->AddButton(QStringLiteral("1 hour"), QStringLiteral("Allow requests for this site for one hour without asking"));
@@ -1328,14 +1342,17 @@ void Connection::AskApproval(const SessionData & Data)
 void Connection::SendList()
 {
   QJsonArray Sites;
-  for (const auto & Data : Configuration::Instance().StoredSessions().Sessions())
+  const StoredSessionList & Stored = Configuration::Instance().StoredSessions();
+  // two sites with one agent name are listed by their site names (AgentAddress)
+  const QHash<QString, int> Use = AgentNameUse(Stored);
+  for (const auto & Data : Stored.Sessions())
   {
     if (!UsableByAgents(*Data))
     {
       continue;
     }
     Sites.append(QJsonObject{
-      {QStringLiteral("name"), AgentSiteName(*Data)},
+      {QStringLiteral("name"), AgentAddress(*Data, Use)},
       // a note item has no server
       {QStringLiteral("kind"), Data->NoteOnly ? QStringLiteral("note") : QStringLiteral("site")},
       {QStringLiteral("host"), Data->NoteOnly ? QString() : Data->HostName},

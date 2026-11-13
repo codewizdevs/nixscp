@@ -2915,6 +2915,13 @@ std::shared_ptr<SessionData> LoginDialog::DoSaveSession(SessionData & Data, cons
   {
     Workspaces::ClearSessionPasswords(Data);
   }
+  if ((OriginalSession != nullptr) && (SessionName != OriginalSession->Name))
+  {
+    // Save As: the original stays, and agents keep reaching it under its agent
+    // name; the copy goes by its own site name (AgentAccess::FindAgentSite)
+    Data.Name = SessionName;
+    AgentAccess::DropClashingAgentName(Data, FSessions);
+  }
   std::shared_ptr<SessionData> NewSession = FSessions.NewSession(SessionName, Data);
   Config.Save();
   if (CreateShortcut)

@@ -170,8 +170,18 @@ By default agents see and address a site by its full name, including folders (`C
 must use it with `--connect`, `--get`, `--put` and `--tunnel`; the real site name and folder stay hidden from them.
 Host name, user name and port are still listed.
 
-Names must be unique among the sites with Agent Access on; NixSCP refuses a duplicate. The audit log records both
-names (`Clients/Acme/web1 [agent name: web1]`), and the approval window shows both.
+Names must be unique among the sites with Agent Access on; the Agent Access window refuses a duplicate. The audit log
+records both names (`Clients/Acme/web1 [agent name: web1]`), and the approval window shows both.
+
+A copy of a site does not take its name for agents: **Save As** and sharing a copy into a team leave the copy without
+one, so agents know it by its site name, and the original keeps its name for agents. The copy keeps the original's
+Agent Access settings; with a master password, it shows the [settings prompt](#settings-prompt-master-password-only)
+once, as any new site does.
+
+Two sites can still end up with one name for agents, for example when two computers set it at the same time and sync.
+NixSCP never guesses which one an agent means: requests to that name are refused, with a message that names the
+other way in. Until you give them different names, each of those sites is listed and reached by its site name,
+folders included (`Clients/Acme/web1`), so for these sites the folder names are not hidden.
 
 ## Command rules
 
@@ -415,7 +425,7 @@ URL or `/rawconfig`.
 | NixSCP is not running. | Start NixSCP (and unlock it with your NixSCP password). |
 | Agent access needs the saved passwords encrypted. | Set a master password (Preferences > Security), or use NixSCP Pro's NixSCP password. |
 | Site "x" is not available to agents. | Use a name exactly as listed by `nixscp --list`; switch the site on in Agent Access... |
-| More than one site is available to agents as "x". | Give the sites different names for agents. |
+| More than one site is available to agents as "x". | Use one of the site names the message lists. To keep the short name, give the sites different names for agents. |
 | The user did not accept the Agent Access settings of the site in NixSCP. | With a master password only: see [Settings prompt](#settings-prompt-master-password-only). |
 | The agent access log cannot be written, so NixSCP refuses agent requests. | Check `nixscp-agent.log` next to the configuration and the free disk space. |
 | ... are not allowed on this site. | The rules refused what they cannot check: run plain commands, and quote text with such characters in single quotes. |
